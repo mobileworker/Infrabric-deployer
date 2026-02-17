@@ -1,0 +1,294 @@
+          echo -e "Test 3: NCCL Collective Operations"
+          echo -e "==========================================${RESET}"
+          echo ""
+          echo "Testing GPU collective operations with NCCL"
+          echo "Running on all worker pods..."
+          echo ""
+
+          # NCCL results stored directly in SQLite database
+
+          # NCCL tests to run
+          NCCL_TESTS=("all_reduce" "all_gather" "broadcast" "reduce_scatter")
+
+          for POD in ${PODS[@]}; do
+            echo "Running NCCL tests on pod: $POD"
+
+            # Detect number of GPUs in pod
+            GPU_COUNT=$(oc exec $POD -- bash -c "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l" 2>/dev/null | tr -d ' \n' || echo "1")
+            [ -z "$GPU_COUNT" ] || [ "$GPU_COUNT" -eq 0 ] && GPU_COUNT=1
+            echo "  Detected $GPU_COUNT GPU(s)"
+
+            # Build comma-separated device list for NCCL_IB_HCA
+            POD_ACTIVE_DEVS=(${POD_RDMA_DEVICES[$POD]})
+            POD_DEVICE_LIST=$(IFS=,; echo "${POD_ACTIVE_DEVS[*]}")
+
+            for TEST in "${NCCL_TESTS[@]}"; do
+              echo "  Running ${TEST}_perf..."
+
+              # Run NCCL test with JSON output (8B to 128M, use all GPUs, 2 min timeout)
+              JSON_FILE="/tmp/nccl_${TEST}.json"
+              timeout 120 oc exec $POD -- bash -c "NCCL_IB_HCA=$POD_DEVICE_LIST timeout 120 /opt/nccl-tests/build/${TEST}_perf -b 8 -e 128M -f 2 -g $GPU_COUNT -J $JSON_FILE >/dev/null 2>&1 && cat $JSON_FILE" > /tmp/local_nccl_${TEST}.json 2>&1 || echo "Test timed out or failed"
+
+              # Parse JSON results
+              if [ -f /tmp/local_nccl_${TEST}.json ] && grep -q '"okay":"true"' /tmp/local_nccl_${TEST}.json 2>/dev/null; then
+                # Extract all GPU models from JSON and format
+                if [ "$GPU_COUNT" -eq 1 ]; then
+                  GPU_MODEL=$(jq -r '.config.devices[0].device_info' /tmp/local_nccl_${TEST}.json 2>/dev/null || echo "N/A")
+                else
+                  GPU_MODEL=$(jq -r '.config.devices[0].device_info' /tmp/local_nccl_${TEST}.json 2>/dev/null || echo "N/A")
+                  GPU_MODEL="${GPU_MODEL} (x${GPU_COUNT})"
+                fi
+
+                # Extract peak bandwidth from last result (out-of-place)
+                PEAK_BW=$(jq -r '.results[-1].out_of_place.alg_bw' /tmp/local_nccl_${TEST}.json 2>/dev/null || echo "0")
+                PEAK_SIZE=$(jq -r '.results[-1].size' /tmp/local_nccl_${TEST}.json 2>/dev/null || echo "0")
+
+                # Convert size to human readable
+                if [ "$PEAK_SIZE" -ge 1048576 ]; then
+                  PEAK_SIZE_HR="$((PEAK_SIZE / 1048576))MB"
+                elif [ "$PEAK_SIZE" -ge 1024 ]; then
+                  PEAK_SIZE_HR="$((PEAK_SIZE / 1024))KB"
+                else
+                  PEAK_SIZE_HR="${PEAK_SIZE}B"
+                fi
+
+                STATUS="PASS"
+                echo "    Result: $PEAK_BW GB/s @ $PEAK_SIZE_HR (GPU: $GPU_MODEL)"
+              else
+                GPU_MODEL="N/A"
+                PEAK_BW="FAIL"
+                PEAK_SIZE_HR="N/A"
+                STATUS="FAIL"
+                echo "    Result: FAIL"
+              fi
+
+              # Get node name and convert bandwidth/size for database
+              NCCL_NODE=$(oc get pod $POD -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+
+              # Convert peak bandwidth to numeric (handle FAIL case)
+              PEAK_BW_NUM=$PEAK_BW
+              [ "$PEAK_BW_NUM" = "FAIL" ] && PEAK_BW_NUM="0.0"
+
+              # Convert peak size to bytes
+              PEAK_SIZE_BYTES=$(echo "$PEAK_SIZE" | sed 's/[^0-9]//g')
+              [ -z "$PEAK_SIZE_BYTES" ] && PEAK_SIZE_BYTES="0"
+
+              # Insert into database
+              sqlite3 "$DB_FILE" "INSERT INTO nccl_results (test_run_id, pod_name, node_name, gpu_model, gpu_count, test_name, peak_size_bytes, peak_bandwidth_gbps, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$POD', '$NCCL_NODE', '$GPU_MODEL', $GPU_COUNT, '$TEST', $PEAK_SIZE_BYTES, $PEAK_BW_NUM, '$STATUS', $(date +%s));" 2>/dev/null || true
+
+              # Cleanup temp file
+              rm -f /tmp/local_nccl_${TEST}.json
+            done
+            echo ""
+          done
+
+          echo ""
+          echo -e "${CYAN}======================================================================"
+          echo -e "NCCL Performance Test Results"
+          echo -e "======================================================================${RESET}"
+          echo ""
+
+          # Query database for NCCL results
+          sqlite3 -separator ' ' "$DB_FILE" << 'EOF_NCCL_QUERY'
+          .mode column
+          .width 30 20 15 12 16 8
+          .headers on
+          SELECT
+            substr(pod_name, 1, 30) as Pod,
+            substr(gpu_model, 1, 20) as "GPU Model",
+            test_name as Test,
+            CASE
+              WHEN peak_size_bytes >= 1048576 THEN (peak_size_bytes / 1048576) || 'MB'
+              WHEN peak_size_bytes >= 1024 THEN (peak_size_bytes / 1024) || 'KB'
+              ELSE peak_size_bytes || 'B'
+            END as "Peak Size",
+            printf('%.2f', peak_bandwidth_gbps) as "Peak BW (GB/s)",
+            test_status as Status
+          FROM nccl_results
+          WHERE test_run_id = '$TEST_RUN_ID'
+          ORDER BY pod_name, test_name;
+          EOF_NCCL_QUERY
+
+          echo ""
+          echo "Column Descriptions:"
+          echo "  Pod         - Worker pod name"
+          echo "  GPU Model   - NVIDIA GPU model detected (with count if multiple)"
+          echo "  Test        - NCCL collective operation tested"
+          echo "  Peak Size   - Message size at peak bandwidth"
+          echo "  Peak BW     - Peak algorithm bandwidth (GB/s)"
+          echo "  Status      - PASS if test completed successfully"
+          echo ""
+
+          echo ""
+          echo -e "${CYAN}=========================================="
+          echo -e "Test 4: Multi-Node NCCL Tests"
+          echo -e "==========================================${RESET}"
+          echo ""
+          echo "Testing multi-node GPU collective operations with torchrun"
+          echo "This tests actual network bandwidth between GPUs on different nodes"
+          echo ""
+
+          # Only run if we have 2+ nodes
+          if [ ${#PODS[@]} -ge 2 ]; then
+            # Create Python test script on coordinator
+            cat > /tmp/nccl_multinode_test.py << 'EOF_NCCL_SCRIPT'
+                      #!/usr/bin/env python3
+                      import torch
+                      import torch.distributed as dist
+                      import time
+                      def main():
+              dist.init_process_group(backend='nccl')
+              rank = dist.get_rank()
+              device = torch.device(f'cuda:{rank % torch.cuda.device_count()}')
+              torch.cuda.set_device(device)
+              sizes = [4*1024*1024, 16*1024*1024, 64*1024*1024, 128*1024*1024]
+              results = []
+              for size in sizes:
+                  tensor = torch.randn(size // 4, device=device)
+                  for _ in range(10):
+                      dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+                  torch.cuda.synchronize()
+                  iterations = 20
+                  start = time.time()
+                  for _ in range(iterations):
+                      dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+                  torch.cuda.synchronize()
+                  elapsed = time.time() - start
+                  bytes_transferred = size * 2 * iterations
+                  bandwidth_gbps = (bytes_transferred / elapsed) * 8 / 1e9
+                  if rank == 0:
+                      size_mb = size / (1024*1024)
+                      results.append(f"{size_mb:.0f}MB:{bandwidth_gbps:.2f}")
+              if rank == 0:
+                  print(f"MULTINODE_NCCL_RESULTS: {','.join(results)}")
+              dist.destroy_process_group()
+                      if __name__ == '__main__':
+              main()
+          EOF_NCCL_SCRIPT
+
+            # Copy script to all worker pods
+            for POD in ${PODS[@]}; do
+              oc cp /tmp/nccl_multinode_test.py $POD:/tmp/nccl_multinode_test.py 2>/dev/null
+            done
+
+            # Get master pod IP (first pod on net1)
+            MASTER_POD="${PODS[0]}"
+            MASTER_IP=$(oc exec $MASTER_POD -- bash -c "ip -4 addr show net1 2>/dev/null | grep 'inet ' | awk '{print \$2}' | cut -d/ -f1" 2>/dev/null | tr -d '\n')
+
+            echo "Master node: $MASTER_POD ($MASTER_IP)"
+            echo "Running multi-node NCCL all_reduce test on ${#PODS[@]} nodes..."
+            echo ""
+
+            # Start worker nodes in background (all except first)
+            for i in $(seq 1 $((${#PODS[@]}-1))); do
+              WORKER_POD="${PODS[$i]}"
+              WORKER_ACTIVE_DEVS=(${POD_RDMA_DEVICES[$WORKER_POD]})
+              WORKER_DEVICE_LIST=$(IFS=,; echo "${WORKER_ACTIVE_DEVS[*]}")
+              echo "  Starting worker rank $i on $WORKER_POD..."
+              oc exec $WORKER_POD -- bash -c "
+                cd /tmp
+                NCCL_IB_HCA=$WORKER_DEVICE_LIST torchrun \
+                  --nproc_per_node=1 \
+                  --nnodes=${#PODS[@]} \
+                  --node_rank=$i \
+                  --master_addr=$MASTER_IP \
+                  --master_port=29500 \
+                  /tmp/nccl_multinode_test.py 2>&1
+              " > /tmp/nccl_worker_${i}.log 2>&1 &
+            done
+
+            # Wait a bit for workers to start
+            sleep 3
+
+            # Run master node in foreground
+            MASTER_ACTIVE_DEVS=(${POD_RDMA_DEVICES[$MASTER_POD]})
+            MASTER_DEVICE_LIST=$(IFS=,; echo "${MASTER_ACTIVE_DEVS[*]}")
+            echo "  Starting master rank 0 on $MASTER_POD..."
+            NCCL_OUTPUT=$(oc exec $MASTER_POD -- bash -c "
+              cd /tmp
+              NCCL_IB_HCA=$MASTER_DEVICE_LIST torchrun \
+                --nproc_per_node=1 \
+                --nnodes=${#PODS[@]} \
+                --node_rank=0 \
+                --master_addr=$MASTER_IP \
+                --master_port=29500 \
+                /tmp/nccl_multinode_test.py 2>&1
+            ")
+
+            # Wait for background workers to finish
+            sleep 2
+
+            # Parse results
+            MULTINODE_RESULTS=$(echo "$NCCL_OUTPUT" | grep "MULTINODE_NCCL_RESULTS:" | cut -d: -f2-)
+
+            # Parse and insert results into database
+            if [ -n "$MULTINODE_RESULTS" ]; then
+              # Parse comma-separated results: 4MB:131.63,16MB:145.21,...
+              IFS=',' read -ra RESULT_ARRAY <<< "$MULTINODE_RESULTS"
+              for result in "${RESULT_ARRAY[@]}"; do
+                SIZE=$(echo "$result" | cut -d: -f1)
+                BW=$(echo "$result" | cut -d: -f2)
+
+                # Convert size to bytes (e.g., "4MB" -> 4194304)
+                SIZE_NUM=$(echo "$SIZE" | sed 's/[^0-9]//g')
+                if [[ "$SIZE" == *"MB"* ]]; then
+                  SIZE_BYTES=$((SIZE_NUM * 1024 * 1024))
+                elif [[ "$SIZE" == *"KB"* ]]; then
+                  SIZE_BYTES=$((SIZE_NUM * 1024))
+                else
+                  SIZE_BYTES=$SIZE_NUM
+                fi
+
+                # Insert into database
+                sqlite3 "$DB_FILE" "INSERT INTO multinode_nccl_results (test_run_id, message_size_bytes, bandwidth_gbps, node_count, test_status, timestamp) VALUES ('$TEST_RUN_ID', $SIZE_BYTES, $BW, ${#PODS[@]}, 'PASS', $(date +%s));" 2>/dev/null || true
+              done
+            fi
+
+            # Display results from database
+            echo ""
+            echo -e "${CYAN}======================================================================"
+            echo -e "Multi-Node NCCL Performance Results"
+            echo -e "======================================================================${RESET}"
+            echo ""
+
+            # Query database for multi-node NCCL results
+            sqlite3 -separator ' ' "$DB_FILE" << 'EOF_MULTINODE_QUERY'
+            .mode column
+            .width 12 22 12
+            .headers on
+            SELECT
+              CASE
+                WHEN message_size_bytes >= 1048576 THEN (message_size_bytes / 1048576) || 'MB'
+                WHEN message_size_bytes >= 1024 THEN (message_size_bytes / 1024) || 'KB'
+                ELSE message_size_bytes || 'B'
+              END as "Size",
+              printf('%.2f', bandwidth_gbps) as "Bandwidth (Gb/s)",
+              test_status as Status
+            FROM multinode_nccl_results
+            WHERE test_run_id = '$TEST_RUN_ID'
+            ORDER BY message_size_bytes;
+          EOF_MULTINODE_QUERY
+
+            # Check if we have results
+            RESULT_COUNT=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM multinode_nccl_results WHERE test_run_id = '$TEST_RUN_ID';" 2>/dev/null || echo "0")
+            if [ "$RESULT_COUNT" -eq 0 ]; then
+              echo "No results - test may have failed"
+            fi
+
+            echo ""
+            echo "Column Descriptions:"
+            echo "  Size       - Message size for all_reduce operation"
+            echo "  Bandwidth  - Network bandwidth between GPU nodes (Gb/s)"
+            echo "  Status     - PASS if test completed successfully"
+            echo ""
+            echo "Note: This test measures actual network performance for multi-GPU workloads"
+            echo "      GPUDirect RDMA is used when NCCL_NET_GDR_LEVEL=5"
+            echo ""
+
+          else
+            echo "Skipping multi-node NCCL tests - requires 2+ worker nodes"
+            echo ""
+          fi
+
+          echo ""
+          echo -e "${CYAN}=========================================="

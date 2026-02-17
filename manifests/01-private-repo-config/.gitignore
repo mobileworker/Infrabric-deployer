@@ -1,0 +1,4 @@
+# Never commit actual secrets to Git
+github-repo-secret.yaml
+*-secret.yaml
+!*.example.yaml

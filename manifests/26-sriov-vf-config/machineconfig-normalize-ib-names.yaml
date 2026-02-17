@@ -1,0 +1,22 @@
+---
+# MachineConfig to normalize InfiniBand interface names across all nodes
+# This ensures consistent naming for IPoIB CNI with RDMA shared devices
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  labels:
+    machineconfiguration.openshift.io/role: worker
+  name: 99-worker-normalize-ib-interface-names
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+    storage:
+      files:
+      - contents:
+          # Udev rules to rename IB interfaces based on PCI address
+          # This normalizes interface names across nodes for consistent IPoIB CNI configuration
+          source: data:text/plain;charset=utf-8;base64,IyBOb3JtYWxpemUgSW5maW5pQmFuZCBpbnRlcmZhY2UgbmFtZXMgYmFzZWQgb24gUENJIGFkZHJlc3MKIyBUaGlzIGFsbG93cyBJUG9JQiBDTkkgdG8gdXNlIGNvbnNpc3RlbnQgaW50ZXJmYWNlIG5hbWVzIGFjcm9zcyBhbGwgbm9kZXMKCiMgTklDIFBvc2l0aW9uIDAgLT4gaWJfbmljMAojIFBDSSAwMDAwOjlhOjAwLjAgKGFsbCBub2RlcykKU1VCU1lTVEVNPT0ibmV0IiwgQUNUSU9OPT0iYWRkIiwgS0VSTkVMUz09IjAwMDA6OWE6MDAuMCIsIE5BTUU9ImliX25pYzAiCgojIE5JQyBQb3NpdGlvbiAxIC0+IGliX25pYzEKIyBQQ0kgMDAwMDpjMDowMC4wIChhbGwgbm9kZXMpClNVQlNZU1RFTT09Im5ldCIsIEFDVElPTj09ImFkZCIsIEtFUk5FTFM9PSIwMDAwOmMwOjAwLjAiLCBOQU1FPSJpYl9uaWMxIgoKIyBOSUMgUG9zaXRpb24gMiAtPiBpYl9uaWMyCiMgUENJIDAwMDA6Y2U6MDAuMCAoYWxsIG5vZGVzKQpTVUJTWVNURU09PSJuZXQiLCBBQ1RJT049PSJhZGQiLCBLRVJORUxTPT0iMDAwMDpjZTowMC4wIiwgTkFNRT0iaWJfbmljMiIKCiMgTklDIFBvc2l0aW9uIDMgLT4gaWJfbmljMwojIFBDSSAwMDAwOmRjOjAwLjAgKGFsbCBub2RlcykKU1VCU1lTVEVNPT0ibmV0IiwgQUNUSU9OPT0iYWRkIiwgS0VSTkVMUz09IjAwMDA6ZGM6MDAuMCIsIE5BTUU9ImliX25pYzMiCgojIE5JQyBQb3NpdGlvbiA0IC0+IGliX25pYzQKIyBQQ0kgMDAwMDo0MDowMC4wIChub2RlcyAxMzc3OSwgMTM3ODApClNVQlNZU1RFTT09Im5ldCIsIEFDVElPTj09ImFkZCIsIEtFUk5FTFM9PSIwMDAwOjQwOjAwLjAiLCBOQU1FPSJpYl9uaWM0IgojIFBDSSAwMDAwOjE4OjAwLjAgKG5vZGUgMTM3ODEpClNVQlNZU1RFTT09Im5ldCIsIEFDVElPTj09ImFkZCIsIEtFUk5FTFM9PSIwMDAwOjE4OjAwLjAiLCBOQU1FPSJpYl9uaWM0IgoKIyBOSUMgUG9zaXRpb24gNSAtPiBpYl9uaWM1CiMgUENJIDAwMDA6NGY6MDAuMCAoYWxsIG5vZGVzKQpTVUJTWVNURU09PSJuZXQiLCBBQ1RJT049PSJhZGQiLCBLRVJORUxTPT0iMDAwMDo0ZjowMC4wIiwgTkFNRT0iaWJfbmljNSIKCiMgTklDIFBvc2l0aW9uIDYgLT4gaWJfbmljNgojIFBDSSAwMDAwOjVlOjAwLjAgKGFsbCBub2RlcykKU1VCU1lTVEVNPT0ibmV0IiwgQUNUSU9OPT0iYWRkIiwgS0VSTkVMUz09IjAwMDA6NWU6MDAuMCIsIE5BTUU9ImliX25pYzYiCg==
+        mode: 0644
+        overwrite: true
+        path: /etc/udev/rules.d/99-normalize-ib-interfaces.rules

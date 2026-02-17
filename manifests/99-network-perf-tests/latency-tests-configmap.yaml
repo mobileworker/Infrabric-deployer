@@ -1,0 +1,162 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: network-perf-latency-tests
+  namespace: default
+data:
+  latency-tests.py: |
+    #!/usr/bin/env python3
+    """RDMA Latency Tests"""
+
+    import os
+    import sys
+    import subprocess
+    import sqlite3
+    import re
+
+    DB_FILE = os.environ.get('DB_FILE', '/tmp/network-perf-results.db')
+    TEST_RUN_ID = os.environ.get('TEST_RUN_ID')
+    TEST_DURATION = int(os.environ.get('TEST_DURATION', '5'))
+    TEST_TIMEOUT = int(os.environ.get('TEST_TIMEOUT', '10'))
+    MSG_SIZE = int(os.environ.get('MSG_SIZE', '4194304'))
+
+    def run_oc_exec(pod, cmd):
+        """Execute command in pod"""
+        result = subprocess.run(
+            ['oc', 'exec', pod, '--', 'bash', '-c', cmd],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, check=False
+        )
+        return result.stdout, result.stderr, result.returncode
+
+    def get_active_devices(pod):
+        """Get active RDMA devices"""
+        stdout, _, _ = run_oc_exec(pod,
+            'for dev in $(ibv_devices 2>/dev/null | grep "mlx5_" | awk "{print $1}"); do '
+            'if ibv_devinfo -d $dev 2>/dev/null | grep -q "PORT_ACTIVE"; then echo $dev; fi; done')
+        return stdout.strip().split()
+
+    def get_optimal_gpu(pod, device):
+        """Get optimal GPU ID for a given RDMA device from topology database"""
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            result = c.execute("""
+                SELECT gpu_id FROM gpu_nic_topology
+                WHERE pod_name = ? AND nic_device = ? AND connection_type = 'PXB'
+                LIMIT 1
+            """, (pod, device)).fetchone()
+            conn.close()
+            return result[0] if result else 0
+        except:
+            return 0
+
+    def run_latency_tests(source_pod, target_pod, source_node, target_node, source_gpus, target_gpus):
+        """Main latency test orchestration"""
+        print("\n" + "="*70)
+        print("RDMA Latency Tests")
+        print("="*70)
+
+        # Get devices
+        source_devices = get_active_devices(source_pod)
+        target_devices = get_active_devices(target_pod)
+
+        # Only test devices that exist on both pods
+        common_devices = sorted(set(source_devices) & set(target_devices))
+
+        print(f"Source devices: {source_devices}")
+        print(f"Target devices: {target_devices}")
+        print(f"Testing common devices: {common_devices}")
+        print()
+
+        if not common_devices:
+            print("No common RDMA devices found between pods!")
+            return
+
+        # Get target IP once
+        target_ip_cmd = f"oc get pod {target_pod} -o jsonpath='{{.status.podIP}}'"
+        target_ip = subprocess.check_output(target_ip_cmd, shell=True, universal_newlines=True).strip()
+
+        # Test each common device
+        for dev in common_devices:
+            # Get optimal GPU for this device on each pod
+            source_gpu_id = get_optimal_gpu(source_pod, dev)
+            target_gpu_id = get_optimal_gpu(target_pod, dev)
+
+            print(f"Testing {dev} → {dev} (source GPU{source_gpu_id}, target GPU{target_gpu_id})...")
+
+            # Test both host and GPU memory
+            for mem_type, mem_flag_template in [('host', ''), ('cuda', '--use_cuda={}')]:
+                # Kill any existing latency test processes
+                run_oc_exec(target_pod, 'pkill -9 ib_write_lat || true; pkill -9 ib_send_lat || true')
+                run_oc_exec(source_pod, 'pkill -9 ib_write_lat || true; pkill -9 ib_send_lat || true')
+
+                # Format memory flags with correct GPU IDs
+                target_mem_flag = mem_flag_template.format(target_gpu_id) if mem_type == 'cuda' else ''
+                source_mem_flag = mem_flag_template.format(source_gpu_id) if mem_type == 'cuda' else ''
+
+                # Use ib_write_lat for HOST, ib_send_lat for CUDA (ib_write_lat doesn't support CUDA)
+                lat_cmd = 'ib_send_lat' if mem_type == 'cuda' else 'ib_write_lat'
+                n_iters = 100 if mem_type == 'cuda' else 1000
+
+                # Start server using Popen (keeps process alive)
+                server_cmd = f'ulimit -l unlimited; {lat_cmd} -d {dev} -s {MSG_SIZE} -n {n_iters} {target_mem_flag}'
+                server_proc = subprocess.Popen(
+                    ['oc', 'exec', target_pod, '--', 'bash', '-c', server_cmd],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+                )
+
+                import time
+                time.sleep(5)
+
+                # Run client
+                stdout, stderr, rc = run_oc_exec(source_pod,
+                    f'ulimit -l unlimited; {lat_cmd} -d {dev} -s {MSG_SIZE} -n {n_iters} {source_mem_flag} {target_ip}')
+
+                # Parse latency from table output (format: bytes iterations t_min t_max t_typical t_avg ...)
+                # Extract t_avg (6th column) from the data line
+                lat_match = re.search(rf'{MSG_SIZE}\s+\d+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([\d.]+)', stdout)
+                if lat_match:
+                    latency_us = float(lat_match.group(1))
+                    print(f"  {mem_type.upper()}: {latency_us:.2f} μs - PASS")
+
+                    # Store in database
+                    conn = sqlite3.connect(DB_FILE)
+                    c = conn.cursor()
+                    c.execute("""
+                        INSERT INTO latency_results
+                        (test_run_id, source_pod, target_pod, source_node, target_node,
+                         source_gpu, target_gpu, rdma_device_source, rdma_device_target,
+                         message_size, memory_type, latency_average_us, iterations, test_status, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PASS', strftime('%s', 'now'))
+                    """, (TEST_RUN_ID, source_pod, target_pod, source_node, target_node,
+                          source_gpus, target_gpus, dev, dev, MSG_SIZE, mem_type, latency_us, n_iters))
+                    conn.commit()
+                    conn.close()
+                else:
+                    print(f"  {mem_type.upper()}: FAIL")
+                    if stdout or stderr:
+                        print(f"    stdout: {stdout[:200]}")
+                        print(f"    stderr: {stderr[:200]}")
+
+                # Cleanup server process
+                server_proc.terminate()
+                try:
+                    server_proc.wait(timeout=2)
+                except:
+                    server_proc.kill()
+                run_oc_exec(target_pod, 'pkill -9 ib_write_lat || true; pkill -9 ib_send_lat || true')
+                run_oc_exec(source_pod, 'pkill -9 ib_write_lat || true; pkill -9 ib_send_lat || true')
+
+        print("\n✓ Latency tests completed")
+
+    if __name__ == '__main__':
+        run_latency_tests(
+            sys.argv[1],  # source_pod
+            sys.argv[2],  # target_pod
+            sys.argv[3],  # source_node
+            sys.argv[4],  # target_node
+            sys.argv[5],  # source_gpus
+            sys.argv[6]   # target_gpus
+        )

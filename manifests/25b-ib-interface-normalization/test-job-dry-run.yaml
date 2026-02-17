@@ -1,0 +1,280 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ib-udev-test
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ib-udev-test
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/exec", "pods/log", "nodes", "namespaces"]
+    verbs: ["get", "list", "create", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ib-udev-test
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ib-udev-test
+subjects:
+  - kind: ServiceAccount
+    name: ib-udev-test
+    namespace: default
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-ib-udev-dry-run
+  namespace: default
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 1800
+  template:
+    spec:
+      serviceAccountName: ib-udev-test
+      restartPolicy: Never
+      containers:
+        - name: test
+          image: registry.redhat.io/openshift4/ose-cli:latest
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+
+              echo "=========================================="
+              echo "DRY RUN: IB Interface Name Normalizer"
+              echo "=========================================="
+              echo ""
+              echo "This test will:"
+              echo "  1. Discover InfiniBand NICs on all nodes"
+              echo "  2. Generate udev rules"
+              echo "  3. Show MachineConfig that WOULD be created"
+              echo "  4. NOT apply anything"
+              echo ""
+
+              # Install dependencies
+              echo "Installing dependencies..."
+              dnf install -y python3 jq >/dev/null 2>&1
+              echo "✓ Python and jq installed"
+              echo ""
+
+              # Get worker nodes
+              echo "=== Finding Worker Nodes ==="
+              WORKER_NODES=$(oc get nodes -l node-role.kubernetes.io/worker -o jsonpath='{.items[*].metadata.name}')
+
+              if [ -z "$WORKER_NODES" ]; then
+                echo "❌ No worker nodes found"
+                exit 1
+              fi
+
+              NODE_COUNT=$(echo $WORKER_NODES | wc -w)
+              echo "✓ Found $NODE_COUNT worker nodes:"
+              for NODE in $WORKER_NODES; do
+                echo "  - $NODE"
+              done
+              echo ""
+
+              # Discover IB NICs
+              echo "=== Discovering InfiniBand NICs ==="
+              mkdir -p /tmp/discovery
+
+              for NODE in $WORKER_NODES; do
+                echo "Scanning node: $NODE"
+
+                # Discover IB interfaces using oc debug
+                DISCOVERY_OUTPUT=$(oc debug node/$NODE --image=registry.access.redhat.com/ubi9/ubi:latest -- bash -c '
+                  chroot /host bash -c "
+                    for iface in /sys/class/net/*; do
+                      ifname=\$(basename \$iface)
+                      # Check if InfiniBand interface
+                      if [ -d \"/sys/class/net/\$ifname/device/infiniband\" ] || [[ \$ifname == ib* ]]; then
+                        pci_path=\$(readlink -f /sys/class/net/\$ifname/device 2>/dev/null || echo unknown)
+                        pci=\$(basename \$pci_path)
+                        # Verify its actually InfiniBand (not RoCE)
+                        ib_dev=\$(ls /sys/class/net/\$ifname/device/infiniband 2>/dev/null | head -1)
+                        if [ -n \"\$ib_dev\" ]; then
+                          link_layer=\$(cat /sys/class/infiniband/\$ib_dev/ports/1/link_layer 2>/dev/null || echo unknown)
+                          if [[ \$link_layer == *InfiniBand* ]]; then
+                            echo \"\$ifname|\$pci\"
+                          fi
+                        fi
+                      fi
+                    done
+                  "
+                ' 2>&1 | grep -v "Starting pod" | grep -v "Removing debug pod" | grep -v "To use host binaries")
+
+                if [ -n "$DISCOVERY_OUTPUT" ]; then
+                  echo "$DISCOVERY_OUTPUT" | while IFS='|' read -r ifname pci; do
+                    # Filter out error messages and lines without valid PCI addresses
+                    if [ -n "$ifname" ] && [ "$pci" != "unknown" ] && [ -n "$pci" ] && [[ ! "$ifname" =~ ^E[0-9] ]]; then
+                      echo "  ✓ $ifname (PCI: $pci)"
+                      echo "$NODE|$ifname|$pci" >> /tmp/discovery/all-ibs.txt
+                    fi
+                  done
+                else
+                  echo "  (no IB devices found)"
+                fi
+                echo ""
+              done
+
+              if [ ! -f /tmp/discovery/all-ibs.txt ]; then
+                echo "❌ No InfiniBand devices found on any node"
+                echo ""
+                echo "This is expected if:"
+                echo "  - All NICs are RoCE (not InfiniBand)"
+                echo "  - MOFED drivers not loaded yet"
+                echo "  - No NICs have cables connected"
+                exit 0
+              fi
+
+              echo "=== Discovery Results ==="
+              cat /tmp/discovery/all-ibs.txt
+              echo ""
+
+              echo "=== Generating Udev Rules ==="
+
+              # Generate udev rules with Python
+              python3 << 'EOF'
+              import base64
+              import json
+              from collections import defaultdict
+
+              # Collect all devices with their PCI addresses
+              pci_to_nodes = defaultdict(list)  # PCI -> list of (node, ifname)
+
+              print("Processing discovered devices...\n")
+
+              with open('/tmp/discovery/all-ibs.txt', 'r') as f:
+                for line in f:
+                  parts = line.strip().split('|')
+                  if len(parts) == 3:
+                    node, ifname, pci = parts
+                    pci_to_nodes[pci].append({'node': node, 'ifname': ifname})
+                    print(f"  {node}: {ifname} → {pci}")
+
+              print()
+
+              # Get all unique PCI addresses and sort them globally
+              all_pci_addresses = sorted(pci_to_nodes.keys())
+
+              print(f"Total unique PCI addresses: {len(all_pci_addresses)}\n")
+
+              # Map PCI address -> normalized name
+              print("=== Global PCI to Name Mapping ===\n")
+              pci_to_name = {}
+
+              for pos, pci in enumerate(all_pci_addresses):
+                norm_name = f"ib_nic{pos}"
+                pci_to_name[pci] = norm_name
+                nodes_with_nic = [d['node'] for d in pci_to_nodes[pci]]
+                print(f"ib_nic{pos} ← PCI {pci}")
+                print(f"  Found on nodes: {', '.join(sorted(set(nodes_with_nic)))}")
+                print()
+
+              # Show per-node mapping
+              devices_by_node = defaultdict(list)
+              with open('/tmp/discovery/all-ibs.txt', 'r') as f:
+                for line in f:
+                  parts = line.strip().split('|')
+                  if len(parts) == 3:
+                    node, ifname, pci = parts
+                    devices_by_node[node].append({'ifname': ifname, 'pci': pci, 'new_name': pci_to_name[pci]})
+
+              print("=== Per-Node Interface Renaming ===\n")
+              for node in sorted(devices_by_node.keys()):
+                print(f"Node: {node}")
+                for nic in sorted(devices_by_node[node], key=lambda x: x['new_name']):
+                  print(f"  {nic['ifname']:15} (PCI {nic['pci']}) → {nic['new_name']}")
+                print()
+
+              # Generate udev rules
+              print("=== Generated Udev Rules ===\n")
+              rules = [
+                "# Auto-generated udev rules to normalize InfiniBand interface names",
+                "# Allows IPoIB CNI to use consistent names across all nodes",
+                "# Generated by ib-udev-generator job",
+                "# Each PCI address gets a globally consistent name",
+                ""
+              ]
+
+              for pos, pci in enumerate(all_pci_addresses):
+                norm_name = f"ib_nic{pos}"
+                rules.append(f"# {norm_name} <- PCI {pci}")
+                rule = f'SUBSYSTEM=="net", ACTION=="add", KERNELS=="{pci}", NAME="{norm_name}"'
+                rules.append(rule)
+                rules.append("")
+                print(f"{norm_name} ← {pci}")
+
+              print()
+
+              udev_content = '\n'.join(rules)
+
+              # Save raw udev rules
+              with open('/tmp/udev-rules.txt', 'w') as f:
+                f.write(udev_content)
+
+              print("\n=== Raw Udev Rules File ===")
+              print(udev_content)
+              print()
+
+              # Generate base64 encoded version
+              udev_b64 = base64.b64encode(udev_content.encode()).decode()
+
+              # Generate MachineConfig
+              mc = {
+                "apiVersion": "machineconfiguration.openshift.io/v1",
+                "kind": "MachineConfig",
+                "metadata": {
+                  "labels": {"machineconfiguration.openshift.io/role": "worker"},
+                  "name": "99-worker-normalize-ib-interfaces"
+                },
+                "spec": {
+                  "config": {
+                    "ignition": {"version": "3.2.0"},
+                    "storage": {
+                      "files": [{
+                        "contents": {"source": f"data:text/plain;charset=utf-8;base64,{udev_b64}"},
+                        "mode": 420,
+                        "overwrite": True,
+                        "path": "/etc/udev/rules.d/99-normalize-ib-interfaces.rules"
+                      }]
+                    }
+                  }
+                }
+              }
+
+              with open('/tmp/mc.json', 'w') as f:
+                json.dump(mc, f, indent=2)
+
+              print("\n=== MachineConfig (would be created) ===")
+              print(json.dumps(mc, indent=2))
+              print()
+
+              EOF
+
+              echo ""
+              echo "=========================================="
+              echo "DRY RUN COMPLETE"
+              echo "=========================================="
+              echo ""
+              echo "✓ Discovery successful"
+              echo "✓ Udev rules generated"
+              echo "✓ MachineConfig created (NOT applied)"
+              echo ""
+              echo "Files available in pod:"
+              echo "  /tmp/discovery/all-ibs.txt - Raw discovery data"
+              echo "  /tmp/udev-rules.txt - Generated udev rules"
+              echo "  /tmp/mc.json - MachineConfig JSON"
+              echo ""
+              echo "To view files:"
+              echo "  oc exec test-ib-udev-dry-run-<pod> -- cat /tmp/udev-rules.txt"
+              echo "  oc exec test-ib-udev-dry-run-<pod> -- cat /tmp/mc.json"
+              echo ""
+              echo "If everything looks correct, deploy the actual job to apply changes."

@@ -1,0 +1,109 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: network-perf-nccl-tests
+  namespace: default
+data:
+  nccl-tests.py: |
+    #!/usr/bin/env python3
+    """NCCL Tests - Python implementation"""
+    
+    import os
+    import sys
+    import subprocess
+    import sqlite3
+    import json
+    
+    DB_FILE = os.environ.get('DB_FILE', '/tmp/network-perf-results.db')
+    TEST_RUN_ID = os.environ.get('TEST_RUN_ID')
+    
+    def get_pods():
+        """Get all network-perf-test-worker pods"""
+        result = subprocess.run(
+            ['oc', 'get', 'pods', '-l', 'app=network-perf-test-worker',
+             '--field-selector=status.phase=Running', '-o', 'json'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+        )
+        
+        if result.returncode != 0:
+            return []
+        
+        data = json.loads(result.stdout)
+        return [item['metadata']['name'] for item in data.get('items', [])]
+    
+    def run_nccl_tests():
+        """Main NCCL test orchestration"""
+        print("\n" + "="*70)
+        print("NCCL Tests")
+        print("="*70)
+        
+        pods = get_pods()
+        print(f"Found {len(pods)} worker pods")
+        
+        if len(pods) < 1:
+            print("ERROR: Need at least 1 worker pod for NCCL tests")
+            return
+        
+        # Build device list for NCCL_IB_HCA and detect network interfaces
+        for pod in pods:
+            # Get RDMA devices
+            result = subprocess.run(
+                ['oc', 'exec', pod, '--', 'bash', '-c',
+                 'for dev in $(ibv_devices 2>/dev/null | grep "mlx5_" | awk "{print $1}"); do if ibv_devinfo -d $dev 2>/dev/null | grep -q "PORT_ACTIVE"; then echo $dev; fi; done'],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+            )
+
+            devices = result.stdout.strip().split()
+            device_list = ','.join(devices)
+
+            # Get network interface (excluding lo)
+            result = subprocess.run(
+                ['oc', 'exec', pod, '--', 'bash', '-c',
+                 'ip -br addr show | grep -v "^lo" | awk "{print $1}" | head -1 | sed "s/@.*//"'],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+            )
+            net_interface = result.stdout.strip()
+
+            print(f"  {pod}: NCCL_SOCKET_IFNAME={net_interface} NCCL_IB_HCA={device_list}")
+
+            # Run NCCL tests with device affinity
+            tests = ['all_reduce', 'all_gather', 'broadcast', 'reduce_scatter']
+
+            for test in tests:
+                print(f"  Running {test}_perf...")
+
+                # Clean up old JSON file and run test
+                result = subprocess.run(
+                    ['oc', 'exec', pod, '--', 'bash', '-c',
+                     f'rm -f /tmp/nccl_{test}.json && NCCL_SOCKET_IFNAME={net_interface} NCCL_IB_HCA={device_list} /opt/nccl-tests/build/{test}_perf -b 8 -e 128M -f 2 -g 8 -J /tmp/nccl_{test}.json >/dev/null 2>&1 && cat /tmp/nccl_{test}.json'],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+                )
+                
+                if result.returncode == 0 and result.stdout:
+                    try:
+                        data = json.loads(result.stdout)
+                        if data.get('out_of_bounds', {}).get('okay') == 'true':
+                            peak_bw = data['results'][-1]['out_of_place']['alg_bw']
+                            print(f"    Result: {peak_bw} GB/s - PASS")
+                            
+                            # Store in database
+                            conn = sqlite3.connect(DB_FILE)
+                            c = conn.cursor()
+                            c.execute("""
+                                INSERT INTO nccl_results
+                                (test_run_id, pod_name, node_name, gpu_model, gpu_count,
+                                 test_name, peak_size_bytes, peak_bandwidth_gbps, test_status, timestamp)
+                                VALUES (?, ?, ?, ?, 8, ?, ?, ?, 'PASS', strftime('%s', 'now'))
+                            """, (TEST_RUN_ID, pod, 'N/A', 'N/A', test, 0, peak_bw))
+                            conn.commit()
+                            conn.close()
+                    except:
+                        print(f"    Result: FAIL (parse error)")
+                else:
+                    print(f"    Result: FAIL")
+        
+        print("\n✓ NCCL tests completed")
+    
+    if __name__ == '__main__':
+        run_nccl_tests()

@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  # Test coordinator and infrastructure
+  - network-perf-test-main.yaml
+  - daemonset-template.yaml
+  - daemonset-builder-configmap.yaml
+  - web-service.yaml
+
+  # Database and report generation
+  - db-init-configmap.yaml
+  - report-generator-configmap.yaml
+
+  # Test scripts
+  - ib-tests-configmap.yaml
+  - roce-tests-configmap.yaml
+  - ucx-tests-configmap.yaml
+  - latency-tests-configmap.yaml
+  - nccl-tests-configmap.yaml

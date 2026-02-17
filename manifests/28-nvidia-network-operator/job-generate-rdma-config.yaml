@@ -1,0 +1,493 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rdma-config-generator
+  namespace: default
+  annotations:
+    argocd.argoproj.io/sync-wave: "28"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rdma-config-generator
+  annotations:
+    argocd.argoproj.io/sync-wave: "28"
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "create", "update", "patch"]
+  - apiGroups: ["mellanox.com"]
+    resources: ["nicclusterpolicies"]
+    verbs: ["get", "list", "patch", "update"]
+  - apiGroups: ["k8s.cni.cncf.io"]
+    resources: ["network-attachment-definitions"]
+    verbs: ["get", "list", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rdma-config-generator
+  annotations:
+    argocd.argoproj.io/sync-wave: "28"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rdma-config-generator
+subjects:
+  - kind: ServiceAccount
+    name: rdma-config-generator
+    namespace: default
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rdma-config-generator-script
+  namespace: default
+  annotations:
+    argocd.argoproj.io/sync-wave: "28"
+data:
+  generate-rdma-config.py: |
+    #!/usr/bin/env python3
+    import json
+    import sys
+    import os
+    import subprocess
+    from collections import defaultdict
+
+    print("\n=== NVIDIA Network Operator RDMA Configuration Generator ===")
+
+    # Configuration from environment variables
+    mtu = int(os.getenv('MTU', '9000'))
+    ip_range_base = os.getenv('IP_RANGE_BASE', '10.0')
+    network_namespace = os.getenv('NETWORK_NAMESPACE', 'default')
+    route_dest_base = os.getenv('ROUTE_DEST', '192.168.75.0/24')
+    subnet_mode = os.getenv('SUBNET_MODE', 'separate').lower()  # 'shared' or 'separate'
+
+    print(f"\nNetwork Configuration:")
+    print(f"  SUBNET_MODE: {subnet_mode}")
+    print(f"  IP_RANGE_BASE: {ip_range_base}")
+    print(f"  NETWORK_NAMESPACE: {network_namespace}")
+    print(f"  ROUTE_DEST: {route_dest_base}")
+    print(f"  MTU: {mtu}")
+
+    # Check if IB devices file exists from SR-IOV discovery
+    ib_devices_file = "/discovery/ib-devices.json"
+
+    if not os.path.exists(ib_devices_file):
+        print("\nNo InfiniBand devices detected - configuring MOFED drivers only")
+        print("RDMA shared device plugin and IPoIB CNI will NOT be enabled")
+        sys.exit(0)
+
+    # Load IB devices
+    with open(ib_devices_file, 'r') as f:
+        ib_devices = json.load(f)
+
+    if not ib_devices:
+        print("\nIB devices file is empty - configuring MOFED drivers only")
+        sys.exit(0)
+
+    print(f"\n✓ Found {len(ib_devices)} InfiniBand devices")
+
+    # Group ALL devices by interface name to check carrier consistency across nodes
+    devices_by_ifname_all = defaultdict(list)
+    for device in ib_devices:
+        pf_name = device['pfName']
+        devices_by_ifname_all[pf_name].append(device)
+
+    print(f"\nChecking carrier status consistency across nodes...")
+    print(f"Note: RDMA resources are only created for NICs with carrier on ALL nodes")
+    print(f"This ensures pods can be scheduled reliably across the cluster\n")
+
+    # Filter to only include NICs that have carrier on ALL nodes
+    fully_connected_nics = []
+    partially_connected_nics = []
+    disconnected_nics = []
+
+    for if_name, devices in sorted(devices_by_ifname_all.items()):
+        total_nodes = len(devices)
+        nodes_with_carrier = [d for d in devices if d.get('carrier') == '1']
+        carrier_count = len(nodes_with_carrier)
+
+        if carrier_count == total_nodes:
+            # All nodes have carrier - include this NIC
+            fully_connected_nics.extend(devices)
+            node_names = [d['_node_name'] for d in devices]
+            print(f"  ✓ {if_name}: {carrier_count}/{total_nodes} nodes connected - INCLUDED")
+            print(f"    Nodes: {', '.join(sorted(node_names))}")
+        elif carrier_count > 0:
+            # Partial connectivity - skip this NIC
+            partially_connected_nics.extend(devices)
+            nodes_up = [d['_node_name'] for d in nodes_with_carrier]
+            nodes_down = [d['_node_name'] for d in devices if d.get('carrier') != '1']
+            print(f"  ⚠ {if_name}: {carrier_count}/{total_nodes} nodes connected - SKIPPED (partial)")
+            print(f"    Connected: {', '.join(sorted(nodes_up))}")
+            print(f"    Disconnected: {', '.join(sorted(nodes_down))}")
+        else:
+            # No connectivity - skip this NIC
+            disconnected_nics.extend(devices)
+            node_names = [d['_node_name'] for d in devices]
+            print(f"  ✗ {if_name}: 0/{total_nodes} nodes connected - SKIPPED (down)")
+            print(f"    Nodes: {', '.join(sorted(node_names))}")
+
+    print(f"\nSummary:")
+    print(f"  Fully connected NICs (all nodes): {len(set(d['pfName'] for d in fully_connected_nics))}")
+    print(f"  Partially connected NICs (some nodes): {len(set(d['pfName'] for d in partially_connected_nics))}")
+    print(f"  Disconnected NICs (no nodes): {len(set(d['pfName'] for d in disconnected_nics))}")
+
+    if not fully_connected_nics:
+        print("\n⚠ No fully connected InfiniBand NICs found")
+        print("All IB ports are either disconnected or only partially connected - skipping RDMA configuration")
+        sys.exit(0)
+
+    # Use only fully connected devices for RDMA configuration
+    ib_devices = fully_connected_nics
+    print(f"\nConfiguring RDMA resources for {len(set(d['pfName'] for d in ib_devices))} fully connected NICs")
+
+    # Group devices by PF name (interface name) to create separate RDMA resources per NIC
+    devices_by_pf = defaultdict(list)
+    for device in ib_devices:
+        pf_name = device['pfName']
+        devices_by_pf[pf_name].append(device)
+
+    print(f"\nGrouped into {len(devices_by_pf)} unique NICs:")
+    for pf_name, devs in devices_by_pf.items():
+        nodes = set(d['_node_name'] for d in devs)
+        print(f"  {pf_name}: {len(devs)} ports across {len(nodes)} nodes")
+
+    # Build RDMA shared device plugin config - one resource per unique interface name
+    # After wave 25b normalization, same interface name = same PCI address across all nodes
+    # This ensures consistent resource mapping even if different nodes have different NICs online
+    # Example: rdma_shared_nic3 = all ib_nic3 interfaces (same PCI 0000:40:00.0)
+
+    # Group devices by interface name (normalized by wave 25b)
+    devices_by_ifname = defaultdict(list)
+    for device in ib_devices:
+        pf_name = device['pfName']
+        devices_by_ifname[pf_name].append(device)
+
+    print(f"\nGrouping by normalized interface names:")
+    print(f"  Total unique interface names: {len(devices_by_ifname)}")
+
+    # Show per-node breakdown
+    devices_by_node = defaultdict(list)
+    for device in ib_devices:
+        devices_by_node[device['_node_name']].append(device)
+
+    print(f"\nNIC count per node:")
+    for node_name in sorted(devices_by_node.keys()):
+        nic_names = sorted([d['pfName'] for d in devices_by_node[node_name]])
+        print(f"  {node_name}: {len(nic_names)} NICs ({', '.join(nic_names)})")
+
+    # Build resource list - one resource per unique interface name
+    config_list = []
+
+    for if_name in sorted(devices_by_ifname.keys()):
+        devices = devices_by_ifname[if_name]
+        device_ids = set()
+        nodes_with_this_nic = []
+        pci_addresses = set()
+
+        for device in devices:
+            device_ids.add(device.get('deviceID', '1021'))
+            nodes_with_this_nic.append(device['_node_name'])
+            # Capture PCI address for logging
+            pci_addr = device.get('pciAddress', 'unknown')
+            pci_addresses.add(pci_addr)
+
+        # Resource name: rdma_shared_nicX (where X comes from ib_nicX)
+        # Extract number from interface name (ib_nic3 -> 3)
+        if if_name.startswith('ib_nic'):
+            nic_number = if_name.replace('ib_nic', '')
+            resource_name = f"rdma_shared_nic{nic_number}"
+        else:
+            # Fallback for non-normalized names
+            resource_name = f"rdma_shared_{if_name}"
+
+        config_entry = {
+            "resourceName": resource_name,
+            "rdmaHcaMax": 1000,  # Max pods that can share this NIC
+            "selectors": {
+                "vendors": ["15b3"],
+                "deviceIDs": list(device_ids),
+                "ifNames": [if_name]  # Single interface name (same across all nodes)
+            }
+        }
+
+        config_list.append(config_entry)
+        pci_str = ', '.join(sorted(pci_addresses)) if len(pci_addresses) <= 2 else f"{len(pci_addresses)} PCI addresses"
+        print(f"\n  Resource: rdma/{resource_name}")
+        print(f"    Interface: {if_name}")
+        print(f"    PCI: {pci_str}")
+        print(f"    Available on: {len(nodes_with_this_nic)} nodes ({', '.join(sorted(set(nodes_with_this_nic)))})")
+        print(f"    Max pods: 1000 per NIC")
+
+    # Generate NicClusterPolicy patch
+    rdma_config_json = json.dumps({"configList": config_list}, indent=2)
+
+    print(f"\n=== Generated RDMA Shared Device Plugin Config ===")
+    print(rdma_config_json)
+
+    # Patch the NicClusterPolicy
+    print(f"\n=== Patching NicClusterPolicy ===")
+
+    patch = {
+        "spec": {
+            "rdmaSharedDevicePlugin": {
+                "image": "k8s-rdma-shared-dev-plugin",
+                "repository": "nvcr.io/nvidia/cloud-native",
+                "version": "v1.5.2",
+                "config": rdma_config_json
+            },
+            "secondaryNetwork": {
+                "ipoib": {
+                    "image": "ipoib-cni",
+                    "repository": "nvcr.io/nvidia/mellanox",
+                    "version": "network-operator-v25.10.0"
+                }
+            }
+        }
+    }
+
+    patch_json = json.dumps(patch)
+
+    cmd = [
+        "oc", "patch", "nicclusterpolicy", "nic-cluster-policy",
+        "-n", "nvidia-network-operator",
+        "--type=merge",
+        "-p", patch_json
+    ]
+
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+    if result.returncode == 0:
+        print("✓ NicClusterPolicy patched successfully")
+        print(f"\nEnabled components:")
+        print(f"  - RDMA Shared Device Plugin: {len(config_list)} global resources (one per unique interface)")
+        print(f"  - IPoIB CNI: network-operator-v25.10.0")
+
+        print(f"\nAvailable RDMA resources (same interface name = same PCI across nodes):")
+        for entry in config_list:
+            if_name = entry['selectors']['ifNames'][0]
+            print(f"  - rdma/{entry['resourceName']} ({if_name}): 1000 per NIC")
+    else:
+        print(f"✗ Failed to patch NicClusterPolicy")
+        print(f"Error: {result.stderr}")
+        sys.exit(1)
+
+
+    # Generate NetworkAttachmentDefinitions for IPoIB
+    print("\n=== Generating NetworkAttachmentDefinitions ===")
+
+    if subnet_mode == 'shared':
+        # One global network for all NICs
+        print(f"\nSubnet Mode: SHARED - Creating 1 global network for all {len(config_list)} NICs")
+
+        ip_range = f"{ip_range_base}.100.0/24"
+        route_dest = route_dest_base
+
+        nad_spec = {
+            "apiVersion": "k8s.cni.cncf.io/v1",
+            "kind": "NetworkAttachmentDefinition",
+            "metadata": {
+                "name": "rdma-ib-shared",
+                "namespace": network_namespace,
+                "annotations": {
+                    "description": "Shared IPoIB network for all RDMA NICs"
+                }
+            },
+            "spec": {
+                "config": json.dumps({
+                    "cniVersion": "0.4.0",
+                    "type": "ipoib",
+                    "name": "rdma-ib-shared",
+                    "ipam": {
+                        "type": "whereabouts",
+                        "range": ip_range,
+                        "routes": [{
+                            "dst": route_dest
+                        }]
+                    }
+                })
+            }
+        }
+
+        cmd = ["oc", "apply", "-f", "-"]
+        nad_json = json.dumps(nad_spec)
+        result = subprocess.run(cmd, input=nad_json, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+        if result.returncode == 0:
+            print(f"  ✓ Created NetworkAttachmentDefinition: rdma-ib-shared")
+            print(f"    IP Range: {ip_range}")
+            print(f"    Route: {route_dest}")
+            print(f"    All {len(config_list)} NICs share this subnet")
+        else:
+            print(f"  ✗ Failed to create NetworkAttachmentDefinition")
+            print(f"  Error: {result.stderr}")
+
+    else:
+        # Separate network per NIC interface
+        print(f"\nSubnet Mode: SEPARATE - Creating {len(config_list)} networks (one per unique interface)")
+
+        for entry in config_list:
+            resource_name = entry['resourceName']
+
+            # Extract NIC number from resource name (rdma_shared_nic3 -> 3)
+            if 'nic' in resource_name:
+                nic_number = resource_name.split('nic')[-1]
+                try:
+                    nic_index = int(nic_number)
+                except ValueError:
+                    nic_index = 0
+            else:
+                nic_index = 0
+
+            network_name = f"rdma-nic{nic_number}"
+            interface_name = entry['selectors']['ifNames'][0]  # ib_nicX
+
+            # Calculate IP range and route destination based on NIC number
+            subnet_third_octet = 101 + nic_index
+            ip_range = f"{ip_range_base}.{subnet_third_octet}.0/24"
+
+            route_base_parts = route_dest_base.split('/')
+            route_ip_parts = route_base_parts[0].split('.')
+            route_third_octet = int(route_ip_parts[2]) + nic_index
+            route_dest = f"{route_ip_parts[0]}.{route_ip_parts[1]}.{route_third_octet}.0/{route_base_parts[1]}"
+
+            nad_spec = {
+                "apiVersion": "k8s.cni.cncf.io/v1",
+                "kind": "NetworkAttachmentDefinition",
+                "metadata": {
+                    "name": network_name,
+                    "namespace": network_namespace,
+                    "annotations": {
+                        "k8s.v1.cni.cncf.io/resourceName": f"rdma/{resource_name}",
+                        "description": f"IPoIB network for {interface_name}"
+                    }
+                },
+                "spec": {
+                    "config": json.dumps({
+                        "cniVersion": "0.4.0",
+                        "type": "ipoib",
+                        "name": network_name,
+                        "master": interface_name,
+                        "ipam": {
+                            "type": "whereabouts",
+                            "range": ip_range,
+                            "routes": [{
+                                "dst": route_dest
+                            }]
+                        }
+                    })
+                }
+            }
+
+            cmd = ["oc", "apply", "-f", "-"]
+            nad_json = json.dumps(nad_spec)
+            result = subprocess.run(cmd, input=nad_json, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+            if result.returncode == 0:
+                print(f"  ✓ Created NetworkAttachmentDefinition: {network_name}")
+                print(f"    Interface: {interface_name}")
+                print(f"    Resource: rdma/{resource_name}")
+                print(f"    IP Range: {ip_range}")
+                print(f"    Route: {route_dest}")
+            else:
+                print(f"  ✗ Failed to create NetworkAttachmentDefinition: {network_name}")
+                print(f"  Error: {result.stderr}")
+
+    print(f"\n=== RDMA Configuration Complete ===")
+    print(f"Total RDMA resources: {len(config_list)}")
+    print(f"NetworkAttachmentDefinitions: {'1 (shared)' if subnet_mode == 'shared' else len(config_list)}")
+    print(f"Total RDMA resources: {len(config_list)}")
+    print(f"NetworkAttachmentDefinitions: {'1 (shared)' if subnet_mode == 'shared' else len(config_list)}")
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: generate-rdma-config
+  namespace: default
+  annotations:
+    argocd.argoproj.io/sync-wave: "28"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app: rdma-config-generator
+    spec:
+      serviceAccountName: rdma-config-generator
+      restartPolicy: OnFailure
+      containers:
+        - name: generator
+          image: registry.redhat.io/openshift4/ose-cli:latest
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+
+              echo "=== RDMA Configuration Generator for NVIDIA Network Operator ==="
+
+              # Wait for NIC discovery to complete (from 26a-sriov-discovery)
+              echo "Waiting for NIC discovery to complete..."
+              timeout=600
+              elapsed=0
+              interval=10
+
+              while [ $elapsed -lt $timeout ]; do
+                # Check if discovery configmap exists with IB devices
+                if oc get configmap generated-sriov-resources -n default &>/dev/null; then
+                  echo "✓ NIC discovery completed"
+                  break
+                fi
+                echo "Waiting for NIC discovery... (${elapsed}s elapsed)"
+                sleep $interval
+                elapsed=$((elapsed + interval))
+              done
+
+              if [ $elapsed -ge $timeout ]; then
+                echo "⚠ Timeout waiting for NIC discovery - proceeding with MOFED-only config"
+              fi
+
+              # Copy IB devices file from discovery output if it exists
+              mkdir -p /discovery
+              if oc get configmap generated-sriov-resources -n default -o jsonpath='{.data.ib-devices\.json}' > /discovery/ib-devices.json 2>/dev/null; then
+                echo "✓ Retrieved IB devices from discovery"
+              else
+                echo "No IB devices found in discovery output"
+              fi
+
+              # Install Python if needed
+              if ! command -v python3 &> /dev/null; then
+                echo "Installing Python..."
+                microdnf install -y python3
+              fi
+
+              # Run the generator script
+              python3 /scripts/generate-rdma-config.py
+          env:
+            - name: MTU
+              value: "9000"
+            - name: IP_RANGE_BASE
+              value: "10.0"
+            - name: NETWORK_NAMESPACE
+              value: "default"
+            - name: ROUTE_DEST
+              value: "192.168.75.0/24"
+            - name: SUBNET_MODE
+              value: "separate"  # "separate" (one network per NIC) or "shared" (one network for all NICs)
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: discovery
+              mountPath: /discovery
+      volumes:
+        - name: script
+          configMap:
+            name: rdma-config-generator-script
+            defaultMode: 0755
+        - name: discovery
+          emptyDir: {}

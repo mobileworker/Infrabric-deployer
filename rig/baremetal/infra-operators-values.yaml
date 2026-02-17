@@ -1,0 +1,31 @@
+additionalCatalogSources: []
+
+cliImage: ghcr.io/helmfile/helmfile:v1.2.2
+namespace: openshift-marketplace
+
+# Operators required for NVIDIA GPU/Network stack
+# NFD MUST be first - GPU and Network operators depend on node labels from NFD
+#
+# NOTE: No explicit channels specified - OLM will use the vendor's defaultChannel
+# This allows OpenShift to automatically select the recommended version for each operator
+operators:
+  # Node Feature Discovery - Discovers and labels nodes with hardware features
+  - name: nfd
+    namespace: openshift-nfd
+    source: redhat-operators
+    sourceNamespace: openshift-marketplace
+    targetNamespace: openshift-nfd
+
+  # NVIDIA Network Operator - Manages MOFED drivers and SR-IOV device plugin
+  - name: nvidia-network-operator
+    namespace: nvidia-network-operator
+    source: certified-operators
+    sourceNamespace: openshift-marketplace
+    targetNamespace: nvidia-network-operator
+
+  # NVIDIA GPU Operator - Manages GPU drivers and device plugin
+  - name: gpu-operator-certified
+    namespace: nvidia-gpu-operator
+    source: certified-operators
+    sourceNamespace: openshift-marketplace
+    targetNamespace: nvidia-gpu-operator

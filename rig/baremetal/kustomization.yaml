@@ -1,0 +1,19 @@
+kind: Kustomization
+apiVersion: kustomize.config.k8s.io/v1beta1
+namespace: openshift-gitops
+resources:
+  - namespace.yaml
+  # Core infrastructure
+  - ../../apps/00-node-preparation
+  - ../../apps/20-operators-baremetal
+  - ../../apps/15-nfd
+  - ../../apps/25-operator-readiness
+  # RDMA/NIC stack (InfiniBand & RoCE)
+  - ../../apps/25a-sriov-operator          # Wave 25: SR-IOV operator (RoCE only)
+  - ../../apps/25b-ib-interface-normalization  # Wave 25: IB interface name normalization (triggers node reboot)
+  - ../../apps/26a-sriov-discovery         # Wave 26: NIC discovery and resource generation
+  - ../../apps/28-gitops                   # Wave 28: GitOps configuration
+  - ../../apps/29-nvidia-network-operator  # Wave 29: NVIDIA Network Operator
+  - ../../apps/30-nvidia-mofed-ready       # Wave 30: MOFED readiness gate
+  # GPU stack
+  - ../../apps/31-gpu-operator-nfd         # Wave 31: GPU Operator

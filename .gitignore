@@ -1,0 +1,34 @@
+# Secrets and sensitive files
+*.secret.yaml
+99-*-secret.yaml
+**/secrets/
+.env
+.env.*
+
+# Kustomize generated files
+kustomization-generated.yaml
+
+# Temporary files
+*.tmp
+*.swp
+*~
+.DS_Store
+
+# IDE files
+.vscode/
+.idea/
+*.iml
+
+# Backup files
+*.bak
+backup-*
+
+# Local development
+local/
+.local/
+
+# Build artifacts
+build/
+dist/
+*.tar.gz
+*.zip

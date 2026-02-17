@@ -1,0 +1,623 @@
+              # Test 1: InfiniBand Tests (only if we have RDMA shared devices)
+              # RDMA_COUNT was detected earlier in the script
+              if [ "$RDMA_COUNT" -gt 0 ] && [ ${#VALID_NICS[@]} -eq 0 ]; then
+                echo ""
+                echo -e "${CYAN}=========================================="
+                echo -e "Test 1: InfiniBand Bandwidth Tests"
+                echo -e "==========================================${RESET}"
+                echo ""
+                echo "Testing RDMA bandwidth using ib_write_bw"
+                echo "Message size: 4MB, Duration: ${TEST_DURATION}s"
+                echo ""
+                echo "Network Type: InfiniBand (native IB transport)"
+                echo ""
+
+                # Use RDMA shared devices directly (InfiniBand native mode)
+                echo ""
+                echo -e "${YELLOW}Using RDMA shared devices (mlx5_*) for InfiniBand tests${RESET}"
+                echo ""
+
+                # Get active RDMA devices for both pods
+                SOURCE_ACTIVE_DEVS=(${POD_RDMA_DEVICES[$SOURCE_POD]})
+                TARGET_ACTIVE_DEVS=(${POD_RDMA_DEVICES[$TARGET_POD]})
+
+                if [ ${#SOURCE_ACTIVE_DEVS[@]} -eq 0 ] || [ ${#TARGET_ACTIVE_DEVS[@]} -eq 0 ]; then
+                  echo "ERROR: No active RDMA devices found on pods"
+                  echo "  Source pod $SOURCE_POD: ${SOURCE_ACTIVE_DEVS[@]:-None}"
+                  echo "  Target pod $TARGET_POD: ${TARGET_ACTIVE_DEVS[@]:-None}"
+                else
+                  echo "Active RDMA devices:"
+                  echo "  Source pod $SOURCE_POD: ${SOURCE_ACTIVE_DEVS[@]}"
+                  echo "  Target pod $TARGET_POD: ${TARGET_ACTIVE_DEVS[@]}"
+                  echo ""
+
+                  # Build GPU-NIC affinity map for optimal GPUDirect performance
+                  echo "Building GPU-NIC topology database..."
+
+                  # Parse nvidia-smi topology and store in database
+                  TOPO_OUTPUT=$(oc exec $SOURCE_POD -- nvidia-smi topo -m 2>/dev/null || echo "")
+                  if [ -n "$TOPO_OUTPUT" ]; then
+                    # Extract NIC legend (NIC0: mlx5_0, etc.) and build mapping
+                    declare -A NIC_NUM_TO_DEV
+                    while IFS= read -r line; do
+                      if [[ $line =~ NIC([0-9]+):[[:space:]]+(mlx5_[0-9]+) ]]; then
+                        NIC_NUM_TO_DEV["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+                      fi
+                    done <<< "$TOPO_OUTPUT"
+
+                    # Parse GPU rows and store all GPU-NIC connections in database
+                    while IFS= read -r gpu_line; do
+                      if [[ $gpu_line =~ ^GPU([0-9]+) ]]; then
+                        GPU_NUM="${BASH_REMATCH[1]}"
+                        # Extract connection types for each NIC
+                        for nic_idx in "${!NIC_NUM_TO_DEV[@]}"; do
+                          NIC_DEV="${NIC_NUM_TO_DEV[$nic_idx]}"
+                          COL_IDX=$((9 + nic_idx))
+                          CONN=$(echo "$gpu_line" | awk -v col=$COL_IDX '{print $col}')
+
+                          # Store in database
+                          if [ -n "$CONN" ] && [ "$CONN" != "X" ]; then
+                            sqlite3 "$DB_FILE" "INSERT INTO gpu_nic_topology (test_run_id, pod_name, node_name, nic_device, gpu_id, connection_type, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$SOURCE_NODE', '$NIC_DEV', $GPU_NUM, '$CONN', $(date +%s));" 2>/dev/null || true
+                          fi
+                        done
+                      fi
+                    done <<< "$TOPO_OUTPUT"
+
+                    # Display PXB (optimal) mappings for source pod
+                    echo "Optimal GPU-NIC mappings for $SOURCE_POD (PXB connections):"
+                    sqlite3 -separator ' → ' "$DB_FILE" "SELECT DISTINCT nic_device, 'GPU' || gpu_id || ' (' || connection_type || ')' FROM gpu_nic_topology WHERE test_run_id = '$TEST_RUN_ID' AND pod_name = '$SOURCE_POD' AND connection_type = 'PXB' ORDER BY nic_device;"
+                  fi
+
+                  # Build GPU-NIC topology for TARGET pod
+                  TOPO_OUTPUT=$(oc exec $TARGET_POD -- nvidia-smi topo -m 2>/dev/null || echo "")
+                  if [ -n "$TOPO_OUTPUT" ]; then
+                    # Extract NIC legend (NIC0: mlx5_0, etc.) and build mapping
+                    declare -A NIC_NUM_TO_DEV_TARGET
+                    while IFS= read -r line; do
+                      if [[ $line =~ NIC([0-9]+):[[:space:]]+(mlx5_[0-9]+) ]]; then
+                        NIC_NUM_TO_DEV_TARGET["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+                      fi
+                    done <<< "$TOPO_OUTPUT"
+
+                    # Parse GPU rows and store all GPU-NIC connections in database for target pod
+                    while IFS= read -r gpu_line; do
+                      if [[ $gpu_line =~ ^GPU([0-9]+) ]]; then
+                        GPU_NUM="${BASH_REMATCH[1]}"
+                        # Extract connection types for each NIC
+                        for nic_idx in "${!NIC_NUM_TO_DEV_TARGET[@]}"; do
+                          NIC_DEV="${NIC_NUM_TO_DEV_TARGET[$nic_idx]}"
+                          COL_IDX=$((9 + nic_idx))
+                          CONN=$(echo "$gpu_line" | awk -v col=$COL_IDX '{print $col}')
+
+                          # Store in database
+                          if [ -n "$CONN" ] && [ "$CONN" != "X" ]; then
+                            sqlite3 "$DB_FILE" "INSERT INTO gpu_nic_topology (test_run_id, pod_name, node_name, nic_device, gpu_id, connection_type, timestamp) VALUES ('$TEST_RUN_ID', '$TARGET_POD', '$TARGET_NODE', '$NIC_DEV', $GPU_NUM, '$CONN', $(date +%s));" 2>/dev/null || true
+                          fi
+                        done
+                      fi
+                    done <<< "$TOPO_OUTPUT"
+
+                    # Display PXB (optimal) mappings for target pod
+                    echo "Optimal GPU-NIC mappings for $TARGET_POD (PXB connections):"
+                    sqlite3 -separator ' → ' "$DB_FILE" "SELECT DISTINCT nic_device, 'GPU' || gpu_id || ' (' || connection_type || ')' FROM gpu_nic_topology WHERE test_run_id = '$TEST_RUN_ID' AND pod_name = '$TARGET_POD' AND connection_type = 'PXB' ORDER BY nic_device;"
+                  fi
+                  echo ""
+
+                  # Sequential tests - one device at a time
+                  echo ""
+                  echo -e "${MAGENTA}=========================================="
+                  echo -e "  SEQUENTIAL Tests (one device at a time)"
+                  echo -e "==========================================${RESET}"
+                  echo ""
+
+                  for i in "${!SOURCE_ACTIVE_DEVS[@]}"; do
+                    if [ $i -ge ${#TARGET_ACTIVE_DEVS[@]} ]; then
+                      break
+                    fi
+
+                    SOURCE_RDMA_DEV="${SOURCE_ACTIVE_DEVS[$i]}"
+                    TARGET_RDMA_DEV="${TARGET_ACTIVE_DEVS[$i]}"
+
+                    echo "  Testing [$SOURCE_RDMA_DEV → $TARGET_RDMA_DEV] sequentially..."
+
+                    # IB test (system memory)
+                    echo "    IB test (host memory)..."
+                    oc exec $SOURCE_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                    oc exec $TARGET_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                    sleep 2
+
+                    # Start server on target
+                    oc exec $TARGET_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw -d $TARGET_RDMA_DEV -s $MSG_SIZE -D $TEST_DURATION -F --report_gbits -q 2 > /tmp/ib_host_${TARGET_RDMA_DEV}_seq.log 2>&1 &"
+                    sleep 3
+
+                    # Get target IP
+                    TARGET_IP=$(oc get pod $TARGET_POD -o jsonpath='{.status.podIP}')
+
+                    # Run client from source
+                    oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; timeout $TEST_TIMEOUT ib_write_bw -d $SOURCE_RDMA_DEV -s $MSG_SIZE -D $TEST_DURATION -F --report_gbits -q 2 $TARGET_IP > /tmp/ib_host_${SOURCE_RDMA_DEV}_seq_result.log 2>&1"
+                    HOST_RESULT=$(oc exec $SOURCE_POD -- bash -c "cat /tmp/ib_host_${SOURCE_RDMA_DEV}_seq_result.log 2>/dev/null | grep '$MSG_SIZE' | grep -v '#' | tail -1" || echo "")
+
+                    if [ -n "$HOST_RESULT" ]; then
+                      HOST_SEQ_GBPS=$(echo "$HOST_RESULT" | awk '{print $4}')
+                      HOST_SEQ_ITERS=$(echo "$HOST_RESULT" | awk '{print $2}')
+                      HOST_SEQ_STATUS="PASS"
+                      [ "$HOST_SEQ_ITERS" -gt 1000 ] 2>/dev/null && HOST_SEQ_STATUS="PASS" || HOST_SEQ_STATUS="FAIL"
+                      echo -e "      ${GREEN}Result: $HOST_SEQ_GBPS Gb/s ($HOST_SEQ_ITERS iters) - $HOST_SEQ_STATUS${RESET}"
+
+                      # Store in database
+                      sqlite3 "$DB_FILE" "INSERT INTO ib_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, nic_interface, rdma_device_source, rdma_device_target, link_speed_gbps, message_size, test_mode, memory_type, bandwidth_gbps, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', 'N/A', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', 0, $MSG_SIZE, 'sequential', 'host', ${HOST_SEQ_GBPS:-0.0}, ${HOST_SEQ_ITERS:-0}, '$HOST_SEQ_STATUS', $(date +%s));" 2>/dev/null || true
+                    else
+                      echo -e "      ${RED}Result: FAIL${RESET}"
+                      HOST_SEQ_GBPS="0.0"
+                      HOST_SEQ_ITERS="0"
+                      HOST_SEQ_STATUS="FAIL"
+                      sqlite3 "$DB_FILE" "INSERT INTO ib_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, nic_interface, rdma_device_source, rdma_device_target, link_speed_gbps, message_size, test_mode, memory_type, bandwidth_gbps, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', 'N/A', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', 0, $MSG_SIZE, 'sequential', 'host', 0.0, 0, 'FAIL', $(date +%s));" 2>/dev/null || true
+                    fi
+
+                    oc exec $SOURCE_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                    oc exec $TARGET_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                    sleep 2
+
+                    # IB+CUDA test (GPU memory) - GPUDirect RDMA
+                    echo "    IB+CUDA test (GPUDirect RDMA)..."
+
+                    # Check if GPUs are available and IOMMU is disabled
+                    SOURCE_GPU_CHECK=$(oc exec $SOURCE_POD -- bash -c "nvidia-smi -L 2>/dev/null | head -1" || echo "")
+                    TARGET_GPU_CHECK=$(oc exec $TARGET_POD -- bash -c "nvidia-smi -L 2>/dev/null | head -1" || echo "")
+                    SOURCE_IOMMU_OK=true
+                    TARGET_IOMMU_OK=true
+                    for node in "${IOMMU_ENABLED_NODES[@]}"; do
+                      if [[ "$SOURCE_NODE" == *"$node"* ]]; then SOURCE_IOMMU_OK=false; fi
+                      if [[ "$TARGET_NODE" == *"$node"* ]]; then TARGET_IOMMU_OK=false; fi
+                    done
+
+                    if [ -n "$SOURCE_GPU_CHECK" ] && [ -n "$TARGET_GPU_CHECK" ] && [ "$SOURCE_IOMMU_OK" = true ] && [ "$TARGET_IOMMU_OK" = true ]; then
+                      # Get optimal GPU for this NIC from topology database (prefer PXB, fallback to 0)
+                      SOURCE_GPU_ID=$(sqlite3 "$DB_FILE" "SELECT gpu_id FROM gpu_nic_topology WHERE test_run_id = '$TEST_RUN_ID' AND pod_name = '$SOURCE_POD' AND nic_device = '$SOURCE_RDMA_DEV' AND connection_type = 'PXB' LIMIT 1;" 2>/dev/null || echo "0")
+                      TARGET_GPU_ID=$(sqlite3 "$DB_FILE" "SELECT gpu_id FROM gpu_nic_topology WHERE test_run_id = '$TEST_RUN_ID' AND pod_name = '$TARGET_POD' AND nic_device = '$TARGET_RDMA_DEV' AND connection_type = 'PXB' LIMIT 1;" 2>/dev/null || echo "0")
+                      SOURCE_GPU_ID=${SOURCE_GPU_ID:-0}
+                      TARGET_GPU_ID=${TARGET_GPU_ID:-0}
+
+                      # Start server on target with GPU memory
+                      oc exec $TARGET_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw -d $TARGET_RDMA_DEV -s $MSG_SIZE -D $TEST_DURATION -F --report_gbits -q 2 --use_cuda=$TARGET_GPU_ID > /tmp/ib_gpu_${TARGET_RDMA_DEV}_seq.log 2>&1 &"
+                      sleep 3
+
+                      # Run client from source with GPU memory
+                      oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; timeout $TEST_TIMEOUT ib_write_bw -d $SOURCE_RDMA_DEV -s $MSG_SIZE -D $TEST_DURATION -F --report_gbits -q 2 --use_cuda=$SOURCE_GPU_ID $TARGET_IP > /tmp/ib_gpu_${SOURCE_RDMA_DEV}_seq_result.log 2>&1"
+                      GPU_RESULT=$(oc exec $SOURCE_POD -- bash -c "cat /tmp/ib_gpu_${SOURCE_RDMA_DEV}_seq_result.log 2>/dev/null | grep '$MSG_SIZE' | grep -v '#' | tail -1" || echo "")
+
+                      if [ -n "$GPU_RESULT" ]; then
+                        GPU_SEQ_GBPS=$(echo "$GPU_RESULT" | awk '{print $4}')
+                        GPU_SEQ_ITERS=$(echo "$GPU_RESULT" | awk '{print $2}')
+                        GPU_SEQ_STATUS="PASS"
+                        [ "$GPU_SEQ_ITERS" -gt 1000 ] 2>/dev/null && GPU_SEQ_STATUS="PASS" || GPU_SEQ_STATUS="FAIL"
+                        echo -e "      ${GREEN}Result: $GPU_SEQ_GBPS Gb/s ($GPU_SEQ_ITERS iters) - $GPU_SEQ_STATUS${RESET}"
+
+                        # Store in database
+                        sqlite3 "$DB_FILE" "INSERT INTO ib_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, nic_interface, rdma_device_source, rdma_device_target, link_speed_gbps, message_size, test_mode, memory_type, bandwidth_gbps, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', 'N/A', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', 0, $MSG_SIZE, 'sequential', 'gpu', ${GPU_SEQ_GBPS:-0.0}, ${GPU_SEQ_ITERS:-0}, '$GPU_SEQ_STATUS', $(date +%s));" 2>/dev/null || true
+                      else
+                        echo -e "      ${RED}Result: FAIL${RESET}"
+                        GPU_SEQ_GBPS="0.0"
+                        GPU_SEQ_ITERS="0"
+                        GPU_SEQ_STATUS="FAIL"
+                        sqlite3 "$DB_FILE" "INSERT INTO ib_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, nic_interface, rdma_device_source, rdma_device_target, link_speed_gbps, message_size, test_mode, memory_type, bandwidth_gbps, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', 'N/A', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', 0, $MSG_SIZE, 'sequential', 'gpu', 0.0, 0, 'FAIL', $(date +%s));" 2>/dev/null || true
+                      fi
+                    else
+                      # Skip GPU tests
+                      SKIP_REASON=""
+                      if [ -z "$SOURCE_GPU_CHECK" ] || [ -z "$TARGET_GPU_CHECK" ]; then
+                        SKIP_REASON="GPUs not available"
+                      elif [ "$SOURCE_IOMMU_OK" = false ] || [ "$TARGET_IOMMU_OK" = false ]; then
+                        SKIP_REASON="IOMMU enabled"
+                      fi
+                      echo -e "      ${YELLOW}SKIPPED - $SKIP_REASON${RESET}"
+                      sqlite3 "$DB_FILE" "INSERT INTO ib_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, nic_interface, rdma_device_source, rdma_device_target, link_speed_gbps, message_size, test_mode, memory_type, bandwidth_gbps, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', 'N/A', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', 0, $MSG_SIZE, 'sequential', 'gpu', 0.0, 0, 'SKIPPED', $(date +%s));" 2>/dev/null || true
+                    fi
+
+                    oc exec $SOURCE_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                    oc exec $TARGET_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                    echo ""
+                  done
+
+                  # Parallel tests - all devices simultaneously
+                  echo ""
+                  echo -e "${MAGENTA}=========================================="
+                  echo -e "  PARALLEL Tests (all devices simultaneously)"
+                  echo -e "==========================================${RESET}"
+                  echo ""
+
+                  echo "  Running IB tests on ALL devices in parallel (host memory)..."
+
+                  # Start servers on all devices
+                  PORT=18515
+                  for i in "${!SOURCE_ACTIVE_DEVS[@]}"; do
+                    if [ $i -ge ${#TARGET_ACTIVE_DEVS[@]} ]; then
+                      break
+                    fi
+                    TARGET_RDMA_DEV="${TARGET_ACTIVE_DEVS[$i]}"
+                    oc exec $TARGET_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw -d $TARGET_RDMA_DEV -p $PORT -s $MSG_SIZE -D $TEST_DURATION -F --report_gbits -q 1 > /tmp/ib_host_${TARGET_RDMA_DEV}_par.log 2>&1 &"
+                    PORT=$((PORT + 1))
+                  done
+                  sleep 3
+
+                  # Start clients on all devices in parallel
+                  CLIENT_CMD="set +m; "
+                  PORT=18515
+                  TARGET_IP=$(oc get pod $TARGET_POD -o jsonpath='{.status.podIP}')
+                  for i in "${!SOURCE_ACTIVE_DEVS[@]}"; do
+                    if [ $i -ge ${#TARGET_ACTIVE_DEVS[@]} ]; then
+                      break
+                    fi
+                    SOURCE_RDMA_DEV="${SOURCE_ACTIVE_DEVS[$i]}"
+                    CLIENT_CMD="${CLIENT_CMD}(ulimit -l unlimited; timeout $TEST_TIMEOUT ib_write_bw -d $SOURCE_RDMA_DEV -p $PORT -s $MSG_SIZE -D $TEST_DURATION -F --report_gbits -q 1 $TARGET_IP > /tmp/ib_host_${SOURCE_RDMA_DEV}_par_result.log 2>&1) & "
+                    PORT=$((PORT + 1))
+                  done
+                  CLIENT_CMD="${CLIENT_CMD}wait"
+                  oc exec $SOURCE_POD -- bash -c "$CLIENT_CMD" &
+                  EXEC_PID=$!
+                  sleep 2
+
+                  # Wait for tests to complete
+                  echo "  Waiting for IB tests to complete..."
+                  wait $EXEC_PID 2>/dev/null || true
+                  echo "  IB tests finished."
+                  echo ""
+
+                  # Collect and display results
+                  for i in "${!SOURCE_ACTIVE_DEVS[@]}"; do
+                    if [ $i -ge ${#TARGET_ACTIVE_DEVS[@]} ]; then
+                      break
+                    fi
+                    SOURCE_RDMA_DEV="${SOURCE_ACTIVE_DEVS[$i]}"
+                    TARGET_RDMA_DEV="${TARGET_ACTIVE_DEVS[$i]}"
+                    HOST_RESULT=$(oc exec $SOURCE_POD -- bash -c "cat /tmp/ib_host_${SOURCE_RDMA_DEV}_par_result.log 2>/dev/null | grep '$MSG_SIZE' | grep -v '#' | tail -1" || echo "")
+
+                    if [ -n "$HOST_RESULT" ]; then
+                      HOST_PAR_GBPS=$(echo "$HOST_RESULT" | awk '{print $4}')
+                      HOST_PAR_ITERS=$(echo "$HOST_RESULT" | awk '{print $2}')
+                      HOST_PAR_STATUS="PASS"
+                      [ "$HOST_PAR_ITERS" -gt 1000 ] 2>/dev/null && HOST_PAR_STATUS="PASS" || HOST_PAR_STATUS="FAIL"
+                      echo -e "  [$SOURCE_RDMA_DEV → $TARGET_RDMA_DEV] IB: ${GREEN}$HOST_PAR_GBPS Gb/s ($HOST_PAR_ITERS iters) - $HOST_PAR_STATUS${RESET}"
+
+                      # Store in database
+                      sqlite3 "$DB_FILE" "INSERT INTO ib_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, nic_interface, rdma_device_source, rdma_device_target, link_speed_gbps, message_size, test_mode, memory_type, bandwidth_gbps, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', 'N/A', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', 0, $MSG_SIZE, 'parallel', 'host', ${HOST_PAR_GBPS:-0.0}, ${HOST_PAR_ITERS:-0}, '$HOST_PAR_STATUS', $(date +%s));" 2>/dev/null || true
+                    else
+                      echo "  [$SOURCE_RDMA_DEV → $TARGET_RDMA_DEV] IB: FAIL"
+                      sqlite3 "$DB_FILE" "INSERT INTO ib_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, nic_interface, rdma_device_source, rdma_device_target, link_speed_gbps, message_size, test_mode, memory_type, bandwidth_gbps, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', 'N/A', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', 0, $MSG_SIZE, 'parallel', 'host', 0.0, 0, 'FAIL', $(date +%s));" 2>/dev/null || true
+                    fi
+                  done
+
+                  oc exec $SOURCE_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                  oc exec $TARGET_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                  sleep 2
+
+                  # GPU parallel tests
+                  echo ""
+                  echo "  Running IB+CUDA tests on ALL devices in parallel (GPUDirect RDMA)..."
+
+                  # Check if GPUs are available and IOMMU is disabled
+                  SOURCE_GPU_CHECK=$(oc exec $SOURCE_POD -- bash -c "nvidia-smi -L 2>/dev/null | head -1" || echo "")
+                  TARGET_GPU_CHECK=$(oc exec $TARGET_POD -- bash -c "nvidia-smi -L 2>/dev/null | head -1" || echo "")
+                  SOURCE_IOMMU_OK=true
+                  TARGET_IOMMU_OK=true
+                  for node in "${IOMMU_ENABLED_NODES[@]}"; do
+                    if [[ "$SOURCE_NODE" == *"$node"* ]]; then SOURCE_IOMMU_OK=false; fi
+                    if [[ "$TARGET_NODE" == *"$node"* ]]; then TARGET_IOMMU_OK=false; fi
+                  done
+
+                  if [ -n "$SOURCE_GPU_CHECK" ] && [ -n "$TARGET_GPU_CHECK" ] && [ "$SOURCE_IOMMU_OK" = true ] && [ "$TARGET_IOMMU_OK" = true ]; then
+                    # Start servers on all devices with GPU memory
+                    PORT=18515
+                    for i in "${!SOURCE_ACTIVE_DEVS[@]}"; do
+                      if [ $i -ge ${#TARGET_ACTIVE_DEVS[@]} ]; then
+                        break
+                      fi
+                      TARGET_RDMA_DEV="${TARGET_ACTIVE_DEVS[$i]}"
+                      TARGET_GPU_ID=$(sqlite3 "$DB_FILE" "SELECT gpu_id FROM gpu_nic_topology WHERE test_run_id = '$TEST_RUN_ID' AND pod_name = '$TARGET_POD' AND nic_device = '$TARGET_RDMA_DEV' AND connection_type = 'PXB' LIMIT 1;" 2>/dev/null || echo "0")
+                      TARGET_GPU_ID=${TARGET_GPU_ID:-0}
+                      oc exec $TARGET_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw -d $TARGET_RDMA_DEV -p $PORT -s $MSG_SIZE -D $TEST_DURATION -F --report_gbits -q 1 --use_cuda=$TARGET_GPU_ID > /tmp/ib_gpu_${TARGET_RDMA_DEV}_par.log 2>&1 &"
+                      PORT=$((PORT + 1))
+                    done
+                    sleep 3
+
+                    # Start clients on all devices in parallel with GPU memory
+                    CLIENT_CMD="set +m; "
+                    PORT=18515
+                    for i in "${!SOURCE_ACTIVE_DEVS[@]}"; do
+                      if [ $i -ge ${#TARGET_ACTIVE_DEVS[@]} ]; then
+                        break
+                      fi
+                      SOURCE_RDMA_DEV="${SOURCE_ACTIVE_DEVS[$i]}"
+                      SOURCE_GPU_ID=$(sqlite3 "$DB_FILE" "SELECT gpu_id FROM gpu_nic_topology WHERE test_run_id = '$TEST_RUN_ID' AND pod_name = '$SOURCE_POD' AND nic_device = '$SOURCE_RDMA_DEV' AND connection_type = 'PXB' LIMIT 1;" 2>/dev/null || echo "0")
+                      SOURCE_GPU_ID=${SOURCE_GPU_ID:-0}
+                      CLIENT_CMD="${CLIENT_CMD}(ulimit -l unlimited; timeout $TEST_TIMEOUT ib_write_bw -d $SOURCE_RDMA_DEV -p $PORT -s $MSG_SIZE -D $TEST_DURATION -F --report_gbits -q 1 --use_cuda=$SOURCE_GPU_ID $TARGET_IP > /tmp/ib_gpu_${SOURCE_RDMA_DEV}_par_result.log 2>&1) & "
+                      PORT=$((PORT + 1))
+                    done
+                    CLIENT_CMD="${CLIENT_CMD}wait"
+                    oc exec $SOURCE_POD -- bash -c "$CLIENT_CMD" &
+                    EXEC_PID=$!
+                    sleep 2
+
+                    # Wait for tests to complete
+                    echo "  Waiting for IB+CUDA tests to complete..."
+                    wait $EXEC_PID 2>/dev/null || true
+                    echo "  IB+CUDA tests finished."
+                    echo ""
+
+                    # Collect and display results
+                    for i in "${!SOURCE_ACTIVE_DEVS[@]}"; do
+                      if [ $i -ge ${#TARGET_ACTIVE_DEVS[@]} ]; then
+                        break
+                      fi
+                      SOURCE_RDMA_DEV="${SOURCE_ACTIVE_DEVS[$i]}"
+                      TARGET_RDMA_DEV="${TARGET_ACTIVE_DEVS[$i]}"
+                      GPU_RESULT=$(oc exec $SOURCE_POD -- bash -c "cat /tmp/ib_gpu_${SOURCE_RDMA_DEV}_par_result.log 2>/dev/null | grep '$MSG_SIZE' | grep -v '#' | tail -1" || echo "")
+
+                      if [ -n "$GPU_RESULT" ]; then
+                        GPU_PAR_GBPS=$(echo "$GPU_RESULT" | awk '{print $4}')
+                        GPU_PAR_ITERS=$(echo "$GPU_RESULT" | awk '{print $2}')
+                        GPU_PAR_STATUS="PASS"
+                        [ "$GPU_PAR_ITERS" -gt 1000 ] 2>/dev/null && GPU_PAR_STATUS="PASS" || GPU_PAR_STATUS="FAIL"
+                        echo -e "  [$SOURCE_RDMA_DEV → $TARGET_RDMA_DEV] IB+CUDA: ${GREEN}$GPU_PAR_GBPS Gb/s ($GPU_PAR_ITERS iters) - $GPU_PAR_STATUS${RESET}"
+
+                        # Store in database
+                        sqlite3 "$DB_FILE" "INSERT INTO ib_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, nic_interface, rdma_device_source, rdma_device_target, link_speed_gbps, message_size, test_mode, memory_type, bandwidth_gbps, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', 'N/A', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', 0, $MSG_SIZE, 'parallel', 'gpu', ${GPU_PAR_GBPS:-0.0}, ${GPU_PAR_ITERS:-0}, '$GPU_PAR_STATUS', $(date +%s));" 2>/dev/null || true
+                      else
+                        echo "  [$SOURCE_RDMA_DEV → $TARGET_RDMA_DEV] IB+CUDA: FAIL"
+                        sqlite3 "$DB_FILE" "INSERT INTO ib_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, nic_interface, rdma_device_source, rdma_device_target, link_speed_gbps, message_size, test_mode, memory_type, bandwidth_gbps, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', 'N/A', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', 0, $MSG_SIZE, 'parallel', 'gpu', 0.0, 0, 'FAIL', $(date +%s));" 2>/dev/null || true
+                      fi
+                    done
+                  else
+                    # Skip GPU tests
+                    SKIP_REASON=""
+                    if [ -z "$SOURCE_GPU_CHECK" ] || [ -z "$TARGET_GPU_CHECK" ]; then
+                      SKIP_REASON="GPUs not available"
+                    elif [ "$SOURCE_IOMMU_OK" = false ] || [ "$TARGET_IOMMU_OK" = false ]; then
+                      SKIP_REASON="IOMMU enabled"
+                    fi
+                    echo -e "  ${YELLOW}Tests SKIPPED - $SKIP_REASON${RESET}"
+                    for i in "${!SOURCE_ACTIVE_DEVS[@]}"; do
+                      if [ $i -ge ${#TARGET_ACTIVE_DEVS[@]} ]; then
+                        break
+                      fi
+                      SOURCE_RDMA_DEV="${SOURCE_ACTIVE_DEVS[$i]}"
+                      TARGET_RDMA_DEV="${TARGET_ACTIVE_DEVS[$i]}"
+                      echo "  [$SOURCE_RDMA_DEV → $TARGET_RDMA_DEV] IB+CUDA: 0.0 Gb/s (SKIPPED - $SKIP_REASON)"
+                      sqlite3 "$DB_FILE" "INSERT INTO ib_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, nic_interface, rdma_device_source, rdma_device_target, link_speed_gbps, message_size, test_mode, memory_type, bandwidth_gbps, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', 'N/A', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', 0, $MSG_SIZE, 'parallel', 'gpu', 0.0, 0, 'SKIPPED', $(date +%s));" 2>/dev/null || true
+                    done
+                  fi
+
+                  oc exec $SOURCE_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                  oc exec $TARGET_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+
+                  # Display results for this pod pair immediately
+                  echo ""
+                  echo -e "${CYAN}======================================================================"
+                  echo -e "IB Test Results for $SOURCE_POD → $TARGET_POD"
+                  echo -e "======================================================================${RESET}"
+                  echo ""
+
+                  # Query database for IB results for this pod pair
+              echo "IB test results stored in database"
+
+                  echo ""
+                fi
+
+                # UCX Bandwidth Tests
+                echo ""
+                echo -e "${CYAN}=========================================="
+                echo -e "UCX Bandwidth Tests"
+                echo -e "==========================================${RESET}"
+                echo ""
+                echo "Testing UCX tag_bw for both host and GPU memory"
+                echo ""
+
+                for i in "${!SOURCE_ACTIVE_DEVS[@]}"; do
+                  if [ $i -ge ${#TARGET_ACTIVE_DEVS[@]} ]; then
+                    break
+                  fi
+
+                  SOURCE_RDMA_DEV="${SOURCE_ACTIVE_DEVS[$i]}"
+                  TARGET_RDMA_DEV="${TARGET_ACTIVE_DEVS[$i]}"
+
+                  echo "  Testing [$SOURCE_RDMA_DEV → $TARGET_RDMA_DEV] with UCX..."
+
+                  # UCX Host Memory Test
+                  echo "    UCX bandwidth test (host memory)..."
+                  oc exec $SOURCE_POD -- pkill -9 ucx_perftest 2>/dev/null || true
+                  oc exec $TARGET_POD -- pkill -9 ucx_perftest 2>/dev/null || true
+                  sleep 2
+
+                  # Start UCX server on target - force specific RDMA device
+                  oc exec $TARGET_POD -- bash -c "UCX_NET_DEVICES=$TARGET_RDMA_DEV:1 timeout $TEST_TIMEOUT ucx_perftest -t tag_bw -s $MSG_SIZE -n 2000 > /tmp/ucx_host_${TARGET_RDMA_DEV}.log 2>&1 &"
+                  sleep 3
+
+                  # Run UCX client from source - force specific RDMA device
+                  TARGET_IP=$(oc get pod $TARGET_POD -o jsonpath='{.status.podIP}')
+                  oc exec $SOURCE_POD -- bash -c "UCX_NET_DEVICES=$SOURCE_RDMA_DEV:1 timeout $TEST_TIMEOUT ucx_perftest $TARGET_IP -t tag_bw -s $MSG_SIZE -n 2000 > /tmp/ucx_host_${SOURCE_RDMA_DEV}_result.log 2>&1"
+                  UCX_HOST_RESULT=$(oc exec $SOURCE_POD -- bash -c "cat /tmp/ucx_host_${SOURCE_RDMA_DEV}_result.log 2>/dev/null | grep 'Final:' | tail -1" || echo "")
+
+                  if [ -n "$UCX_HOST_RESULT" ]; then
+                    # UCX reports in MB/s, convert to Gb/s (MB/s * 8 / 1000)
+                    UCX_HOST_MBPS=$(echo "$UCX_HOST_RESULT" | awk '{print $6}')
+                    UCX_HOST_GBPS=$(echo "$UCX_HOST_MBPS" | awk '{printf "%.2f", $1 * 8 / 1000}')
+                    UCX_HOST_ITERS=$(echo "$UCX_HOST_RESULT" | awk '{print $2}')
+                    UCX_HOST_LATENCY=$(echo "$UCX_HOST_RESULT" | awk '{print $4}')
+                    UCX_HOST_STATUS="PASS"
+                    [ "$UCX_HOST_ITERS" -gt 1000 ] 2>/dev/null && UCX_HOST_STATUS="PASS" || UCX_HOST_STATUS="FAIL"
+                    echo -e "      ${GREEN}Result: $UCX_HOST_GBPS Gb/s ($UCX_HOST_ITERS iters, ${UCX_HOST_LATENCY}us latency) - $UCX_HOST_STATUS${RESET}"
+
+                    sqlite3 "$DB_FILE" "INSERT INTO ucx_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, rdma_device_source, rdma_device_target, message_size, memory_type, bandwidth_gbps, bandwidth_mbps, latency_us, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', $MSG_SIZE, 'host', ${UCX_HOST_GBPS:-0.0}, ${UCX_HOST_MBPS:-0.0}, ${UCX_HOST_LATENCY:-0.0}, ${UCX_HOST_ITERS:-0}, '$UCX_HOST_STATUS', $(date +%s));" 2>/dev/null || true
+                  else
+                    echo -e "      ${RED}Result: FAIL${RESET}"
+                    sqlite3 "$DB_FILE" "INSERT INTO ucx_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, rdma_device_source, rdma_device_target, message_size, memory_type, bandwidth_gbps, bandwidth_mbps, latency_us, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', $MSG_SIZE, 'host', 0.0, 0.0, 0.0, 0, 'FAIL', $(date +%s));" 2>/dev/null || true
+                  fi
+
+                  oc exec $SOURCE_POD -- pkill -9 ucx_perftest 2>/dev/null || true
+                  oc exec $TARGET_POD -- pkill -9 ucx_perftest 2>/dev/null || true
+                  sleep 2
+
+                  # UCX GPU Memory Test
+                  echo "    UCX bandwidth test (GPUDirect RDMA)..."
+                  SOURCE_GPU_CHECK=$(oc exec $SOURCE_POD -- bash -c "nvidia-smi -L 2>/dev/null | head -1" || echo "")
+                  TARGET_GPU_CHECK=$(oc exec $TARGET_POD -- bash -c "nvidia-smi -L 2>/dev/null | head -1" || echo "")
+                  SOURCE_IOMMU_OK=true
+                  TARGET_IOMMU_OK=true
+                  for node in "${IOMMU_ENABLED_NODES[@]}"; do
+                    if [[ "$SOURCE_NODE" == *"$node"* ]]; then SOURCE_IOMMU_OK=false; fi
+                    if [[ "$TARGET_NODE" == *"$node"* ]]; then TARGET_IOMMU_OK=false; fi
+                  done
+
+                  if [ -n "$SOURCE_GPU_CHECK" ] && [ -n "$TARGET_GPU_CHECK" ] && [ "$SOURCE_IOMMU_OK" = true ] && [ "$TARGET_IOMMU_OK" = true ]; then
+                    SOURCE_GPU_ID=$(sqlite3 "$DB_FILE" "SELECT gpu_id FROM gpu_nic_topology WHERE test_run_id = '$TEST_RUN_ID' AND pod_name = '$SOURCE_POD' AND nic_device = '$SOURCE_RDMA_DEV' AND connection_type = 'PXB' LIMIT 1;" 2>/dev/null || echo "0")
+                    TARGET_GPU_ID=$(sqlite3 "$DB_FILE" "SELECT gpu_id FROM gpu_nic_topology WHERE test_run_id = '$TEST_RUN_ID' AND pod_name = '$TARGET_POD' AND nic_device = '$TARGET_RDMA_DEV' AND connection_type = 'PXB' LIMIT 1;" 2>/dev/null || echo "0")
+                    SOURCE_GPU_ID=${SOURCE_GPU_ID:-0}
+                    TARGET_GPU_ID=${TARGET_GPU_ID:-0}
+                    echo "      [DEBUG] Using GPU mappings: $SOURCE_RDMA_DEV → GPU$SOURCE_GPU_ID (source), $TARGET_RDMA_DEV → GPU$TARGET_GPU_ID (target)"
+
+                    # Start UCX server with GPU memory - force specific RDMA device
+                    oc exec $TARGET_POD -- bash -c "UCX_NET_DEVICES=$TARGET_RDMA_DEV:1 timeout $TEST_TIMEOUT ucx_perftest -t tag_bw -m cuda -c $TARGET_GPU_ID -s $MSG_SIZE -n 2000 > /tmp/ucx_gpu_${TARGET_RDMA_DEV}.log 2>&1 &"
+                    sleep 3
+
+                    # Run UCX client with GPU memory - force specific RDMA device
+                    oc exec $SOURCE_POD -- bash -c "UCX_NET_DEVICES=$SOURCE_RDMA_DEV:1 timeout $TEST_TIMEOUT ucx_perftest $TARGET_IP -t tag_bw -m cuda -c $SOURCE_GPU_ID -s $MSG_SIZE -n 2000 > /tmp/ucx_gpu_${SOURCE_RDMA_DEV}_result.log 2>&1"
+                    UCX_GPU_RESULT=$(oc exec $SOURCE_POD -- bash -c "cat /tmp/ucx_gpu_${SOURCE_RDMA_DEV}_result.log 2>/dev/null | grep 'Final:' | tail -1" || echo "")
+
+                    if [ -n "$UCX_GPU_RESULT" ]; then
+                      UCX_GPU_MBPS=$(echo "$UCX_GPU_RESULT" | awk '{print $6}')
+                      UCX_GPU_GBPS=$(echo "$UCX_GPU_MBPS" | awk '{printf "%.2f", $1 * 8 / 1000}')
+                      UCX_GPU_ITERS=$(echo "$UCX_GPU_RESULT" | awk '{print $2}')
+                      UCX_GPU_LATENCY=$(echo "$UCX_GPU_RESULT" | awk '{print $4}')
+                      UCX_GPU_STATUS="PASS"
+                      [ "$UCX_GPU_ITERS" -gt 1000 ] 2>/dev/null && UCX_GPU_STATUS="PASS" || UCX_GPU_STATUS="FAIL"
+                      echo -e "      ${GREEN}Result: $UCX_GPU_GBPS Gb/s ($UCX_GPU_ITERS iters, ${UCX_GPU_LATENCY}us latency) - $UCX_GPU_STATUS${RESET}"
+
+                      sqlite3 "$DB_FILE" "INSERT INTO ucx_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, rdma_device_source, rdma_device_target, message_size, memory_type, bandwidth_gbps, bandwidth_mbps, latency_us, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', $MSG_SIZE, 'gpu', ${UCX_GPU_GBPS:-0.0}, ${UCX_GPU_MBPS:-0.0}, ${UCX_GPU_LATENCY:-0.0}, ${UCX_GPU_ITERS:-0}, '$UCX_GPU_STATUS', $(date +%s));" 2>/dev/null || true
+                    else
+                      echo -e "      ${RED}Result: FAIL${RESET}"
+                      sqlite3 "$DB_FILE" "INSERT INTO ucx_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, rdma_device_source, rdma_device_target, message_size, memory_type, bandwidth_gbps, bandwidth_mbps, latency_us, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', $MSG_SIZE, 'gpu', 0.0, 0.0, 0.0, 0, 'FAIL', $(date +%s));" 2>/dev/null || true
+                    fi
+                  else
+                    SKIP_REASON=""
+                    if [ -z "$SOURCE_GPU_CHECK" ] || [ -z "$TARGET_GPU_CHECK" ]; then
+                      SKIP_REASON="GPUs not available"
+                    elif [ "$SOURCE_IOMMU_OK" = false ] || [ "$TARGET_IOMMU_OK" = false ]; then
+                      SKIP_REASON="IOMMU enabled"
+                    fi
+                    echo -e "      ${YELLOW}SKIPPED - $SKIP_REASON${RESET}"
+                    sqlite3 "$DB_FILE" "INSERT INTO ucx_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, rdma_device_source, rdma_device_target, message_size, memory_type, bandwidth_gbps, bandwidth_mbps, latency_us, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', $MSG_SIZE, 'gpu', 0.0, 0.0, 0.0, 0, 'SKIPPED', $(date +%s));" 2>/dev/null || true
+                  fi
+
+                  oc exec $SOURCE_POD -- pkill -9 ucx_perftest 2>/dev/null || true
+                  oc exec $TARGET_POD -- pkill -9 ucx_perftest 2>/dev/null || true
+                  echo ""
+                done
+
+                # Latency Tests
+                echo ""
+                echo -e "${CYAN}=========================================="
+                echo -e "RDMA Latency Tests"
+                echo -e "==========================================${RESET}"
+                echo ""
+                echo "Testing RDMA latency using ib_write_lat (lower is better)"
+                echo ""
+
+                for i in "${!SOURCE_ACTIVE_DEVS[@]}"; do
+                  if [ $i -ge ${#TARGET_ACTIVE_DEVS[@]} ]; then
+                    break
+                  fi
+
+                  SOURCE_RDMA_DEV="${SOURCE_ACTIVE_DEVS[$i]}"
+                  TARGET_RDMA_DEV="${TARGET_ACTIVE_DEVS[$i]}"
+
+                  echo "  Testing [$SOURCE_RDMA_DEV → $TARGET_RDMA_DEV] latency..."
+
+                  # Host Memory Latency Test
+                  echo "    Latency test (host memory)..."
+                  oc exec $SOURCE_POD -- pkill -9 ib_write_lat 2>/dev/null || true
+                  oc exec $TARGET_POD -- pkill -9 ib_write_lat 2>/dev/null || true
+                  sleep 2
+
+                  # Start latency server on target
+                  oc exec $TARGET_POD -- bash -c "ulimit -l unlimited; nohup ib_write_lat -d $TARGET_RDMA_DEV -s 4096 -n 10000 -F > /tmp/ib_lat_host_${TARGET_RDMA_DEV}.log 2>&1 &"
+                  sleep 3
+
+                  # Run latency client from source
+                  TARGET_IP=$(oc get pod $TARGET_POD -o jsonpath='{.status.podIP}')
+                  oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; timeout $TEST_TIMEOUT ib_write_lat -d $SOURCE_RDMA_DEV -s 4096 -n 10000 -F $TARGET_IP > /tmp/ib_lat_host_${SOURCE_RDMA_DEV}_result.log 2>&1"
+                  LAT_HOST_RESULT=$(oc exec $SOURCE_POD -- bash -c "cat /tmp/ib_lat_host_${SOURCE_RDMA_DEV}_result.log 2>/dev/null | grep -E '^[[:space:]]*4096' | tail -1" || echo "")
+
+                  if [ -n "$LAT_HOST_RESULT" ]; then
+                    LAT_HOST_MEDIAN=$(echo "$LAT_HOST_RESULT" | awk '{print $3}')
+                    LAT_HOST_AVG=$(echo "$LAT_HOST_RESULT" | awk '{print $4}')
+                    LAT_HOST_99P=$(echo "$LAT_HOST_RESULT" | awk '{print $5}')
+                    LAT_HOST_STATUS="PASS"
+                    echo -e "      ${GREEN}Result: Median=${LAT_HOST_MEDIAN}us, Average=${LAT_HOST_AVG}us - $LAT_HOST_STATUS${RESET}"
+
+                    sqlite3 "$DB_FILE" "INSERT INTO latency_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, rdma_device_source, rdma_device_target, message_size, memory_type, latency_median_us, latency_average_us, latency_99p_us, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', 4096, 'host', ${LAT_HOST_MEDIAN:-0.0}, ${LAT_HOST_AVG:-0.0}, ${LAT_HOST_99P:-0.0}, 10000, '$LAT_HOST_STATUS', $(date +%s));" 2>/dev/null || true
+                  else
+                    echo -e "      ${RED}Result: FAIL${RESET}"
+                    sqlite3 "$DB_FILE" "INSERT INTO latency_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, rdma_device_source, rdma_device_target, message_size, memory_type, latency_median_us, latency_average_us, latency_99p_us, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', 4096, 'host', 0.0, 0.0, 0.0, 0, 'FAIL', $(date +%s));" 2>/dev/null || true
+                  fi
+
+                  oc exec $SOURCE_POD -- pkill -9 ib_write_lat 2>/dev/null || true
+                  oc exec $TARGET_POD -- pkill -9 ib_write_lat 2>/dev/null || true
+                  sleep 2
+
+                  # GPU Memory Latency Test
+                  echo "    Latency test (GPUDirect RDMA)..."
+                  SOURCE_GPU_CHECK=$(oc exec $SOURCE_POD -- bash -c "nvidia-smi -L 2>/dev/null | head -1" || echo "")
+                  TARGET_GPU_CHECK=$(oc exec $TARGET_POD -- bash -c "nvidia-smi -L 2>/dev/null | head -1" || echo "")
+                  SOURCE_IOMMU_OK=true
+                  TARGET_IOMMU_OK=true
+                  for node in "${IOMMU_ENABLED_NODES[@]}"; do
+                    if [[ "$SOURCE_NODE" == *"$node"* ]]; then SOURCE_IOMMU_OK=false; fi
+                    if [[ "$TARGET_NODE" == *"$node"* ]]; then TARGET_IOMMU_OK=false; fi
+                  done
+
+                  if [ -n "$SOURCE_GPU_CHECK" ] && [ -n "$TARGET_GPU_CHECK" ] && [ "$SOURCE_IOMMU_OK" = true ] && [ "$TARGET_IOMMU_OK" = true ]; then
+                    SOURCE_GPU_ID=$(sqlite3 "$DB_FILE" "SELECT gpu_id FROM gpu_nic_topology WHERE test_run_id = '$TEST_RUN_ID' AND pod_name = '$SOURCE_POD' AND nic_device = '$SOURCE_RDMA_DEV' AND connection_type = 'PXB' LIMIT 1;" 2>/dev/null || echo "0")
+                    TARGET_GPU_ID=$(sqlite3 "$DB_FILE" "SELECT gpu_id FROM gpu_nic_topology WHERE test_run_id = '$TEST_RUN_ID' AND pod_name = '$TARGET_POD' AND nic_device = '$TARGET_RDMA_DEV' AND connection_type = 'PXB' LIMIT 1;" 2>/dev/null || echo "0")
+                    SOURCE_GPU_ID=${SOURCE_GPU_ID:-0}
+                    TARGET_GPU_ID=${TARGET_GPU_ID:-0}
+                    echo "      [DEBUG] Using GPU mappings: $SOURCE_RDMA_DEV → GPU$SOURCE_GPU_ID (source), $TARGET_RDMA_DEV → GPU$TARGET_GPU_ID (target)"
+
+                    # Start latency server with GPU memory
+                    oc exec $TARGET_POD -- bash -c "ulimit -l unlimited; nohup ib_write_lat -d $TARGET_RDMA_DEV -s 4096 -n 10000 -F --use_cuda=$TARGET_GPU_ID > /tmp/ib_lat_gpu_${TARGET_RDMA_DEV}.log 2>&1 &"
+                    sleep 3
+
+                    # Run latency client with GPU memory
+                    oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; timeout $TEST_TIMEOUT ib_write_lat -d $SOURCE_RDMA_DEV -s 4096 -n 10000 -F --use_cuda=$SOURCE_GPU_ID $TARGET_IP > /tmp/ib_lat_gpu_${SOURCE_RDMA_DEV}_result.log 2>&1"
+                    LAT_GPU_RESULT=$(oc exec $SOURCE_POD -- bash -c "cat /tmp/ib_lat_gpu_${SOURCE_RDMA_DEV}_result.log 2>/dev/null | grep -E '^[[:space:]]*4096' | tail -1" || echo "")
+
+                    if [ -n "$LAT_GPU_RESULT" ]; then
+                      LAT_GPU_MEDIAN=$(echo "$LAT_GPU_RESULT" | awk '{print $3}')
+                      LAT_GPU_AVG=$(echo "$LAT_GPU_RESULT" | awk '{print $4}')
+                      LAT_GPU_99P=$(echo "$LAT_GPU_RESULT" | awk '{print $5}')
+                      LAT_GPU_STATUS="PASS"
+                      echo -e "      ${GREEN}Result: Median=${LAT_GPU_MEDIAN}us, Average=${LAT_GPU_AVG}us - $LAT_GPU_STATUS${RESET}"
+
+                      sqlite3 "$DB_FILE" "INSERT INTO latency_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, rdma_device_source, rdma_device_target, message_size, memory_type, latency_median_us, latency_average_us, latency_99p_us, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', 4096, 'gpu', ${LAT_GPU_MEDIAN:-0.0}, ${LAT_GPU_AVG:-0.0}, ${LAT_GPU_99P:-0.0}, 10000, '$LAT_GPU_STATUS', $(date +%s));" 2>/dev/null || true
+                    else
+                      echo -e "      ${RED}Result: FAIL${RESET}"
+                      sqlite3 "$DB_FILE" "INSERT INTO latency_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, rdma_device_source, rdma_device_target, message_size, memory_type, latency_median_us, latency_average_us, latency_99p_us, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', 4096, 'gpu', 0.0, 0.0, 0.0, 0, 'FAIL', $(date +%s));" 2>/dev/null || true
+                    fi
+                  else
+                    SKIP_REASON=""
+                    if [ -z "$SOURCE_GPU_CHECK" ] || [ -z "$TARGET_GPU_CHECK" ]; then
+                      SKIP_REASON="GPUs not available"
+                    elif [ "$SOURCE_IOMMU_OK" = false ] || [ "$TARGET_IOMMU_OK" = false ]; then
+                      SKIP_REASON="IOMMU enabled"
+                    fi
+                    echo -e "      ${YELLOW}SKIPPED - $SKIP_REASON${RESET}"
+                    sqlite3 "$DB_FILE" "INSERT INTO latency_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, rdma_device_source, rdma_device_target, message_size, memory_type, latency_median_us, latency_average_us, latency_99p_us, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', 4096, 'gpu', 0.0, 0.0, 0.0, 0, 'SKIPPED', $(date +%s));" 2>/dev/null || true
+                  fi
+
+                  oc exec $SOURCE_POD -- pkill -9 ib_write_lat 2>/dev/null || true
+                  oc exec $TARGET_POD -- pkill -9 ib_write_lat 2>/dev/null || true
+                  echo ""
+                done
+
+                echo ""
+              fi
+

@@ -1,0 +1,33 @@
+apiVersion: mellanox.com/v1alpha1
+kind: NicClusterPolicy
+metadata:
+  name: nic-cluster-policy
+  namespace: nvidia-network-operator
+  annotations:
+    # ArgoCD: Track this resource for drift detection but allow hook to manage ofedDriver config
+    argocd.argoproj.io/sync-options: IgnoreExtraneous
+spec:
+  # Tolerations for all DaemonSets (OFED, SR-IOV, RDMA plugins)
+  tolerations:
+  - key: "UpdateInProgress"
+    operator: "Exists"
+    effect: "PreferNoSchedule"
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: node-role.kubernetes.io/worker
+          operator: Exists
+        - key: node-role.kubernetes.io/master
+          operator: DoesNotExist
+
+  # Note: ofedDriver configuration is managed dynamically by the discover-ofed-version
+  # hook Job, which discovers the correct driver version from the NVIDIA Network Operator
+  # deployment. This ensures the MOFED driver version always matches the operator's default.
+  #
+  # SR-IOV Device Plugin configuration is also generated dynamically by the NIC Discovery
+  # process (manifests/35-nic-discovery) based on actual hardware present in the cluster.

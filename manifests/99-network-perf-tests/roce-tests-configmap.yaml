@@ -1,0 +1,53 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: network-perf-roce-tests
+  namespace: default
+data:
+  roce-tests.py: |
+    #!/usr/bin/env python3
+    """RoCE Tests - Python implementation"""
+    
+    import os
+    import sys
+    import subprocess
+    import sqlite3
+    
+    DB_FILE = os.environ.get('DB_FILE', '/tmp/network-perf-results.db')
+    TEST_RUN_ID = os.environ.get('TEST_RUN_ID')
+    
+    def run_roce_tests(source_pod, target_pod, source_node, target_node, source_gpus, target_gpus):
+        """Main RoCE test orchestration"""
+        print("\n" + "="*70)
+        print("RoCE Tests")
+        print("="*70)
+        print("RoCE tests require SR-IOV networks - checking...")
+        
+        # Check for SR-IOV networks
+        result = subprocess.run(['oc', 'get', 'sriovnetworks', '-o', 'json'],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        
+        if result.returncode != 0 or 'items' not in result.stdout:
+            print("No SR-IOV networks found - skipping RoCE tests")
+            return
+        
+        import json
+        networks = json.loads(result.stdout)
+        
+        if not networks.get('items'):
+            print("No SR-IOV networks configured - skipping RoCE tests")
+            return
+        
+        print(f"Found {len(networks['items'])} SR-IOV network(s)")
+        print("✓ RoCE tests would run here (implementation needed)")
+    
+    if __name__ == '__main__':
+        run_roce_tests(
+            sys.argv[1],  # source_pod
+            sys.argv[2],  # target_pod
+            sys.argv[3],  # source_node
+            sys.argv[4],  # target_node
+            sys.argv[5],  # source_gpus
+            sys.argv[6]   # target_gpus
+        )

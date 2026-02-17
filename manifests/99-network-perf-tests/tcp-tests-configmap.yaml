@@ -1,0 +1,218 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: network-perf-tcp-tests
+  namespace: default
+data:
+  tcp-tests.py: |
+    #!/usr/bin/env python3
+    """TCP Bandwidth Tests using iperf3"""
+
+    import os
+    import sys
+    import subprocess
+    import sqlite3
+    import re
+    import time
+    import json
+
+    DB_FILE = os.environ.get('DB_FILE', '/tmp/network-perf-results.db')
+    TEST_RUN_ID = os.environ.get('TEST_RUN_ID')
+    TEST_DURATION = int(os.environ.get('TEST_DURATION', '10'))
+
+    def run_oc_exec(pod, cmd):
+        """Execute command in pod"""
+        result = subprocess.run(
+            ['oc', 'exec', pod, '--', 'bash', '-c', cmd],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, check=False
+        )
+        return result.stdout, result.stderr, result.returncode
+
+    def get_device_ips(pod):
+        """Get IP addresses for RDMA devices"""
+        devices = {}
+        stdout, _, _ = run_oc_exec(pod, 'ip -o -4 addr show | grep -E "net[0-9]|mlx5_" | awk \'{print $2, $4}\' | cut -d/ -f1')
+
+        for line in stdout.strip().split('\n'):
+            if line:
+                parts = line.split()
+                if len(parts) >= 2:
+                    dev, ip = parts[0], parts[1]
+                    devices[dev] = ip
+
+        return devices
+
+    def get_nic_speed(pod, device):
+        """Get NIC speed in Gbps"""
+        stdout, _, _ = run_oc_exec(pod, f'ethtool {device} 2>/dev/null | grep Speed: | awk \'{{print $2}}\' | sed \'s/Mb\\/s//\'')
+        speed_mbps = stdout.strip()
+
+        if speed_mbps and speed_mbps.isdigit():
+            return int(speed_mbps) // 1000  # Convert to Gbps
+        return 100  # Default to 100G
+
+    def calculate_streams(speed_gbps):
+        """Calculate optimal iperf3 streams based on NIC speed"""
+        streams = max(2, speed_gbps // 8)
+        return streams
+
+    def run_tcp_tests(source_pod, target_pod, source_node, target_node, source_gpus, target_gpus):
+        """Main TCP test orchestration"""
+        print("\n" + "="*70)
+        print("TCP Bandwidth Tests (iperf3)")
+        print("="*70)
+
+        # Get device IPs
+        source_devices = get_device_ips(source_pod)
+        target_devices = get_device_ips(target_pod)
+
+        # Find common devices
+        common_devices = sorted(set(source_devices.keys()) & set(target_devices.keys()))
+
+        print(f"Source devices: {list(source_devices.keys())}")
+        print(f"Target devices: {list(target_devices.keys())}")
+        print(f"Testing common devices: {common_devices}")
+        print()
+
+        if not common_devices:
+            print("No common network devices found between pods!")
+            return
+
+        # Kill any existing iperf3 processes
+        run_oc_exec(source_pod, 'pkill -9 iperf3')
+        run_oc_exec(target_pod, 'pkill -9 iperf3')
+        time.sleep(2)
+
+        # Test each common device
+        for dev in common_devices:
+            source_ip = source_devices[dev]
+            target_ip = target_devices[dev]
+
+            # Get NIC speed
+            nic_speed = get_nic_speed(source_pod, dev)
+            streams = calculate_streams(nic_speed)
+
+            print(f"Testing {dev}: {source_ip} → {target_ip} ({nic_speed}G, {streams} streams)")
+
+            # Sequential test
+            print(f"  Running sequential test...")
+
+            # Start iperf3 server on target
+            port = 5201
+            server_cmd = f'iperf3 -s -B {target_ip} -p {port} -1 -D'
+            run_oc_exec(target_pod, server_cmd)
+            time.sleep(2)
+
+            # Run iperf3 client
+            client_cmd = f'iperf3 -c {target_ip} -p {port} -t {TEST_DURATION} -P {streams} -w 128K -l 1M -J'
+            stdout, stderr, rc = run_oc_exec(source_pod, client_cmd)
+
+            # Parse results
+            tcp_seq_gbps = 0
+            try:
+                result_json = json.loads(stdout)
+                if 'end' in result_json and 'sum_sent' in result_json['end']:
+                    bits_per_second = result_json['end']['sum_sent']['bits_per_second']
+                    tcp_seq_gbps = bits_per_second / 1_000_000_000  # Convert to Gbps
+                    print(f"    Sequential: {tcp_seq_gbps:.2f} Gb/s - PASS")
+                else:
+                    print(f"    Sequential: FAIL - no sum_sent in results")
+            except Exception as e:
+                print(f"    Sequential: FAIL - {str(e)}")
+                if stdout:
+                    print(f"      stdout: {stdout[:200]}")
+
+            # Store sequential result
+            if tcp_seq_gbps > 0:
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("""
+                    INSERT INTO tcp_results
+                    (test_run_id, source_pod, target_pod, source_node, target_node,
+                     nic_interface, link_speed_gbps, test_mode, bandwidth_gbps, streams, test_status, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'sequential', ?, ?, 'PASS', strftime('%s', 'now'))
+                """, (TEST_RUN_ID, source_pod, target_pod, source_node, target_node,
+                      dev, nic_speed, tcp_seq_gbps, streams))
+                conn.commit()
+                conn.close()
+
+            # Cleanup
+            run_oc_exec(target_pod, 'pkill -9 iperf3')
+            time.sleep(1)
+
+        # Parallel tests (all devices simultaneously)
+        print(f"\nRunning parallel test on all {len(common_devices)} devices...")
+
+        # Start iperf3 servers on all devices
+        for idx, dev in enumerate(common_devices):
+            target_ip = target_devices[dev]
+            port = 5201 + idx
+            server_cmd = f'nohup iperf3 -s -B {target_ip} -p {port} > /tmp/iperf3_server_{port}.log 2>&1 &'
+            run_oc_exec(target_pod, server_cmd)
+
+        time.sleep(3)
+
+        # Start iperf3 clients on all devices simultaneously
+        client_pids = []
+        for idx, dev in enumerate(common_devices):
+            target_ip = target_devices[dev]
+            port = 5201 + idx
+            nic_speed = get_nic_speed(source_pod, dev)
+            streams = calculate_streams(nic_speed)
+
+            client_cmd = f'iperf3 -c {target_ip} -p {port} -t {TEST_DURATION} -P {streams} -w 128K -l 1M -J > /tmp/iperf3_{dev}_par.json 2>&1 &'
+            run_oc_exec(source_pod, client_cmd)
+
+        # Wait for tests to complete
+        time.sleep(TEST_DURATION + 5)
+
+        # Collect parallel results
+        for dev in common_devices:
+            stdout, _, _ = run_oc_exec(source_pod, f'cat /tmp/iperf3_{dev}_par.json 2>/dev/null')
+
+            tcp_par_gbps = 0
+            nic_speed = get_nic_speed(source_pod, dev)
+            streams = calculate_streams(nic_speed)
+
+            try:
+                result_json = json.loads(stdout)
+                if 'end' in result_json and 'sum_sent' in result_json['end']:
+                    bits_per_second = result_json['end']['sum_sent']['bits_per_second']
+                    tcp_par_gbps = bits_per_second / 1_000_000_000
+                    print(f"  [{dev}] Parallel: {tcp_par_gbps:.2f} Gb/s - PASS")
+                else:
+                    print(f"  [{dev}] Parallel: FAIL - no sum_sent in results")
+            except Exception as e:
+                print(f"  [{dev}] Parallel: FAIL - {str(e)}")
+
+            # Store parallel result
+            if tcp_par_gbps > 0:
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("""
+                    INSERT INTO tcp_results
+                    (test_run_id, source_pod, target_pod, source_node, target_node,
+                     nic_interface, link_speed_gbps, test_mode, bandwidth_gbps, streams, test_status, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'parallel', ?, ?, 'PASS', strftime('%s', 'now'))
+                """, (TEST_RUN_ID, source_pod, target_pod, source_node, target_node,
+                      dev, nic_speed, tcp_par_gbps, streams))
+                conn.commit()
+                conn.close()
+
+        # Cleanup
+        run_oc_exec(source_pod, 'pkill -9 iperf3')
+        run_oc_exec(target_pod, 'pkill -9 iperf3')
+
+        print("\n✓ TCP tests completed")
+
+    if __name__ == '__main__':
+        run_tcp_tests(
+            sys.argv[1],  # source_pod
+            sys.argv[2],  # target_pod
+            sys.argv[3],  # source_node
+            sys.argv[4],  # target_node
+            sys.argv[5],  # source_gpus
+            sys.argv[6]   # target_gpus
+        )

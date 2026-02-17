@@ -1,0 +1,391 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: infrastructure-cleanup
+  namespace: nvidia-network-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: infrastructure-cleanup
+rules:
+# NVIDIA Network Operator resources
+- apiGroups: ["mellanox.com"]
+  resources: ["nicclusterpolicies"]
+  verbs: ["get", "list", "delete"]
+# NVIDIA GPU Operator resources
+- apiGroups: ["nvidia.com"]
+  resources: ["clusterpolicies"]
+  verbs: ["get", "list", "delete"]
+# NFD resources
+- apiGroups: ["nfd.openshift.io"]
+  resources: ["nodefeaturediscoveries", "nodefeaturerules"]
+  verbs: ["get", "list", "delete"]
+# NIC Discovery resources (in default namespace) + Operator Deployments
+- apiGroups: ["apps"]
+  resources: ["daemonsets", "deployments"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "delete"]
+# Jobs and Pods
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+# RBAC cleanup
+- apiGroups: [""]
+  resources: ["serviceaccounts"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterroles", "clusterrolebindings"]
+  verbs: ["get", "list", "delete"]
+# MachineConfigs
+- apiGroups: ["machineconfiguration.openshift.io"]
+  resources: ["machineconfigs"]
+  verbs: ["get", "list", "delete"]
+# ArgoCD Applications
+- apiGroups: ["argoproj.io"]
+  resources: ["applications"]
+  verbs: ["get", "list", "delete", "patch"]
+# Node access for VF reset
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: infrastructure-cleanup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: infrastructure-cleanup
+subjects:
+- kind: ServiceAccount
+  name: infrastructure-cleanup
+  namespace: nvidia-network-operator
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: infrastructure-cleanup
+  namespace: nvidia-network-operator
+spec:
+  template:
+    spec:
+      serviceAccount: infrastructure-cleanup
+      restartPolicy: Never
+      containers:
+      - name: cleanup
+        image: registry.redhat.io/openshift4/ose-cli:latest
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+
+          echo "========================================="
+          echo "STEP 1: Delete Deployed ArgoCD Applications"
+          echo "========================================="
+
+          # Delete ArgoCD Applications we deployed (labeled with fab-rig)
+          # This prevents them from recreating resources during cleanup
+          echo "Deleting fab-rig managed ArgoCD applications..."
+          oc delete app -n openshift-gitops -l app.kubernetes.io/managed-by=fab-rig --ignore-not-found=true
+
+          echo "Waiting 10 seconds for applications to be deleted..."
+          sleep 10
+
+          echo ""
+          echo "========================================="
+          echo "STEP 2: Clean GPU Operator (depends on MOFED)"
+          echo "========================================="
+
+          # Delete GPU ClusterPolicy first (depends on MOFED)
+          echo "Deleting GPU ClusterPolicy..."
+          oc delete clusterpolicy --all -n nvidia-gpu-operator --ignore-not-found=true
+
+          # Wait for GPU driver pods to start terminating
+          echo "Waiting for GPU driver pods to terminate..."
+          timeout=300
+          while [ $timeout -gt 0 ]; do
+            pod_count=$(oc get pods -n nvidia-gpu-operator -l app=nvidia-driver-daemonset --no-headers 2>/dev/null | wc -l)
+            if [ "$pod_count" -eq 0 ]; then
+              echo "✓ All GPU driver pods terminated"
+              break
+            fi
+            echo "  Waiting for $pod_count GPU driver pods... ($timeout seconds left)"
+            sleep 10
+            timeout=$((timeout - 10))
+          done
+
+          echo ""
+          echo "========================================="
+          echo "STEP 3: Clean Network Operator (MOFED)"
+          echo "========================================="
+
+          # Delete NicClusterPolicy
+          echo "Deleting NicClusterPolicy..."
+          oc delete nicclusterpolicy --all --all-namespaces --ignore-not-found=true
+
+          # Wait for MOFED driver pods to start terminating
+          echo "Waiting for MOFED driver pods to terminate..."
+          timeout=300
+          while [ $timeout -gt 0 ]; do
+            pod_count=$(oc get pods -n nvidia-network-operator -l app=mofed-driver --no-headers 2>/dev/null | wc -l)
+            if [ "$pod_count" -eq 0 ]; then
+              echo "✓ All MOFED driver pods terminated"
+              break
+            fi
+            echo "  Waiting for $pod_count MOFED driver pods... ($timeout seconds left)"
+            sleep 10
+            timeout=$((timeout - 10))
+          done
+
+          # Delete Jobs
+          echo "Deleting Network Operator Jobs..."
+          oc delete job discover-ofed-version wait-for-mofed-ready -n nvidia-network-operator \
+            --ignore-not-found=true
+
+          # Delete RBAC
+          echo "Deleting nic-policy-updater RBAC..."
+          oc delete serviceaccount nic-policy-updater -n nvidia-network-operator \
+            --ignore-not-found=true
+          oc delete clusterrole nic-policy-updater --ignore-not-found=true
+          oc delete clusterrolebinding nic-policy-updater --ignore-not-found=true
+
+          echo ""
+          echo "========================================="
+          echo "STEP 4: Clean NFD Resources"
+          echo "========================================="
+
+          # Delete NFD resources
+          echo "Deleting NodeFeatureDiscovery..."
+          oc delete nodefeaturediscovery nfd-instance -n openshift-nfd --ignore-not-found=true
+
+          echo "Deleting NodeFeatureRule..."
+          oc delete nodefeaturerule hardware-discovery -n openshift-nfd --ignore-not-found=true
+
+          # Wait for NFD pods to terminate
+          echo "Waiting for NFD pods to terminate..."
+          timeout=60
+          while [ $timeout -gt 0 ]; do
+            pod_count=$(oc get pods -n openshift-nfd --no-headers 2>/dev/null | wc -l)
+            if [ "$pod_count" -eq 0 ]; then
+              echo "✓ All NFD pods terminated"
+              break
+            fi
+            echo "  Waiting for $pod_count NFD pods... ($timeout seconds left)"
+            sleep 5
+            timeout=$((timeout - 5))
+          done
+
+          echo ""
+          echo "========================================="
+          echo "STEP 5: Clean NIC Discovery Resources"
+          echo "========================================="
+
+          # Delete NIC Discovery resources from default namespace
+          echo "Deleting NIC Discovery DaemonSets..."
+          oc delete daemonset nic-port-discovery nic-vf-configurator -n default --ignore-not-found=true
+
+          echo "Deleting NIC Discovery Jobs..."
+          oc delete job nic-resource-generator -n default --ignore-not-found=true
+
+          echo "Deleting NIC Discovery ConfigMaps..."
+          oc delete configmap nic-port-discovery-script nic-resource-generator-script -n default --ignore-not-found=true
+
+          echo "Deleting NIC Discovery RBAC..."
+          oc delete serviceaccount nic-discovery-sa -n default --ignore-not-found=true
+          oc delete clusterrole nic-discovery-role --ignore-not-found=true
+          oc delete clusterrolebinding nic-discovery-rolebinding nic-discovery-privileged-scc --ignore-not-found=true
+
+          # Wait for NIC Discovery pods to terminate
+          echo "Waiting for NIC Discovery pods to terminate..."
+          timeout=60
+          while [ $timeout -gt 0 ]; do
+            pod_count=$(oc get pods -n default -l app=nic-port-discovery --no-headers 2>/dev/null | wc -l)
+            vf_pod_count=$(oc get pods -n default -l app=nic-vf-configurator --no-headers 2>/dev/null | wc -l)
+            total=$((pod_count + vf_pod_count))
+            if [ "$total" -eq 0 ]; then
+              echo "✓ All NIC Discovery pods terminated"
+              break
+            fi
+            echo "  Waiting for $total NIC Discovery pods... ($timeout seconds left)"
+            sleep 5
+            timeout=$((timeout - 5))
+          done
+
+          echo ""
+          echo "========================================="
+          echo "STEP 6: Clean MachineConfigs"
+          echo "========================================="
+
+          echo "Deleting SR-IOV MachineConfigs..."
+          oc delete machineconfig \
+            99-worker-sriov-max-vfs \
+            99-worker-dgx-sriov-max-vfs \
+            --ignore-not-found=true
+
+          echo "Note: MachineConfigPools will update to remove the configs."
+          echo "Wait for all MCPs to show UPDATED=True before proceeding."
+
+          echo ""
+          echo "========================================="
+          echo "STEP 7: Reset VFs to 0"
+          echo "========================================="
+
+          echo "Resetting VFs on all worker-dgx nodes..."
+          for node in $(oc get nodes -l node-role.kubernetes.io/worker-dgx -o jsonpath='{.items[*].metadata.name}'); do
+            echo "Processing $node..."
+            oc debug node/$node -- chroot /host /bin/bash -c '
+              for nic in mlx5_0 mlx5_1; do
+                numvfs_path="/sys/class/infiniband/$nic/device/sriov_numvfs"
+                if [ -f "$numvfs_path" ]; then
+                  current=$(cat $numvfs_path)
+                  if [ "$current" != "0" ]; then
+                    echo 0 > "$numvfs_path" 2>/dev/null && echo "  $nic: $current → 0 VFs" || echo "  $nic: Failed to reset"
+                  else
+                    echo "  $nic: Already 0 VFs"
+                  fi
+                fi
+              done
+            ' 2>&1 | grep -E "mlx5|Failed|Already" || true
+          done
+
+          echo ""
+          echo "========================================="
+          echo "STEP 8: Clean Up Orphaned Operators"
+          echo "========================================="
+
+          # Delete orphaned operator CSVs (left behind when Subscriptions are deleted)
+          echo "Deleting orphaned operator CSVs..."
+
+          # NFD CSV
+          nfd_csv=$(oc get csv -n openshift-nfd --no-headers 2>/dev/null | grep nfd | awk '{print $1}' || echo "")
+          if [ -n "$nfd_csv" ]; then
+            echo "  Deleting NFD CSV: $nfd_csv"
+            oc delete csv "$nfd_csv" -n openshift-nfd --ignore-not-found=true
+          fi
+
+          # Network Operator CSV
+          net_csv=$(oc get csv -n nvidia-network-operator --no-headers 2>/dev/null | grep nvidia-network-operator | awk '{print $1}' || echo "")
+          if [ -n "$net_csv" ]; then
+            echo "  Deleting Network Operator CSV: $net_csv"
+            oc delete csv "$net_csv" -n nvidia-network-operator --ignore-not-found=true
+          fi
+
+          # GPU Operator CSV
+          gpu_csv=$(oc get csv -n nvidia-gpu-operator --no-headers 2>/dev/null | grep gpu-operator | awk '{print $1}' || echo "")
+          if [ -n "$gpu_csv" ]; then
+            echo "  Deleting GPU Operator CSV: $gpu_csv"
+            oc delete csv "$gpu_csv" -n nvidia-gpu-operator --ignore-not-found=true
+          fi
+
+          echo ""
+          echo "Deleting operator Deployments..."
+
+          # Delete operator deployments that prevent namespace deletion
+          oc delete deployment nvidia-network-operator-controller-manager -n nvidia-network-operator --ignore-not-found=true
+          oc delete deployment gpu-operator -n nvidia-gpu-operator --ignore-not-found=true
+          oc delete deployment nfd-controller-manager -n openshift-nfd --ignore-not-found=true
+
+          echo ""
+          echo "Deleting operator namespaces..."
+
+          # Delete namespaces (will wait for all resources to be removed)
+          for ns in openshift-nfd nvidia-network-operator nvidia-gpu-operator; do
+            if oc get namespace "$ns" &>/dev/null; then
+              echo "  Deleting namespace: $ns"
+              oc delete namespace "$ns" --ignore-not-found=true &
+            fi
+          done
+
+          # Wait for namespace deletions to complete (max 5 minutes)
+          echo "Waiting for operator namespaces to be deleted..."
+          timeout=300
+          while [ $timeout -gt 0 ]; do
+            remaining=0
+            for ns in openshift-nfd nvidia-network-operator nvidia-gpu-operator; do
+              if oc get namespace "$ns" &>/dev/null; then
+                remaining=$((remaining + 1))
+              fi
+            done
+
+            if [ $remaining -eq 0 ]; then
+              echo "✓ All operator namespaces deleted"
+              break
+            fi
+
+            echo "  Waiting for $remaining namespace(s) to be deleted... ($timeout seconds left)"
+            sleep 10
+            timeout=$((timeout - 10))
+          done
+
+          if [ $timeout -le 0 ]; then
+            echo ""
+            echo "⚠ Timeout: Some namespaces still terminating - forcing finalization..."
+            echo ""
+
+            # Force finalize stuck namespaces via API
+            for ns in openshift-nfd nvidia-network-operator nvidia-gpu-operator; do
+              if oc get namespace "$ns" &>/dev/null; then
+                echo "  Force finalizing namespace: $ns"
+                oc get ns "$ns" -o json | jq '.spec.finalizers = []' | oc replace --raw /api/v1/namespaces/$ns/finalize -f - &>/dev/null || true
+              fi
+            done
+
+            echo ""
+            echo "Waiting 10 seconds for forced finalization..."
+            sleep 10
+
+            # Check final status
+            remaining=0
+            for ns in openshift-nfd nvidia-network-operator nvidia-gpu-operator; do
+              if oc get namespace "$ns" &>/dev/null; then
+                remaining=$((remaining + 1))
+                echo "  ⚠ Namespace still exists: $ns"
+              fi
+            done
+
+            if [ $remaining -eq 0 ]; then
+              echo "  ✓ All namespaces deleted after forced finalization"
+            else
+              echo "  ⚠ Warning: $remaining namespace(s) still exist - manual intervention required"
+              echo "    Check: oc get ns | grep -E 'nfd|nvidia'"
+            fi
+          fi
+
+          echo ""
+          echo "========================================="
+          echo "Cleanup Complete!"
+          echo "========================================="
+          echo ""
+          echo "Next steps:"
+          echo "1. Wait for all MachineConfigPools to be ready:"
+          echo "   oc get mcp -w"
+          echo ""
+          echo "2. Verify VFs are at 0:"
+          echo "   oc debug node/<node> -- chroot /host cat /sys/class/infiniband/mlx5_0/device/sriov_numvfs"
+          echo ""
+          echo "3. Re-deploy infrastructure components:"
+          echo "   Apply your ArgoCD/deployment manifests to redeploy the operators."
+          echo ""
+          echo "   The deployment will follow this order (via ArgoCD sync waves):"
+          echo "   - Wave 15: NFD → Node feature discovery"
+          echo "   - Wave 26-27: MachineConfig → VF configuration (waits for MCPs)"
+          echo "   - Wave 28: Network Operator → Deploys operator only"
+          echo "   - Wave 35: NIC Discovery → Creates NicClusterPolicy → MOFED deploys"
+          echo "   - Wave 30: GPU Operator → Waits for MOFED via PreSync hook"
+          echo ""
+          echo "NOTE: If using ArgoCD with auto-sync, ensure it is disabled before"
+          echo "      running this cleanup to prevent resources from being recreated"
+          echo "      during the cleanup process."
+          echo ""

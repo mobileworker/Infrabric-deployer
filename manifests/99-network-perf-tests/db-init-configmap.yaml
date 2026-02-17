@@ -1,0 +1,210 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: network-perf-db-init
+  namespace: default
+data:
+  init-db.sh: |
+    #!/bin/bash
+    set -e
+
+    # Database file location
+    export DB_FILE="/tmp/network-perf-results.db"
+
+    # Generate unique test run ID
+    export TEST_RUN_ID=$(date +%s)_$$
+    echo "Test Run ID: $TEST_RUN_ID"
+
+    # Create database schema
+    sqlite3 "$DB_FILE" << 'EOF_SCHEMA'
+    CREATE TABLE IF NOT EXISTS test_runs (
+      test_run_id TEXT PRIMARY KEY,
+      start_time INTEGER,
+      end_time INTEGER,
+      test_duration INTEGER,
+      network_type TEXT,
+      pod_count INTEGER,
+      test_status TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS ib_results (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      test_run_id TEXT,
+      source_pod TEXT,
+      target_pod TEXT,
+      source_node TEXT,
+      target_node TEXT,
+      source_gpu TEXT,
+      target_gpu TEXT,
+      nic_interface TEXT,
+      rdma_device_source TEXT,
+      rdma_device_target TEXT,
+      link_speed_gbps INTEGER,
+      message_size INTEGER,
+      test_mode TEXT,
+      memory_type TEXT,
+      bandwidth_gbps REAL,
+      latency_usec REAL,
+      iterations INTEGER,
+      test_status TEXT,
+      timestamp INTEGER,
+      FOREIGN KEY (test_run_id) REFERENCES test_runs(test_run_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS roce_results (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      test_run_id TEXT,
+      source_pod TEXT,
+      target_pod TEXT,
+      source_node TEXT,
+      target_node TEXT,
+      source_gpu TEXT,
+      target_gpu TEXT,
+      nic_interface TEXT,
+      rdma_device_source TEXT,
+      rdma_device_target TEXT,
+      link_speed_gbps INTEGER,
+      message_size INTEGER,
+      test_mode TEXT,
+      memory_type TEXT,
+      bandwidth_gbps REAL,
+      iterations INTEGER,
+      test_status TEXT,
+      timestamp INTEGER,
+      FOREIGN KEY (test_run_id) REFERENCES test_runs(test_run_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS tcp_results (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      test_run_id TEXT,
+      source_pod TEXT,
+      target_pod TEXT,
+      source_node TEXT,
+      target_node TEXT,
+      nic_interface TEXT,
+      link_speed_gbps INTEGER,
+      test_mode TEXT,
+      bandwidth_gbps REAL,
+      streams INTEGER,
+      test_status TEXT,
+      timestamp INTEGER,
+      FOREIGN KEY (test_run_id) REFERENCES test_runs(test_run_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS nccl_results (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      test_run_id TEXT,
+      pod_name TEXT,
+      node_name TEXT,
+      gpu_model TEXT,
+      gpu_count INTEGER,
+      test_name TEXT,
+      peak_size_bytes INTEGER,
+      peak_bandwidth_gbps REAL,
+      test_status TEXT,
+      timestamp INTEGER,
+      FOREIGN KEY (test_run_id) REFERENCES test_runs(test_run_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS multinode_nccl_results (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      test_run_id TEXT,
+      message_size_bytes INTEGER,
+      bandwidth_gbps REAL,
+      node_count INTEGER,
+      test_status TEXT,
+      timestamp INTEGER,
+      FOREIGN KEY (test_run_id) REFERENCES test_runs(test_run_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS gpu_nic_topology (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      test_run_id TEXT,
+      pod_name TEXT,
+      node_name TEXT,
+      nic_device TEXT,
+      gpu_id INTEGER,
+      connection_type TEXT,
+      timestamp INTEGER,
+      FOREIGN KEY (test_run_id) REFERENCES test_runs(test_run_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS latency_under_load_results (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      test_run_id TEXT,
+      source_pod TEXT,
+      target_pod TEXT,
+      source_node TEXT,
+      target_node TEXT,
+      source_gpu TEXT,
+      target_gpu TEXT,
+      rdma_device_source TEXT,
+      rdma_device_target TEXT,
+      message_size INTEGER,
+      test_type TEXT,
+      memory_type TEXT,
+      latency_usec REAL,
+      test_status TEXT,
+      timestamp INTEGER,
+      FOREIGN KEY (test_run_id) REFERENCES test_runs(test_run_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ucx_results (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      test_run_id TEXT,
+      source_pod TEXT,
+      target_pod TEXT,
+      source_node TEXT,
+      target_node TEXT,
+      source_gpu TEXT,
+      target_gpu TEXT,
+      rdma_device_source TEXT,
+      rdma_device_target TEXT,
+      message_size INTEGER,
+      test_mode TEXT,
+      memory_type TEXT,
+      bandwidth_gbps REAL,
+      latency_usec REAL,
+      test_status TEXT,
+      timestamp INTEGER,
+      FOREIGN KEY (test_run_id) REFERENCES test_runs(test_run_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS latency_results (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      test_run_id TEXT,
+      source_pod TEXT,
+      target_pod TEXT,
+      source_node TEXT,
+      target_node TEXT,
+      source_gpu TEXT,
+      target_gpu TEXT,
+      rdma_device_source TEXT,
+      rdma_device_target TEXT,
+      message_size INTEGER,
+      memory_type TEXT,
+      latency_median_us REAL,
+      latency_average_us REAL,
+      latency_99p_us REAL,
+      iterations INTEGER,
+      test_status TEXT,
+      timestamp INTEGER,
+      FOREIGN KEY (test_run_id) REFERENCES test_runs(test_run_id)
+    );
+    EOF_SCHEMA
+
+    # Insert test run metadata
+    sqlite3 "$DB_FILE" "INSERT INTO test_runs (test_run_id, start_time, test_duration, test_status) VALUES ('$TEST_RUN_ID', $(date +%s), $TEST_DURATION, 'running');"
+
+    echo "✓ Database initialized: $DB_FILE"
+
+    # Compact DB dump function
+    dump_db() {
+      echo -e "\n${CYAN}=== DB DUMP ===${RESET}"
+      for t in ib_results ucx_results latency_results roce_results tcp_results nccl_results; do
+        sqlite3 -header -column "$DB_FILE" "SELECT * FROM $t WHERE test_run_id='$TEST_RUN_ID';" 2>/dev/null && echo ""
+      done
+      echo -e "${CYAN}=== END ===${RESET}\n"
+    }
+    trap dump_db EXIT

@@ -1,0 +1,788 @@
+              # Test 2: RoCE Tests (only if we have SR-IOV networks)
+              if [ ${#VALID_NICS[@]} -gt 0 ]; then
+                echo ""
+                echo -e "${CYAN}=========================================="
+                echo -e "Test 2: RoCE Bandwidth Tests"
+                echo -e "==========================================${RESET}"
+                echo ""
+                echo "Testing RDMA bandwidth using ib_write_bw"
+                echo "Message size: 4MB, Duration: ${TEST_DURATION}s"
+                echo ""
+                echo "Network Type: RoCE (RDMA over Converged Ethernet)"
+                echo ""
+
+                # Use SR-IOV interfaces for RoCE tests
+                echo ""
+                echo -e "${YELLOW}Using SR-IOV interfaces for RoCE tests${RESET}"
+                echo ""
+
+                echo ""
+                echo -e "${MAGENTA}=========================================="
+                echo -e "  SEQUENTIAL Tests (one NIC at a time)"
+                echo -e "==========================================${RESET}"
+                echo ""
+
+                # Sequential tests - run each NIC independently
+                for NIC in "${VALID_NICS[@]}"; do
+                NIC_SPEED=${NIC_SPEEDS[$NIC]}
+                SOURCE_RDMA_DEV=${NIC_SOURCE_RDMA_DEVS[$NIC]}
+                TARGET_RDMA_DEV=${NIC_TARGET_RDMA_DEVS[$NIC]}
+                PHYS_PORTS=${NIC_RDMA_PHYS_PORTS[$NIC]}
+                SOURCE_IP=${NIC_SOURCE_IPS[$NIC]}
+
+                # Determine if dual-port mode should be used
+                DUALPORT_FLAG=""
+                MODE_DESC="single-port"
+                if [ "$PHYS_PORTS" -eq 2 ] 2>/dev/null; then
+                  DUALPORT_FLAG="-O"
+                  MODE_DESC="dual-port"
+                fi
+
+                echo "  Testing [$NIC] sequentially (Link: ${NIC_SPEED}G, $MODE_DESC)..."
+
+                # RoCE test (system memory)
+                echo "    RoCE test..."
+                oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw $DUALPORT_FLAG -d $SOURCE_RDMA_DEV -s $MSG_SIZE -D $TEST_DURATION -F --report_gbits -q 2 > /tmp/ib_host_${NIC}_seq.log 2>&1 &"
+                sleep 3
+                oc exec $TARGET_POD -- bash -c "ulimit -l unlimited; timeout $TEST_TIMEOUT ib_write_bw $DUALPORT_FLAG -d $TARGET_RDMA_DEV -s $MSG_SIZE -D $TEST_DURATION -F --report_gbits -q 2 $SOURCE_IP > /tmp/ib_host_${NIC}_seq_result.log 2>&1"
+                HOST_RESULT=$(oc exec $TARGET_POD -- bash -c "cat /tmp/ib_host_${NIC}_seq_result.log 2>/dev/null | grep '$MSG_SIZE' | grep -v '#' | tail -1" || echo "")
+
+                if [ -n "$HOST_RESULT" ]; then
+                  HOST_SEQ_GBPS=$(echo "$HOST_RESULT" | awk '{print $4}')
+                  HOST_SEQ_ITERS=$(echo "$HOST_RESULT" | awk '{print $2}')
+                  echo -e "      ${GREEN}Result: $HOST_SEQ_GBPS Gb/s ($HOST_SEQ_ITERS iters)${RESET} (see $TARGET_POD:/tmp/ib_host_${NIC}_seq_result.log)"
+                else
+                  HOST_SEQ_GBPS="FAIL"
+                  HOST_SEQ_ITERS="0"
+                  echo -e "      ${RED}Result: FAIL${RESET}"
+                fi
+                NIC_HOST_SEQ_GBPS[$NIC]=$HOST_SEQ_GBPS
+                NIC_HOST_SEQ_ITERS[$NIC]=$HOST_SEQ_ITERS
+
+                oc exec $SOURCE_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                oc exec $TARGET_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                sleep 2
+
+                # RoCE+CUDA test (GPU memory) - GPUDirect RDMA
+                echo "    RoCE+CUDA test (GPUDirect RDMA)..."
+
+                # Check if GPUs are available on both pods
+                SOURCE_GPU_CHECK=$(oc exec $SOURCE_POD -- bash -c "nvidia-smi -L 2>/dev/null | head -1" || echo "")
+                TARGET_GPU_CHECK=$(oc exec $TARGET_POD -- bash -c "nvidia-smi -L 2>/dev/null | head -1" || echo "")
+
+                # Check if IOMMU is disabled on both nodes
+                SOURCE_NODE=$(oc get pod $SOURCE_POD -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+                TARGET_NODE=$(oc get pod $TARGET_POD -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+                SOURCE_IOMMU_OK=true
+                TARGET_IOMMU_OK=true
+                for node in "${IOMMU_ENABLED_NODES[@]}"; do
+                  if [[ "$SOURCE_NODE" == *"$node"* ]]; then
+                    SOURCE_IOMMU_OK=false
+                  fi
+                  if [[ "$TARGET_NODE" == *"$node"* ]]; then
+                    TARGET_IOMMU_OK=false
+                  fi
+                done
+
+                if [ -n "$SOURCE_GPU_CHECK" ] && [ -n "$TARGET_GPU_CHECK" ] && [ "$SOURCE_IOMMU_OK" = true ] && [ "$TARGET_IOMMU_OK" = true ]; then
+                  # Run GPUDirect RDMA test using GPU memory (--use_cuda=0 for GPU 0)
+                  oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw $DUALPORT_FLAG -d $SOURCE_RDMA_DEV -s $MSG_SIZE -D $TEST_DURATION -F --report_gbits -q 2 --use_cuda=0 > /tmp/ib_gpu_${NIC}_seq.log 2>&1 &"
+                  sleep 3
+                  oc exec $TARGET_POD -- bash -c "ulimit -l unlimited; timeout $TEST_TIMEOUT ib_write_bw $DUALPORT_FLAG -d $TARGET_RDMA_DEV -s $MSG_SIZE -D $TEST_DURATION -F --report_gbits -q 2 --use_cuda=0 $SOURCE_IP > /tmp/ib_gpu_${NIC}_seq_result.log 2>&1"
+                  GPU_RESULT=$(oc exec $TARGET_POD -- bash -c "cat /tmp/ib_gpu_${NIC}_seq_result.log 2>/dev/null | grep '$MSG_SIZE' | grep -v '#' | tail -1" || echo "")
+
+                  if [ -n "$GPU_RESULT" ]; then
+                    GPU_SEQ_GBPS=$(echo "$GPU_RESULT" | awk '{print $4}')
+                    GPU_SEQ_ITERS=$(echo "$GPU_RESULT" | awk '{print $2}')
+                    echo -e "      ${GREEN}Result: $GPU_SEQ_GBPS Gb/s ($GPU_SEQ_ITERS iters)${RESET} (see $TARGET_POD:/tmp/ib_gpu_${NIC}_seq_result.log)"
+                  else
+                    GPU_SEQ_GBPS="0.0"
+                    GPU_SEQ_ITERS="0"
+                    echo -e "      ${RED}Result: 0.0 Gb/s (FAIL)${RESET}"
+                    # Show error log for debugging
+                    oc exec $TARGET_POD -- bash -c "cat /tmp/ib_gpu_${NIC}_seq_result.log 2>/dev/null | tail -5" || true
+                  fi
+
+                  oc exec $SOURCE_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                  oc exec $TARGET_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                else
+                  # Determine skip reason
+                  SKIP_REASON=""
+                  if [ -z "$SOURCE_GPU_CHECK" ] || [ -z "$TARGET_GPU_CHECK" ]; then
+                    SKIP_REASON="GPUs not available"
+                  elif [ "$SOURCE_IOMMU_OK" = false ] || [ "$TARGET_IOMMU_OK" = false ]; then
+                    SKIP_REASON="IOMMU enabled"
+                  fi
+                  echo -e "      ${YELLOW}Result: 0.0 Gb/s (SKIPPED - $SKIP_REASON)${RESET}"
+                  GPU_SEQ_GBPS="0.0"
+                  GPU_SEQ_ITERS="0"
+                fi
+
+                NIC_GPU_SEQ_GBPS[$NIC]=$GPU_SEQ_GBPS
+                NIC_GPU_SEQ_ITERS[$NIC]=$GPU_SEQ_ITERS
+                echo ""
+              done
+
+              echo ""
+              echo -e "${MAGENTA}=========================================="
+              echo -e "  PARALLEL Tests (all NICs simultaneously)"
+              echo -e "==========================================${RESET}"
+              echo ""
+
+              echo "  Running RoCE tests on ALL NICs in parallel (using separate processes per NIC)..."
+
+              # Build comma-separated list of RDMA devices and source IPs
+              SOURCE_RDMA_DEVICES=""
+              TARGET_RDMA_DEVICES=""
+              SOURCE_IPS=""
+              NIC_COUNT=0
+              for NIC in "${VALID_NICS[@]}"; do
+                if [ $NIC_COUNT -eq 0 ]; then
+                  SOURCE_RDMA_DEVICES="${NIC_SOURCE_RDMA_DEVS[$NIC]}"
+                  TARGET_RDMA_DEVICES="${NIC_TARGET_RDMA_DEVS[$NIC]}"
+                  SOURCE_IPS="${NIC_SOURCE_IPS[$NIC]}"
+                else
+                  SOURCE_RDMA_DEVICES="${SOURCE_RDMA_DEVICES},${NIC_SOURCE_RDMA_DEVS[$NIC]}"
+                  TARGET_RDMA_DEVICES="${TARGET_RDMA_DEVICES},${NIC_TARGET_RDMA_DEVS[$NIC]}"
+                  SOURCE_IPS="${SOURCE_IPS},${NIC_SOURCE_IPS[$NIC]}"
+                fi
+                NIC_COUNT=$((NIC_COUNT + 1))
+              done
+
+              # If we have multiple NICs, try to test them individually in quick succession
+              # to reduce contention (instead of true parallel which causes memory bandwidth issues)
+              if [ $NIC_COUNT -gt 1 ]; then
+                echo "  Testing $NIC_COUNT NICs with optimized parallel approach (reduced queue pairs)..."
+              fi
+
+              # Start servers on all NICs (use different ports, reduced queue pairs, dual-port if available)
+              # Track tested RDMA devices to avoid duplicate tests on multi-port HCAs
+              declare -A TESTED_SOURCE_RDMA_DEVS
+              PORT=18515
+              for NIC in "${VALID_NICS[@]}"; do
+                SOURCE_RDMA_DEV=${NIC_SOURCE_RDMA_DEVS[$NIC]}
+                PHYS_PORTS=${NIC_RDMA_PHYS_PORTS[$NIC]}
+
+                # Check if this is a multi-port device that we've already tested
+                if [ "$PHYS_PORTS" -ge 2 ] 2>/dev/null && [ -n "${TESTED_SOURCE_RDMA_DEVS[$SOURCE_RDMA_DEV]}" ]; then
+                  echo "    Skipping $NIC - already testing $SOURCE_RDMA_DEV (${PHYS_PORTS}-port HCA)"
+                  continue
+                fi
+
+                # Determine if dual-port mode should be used (only for 2-port HCAs)
+                DUALPORT_FLAG=""
+                if [ "$PHYS_PORTS" -eq 2 ] 2>/dev/null; then
+                  DUALPORT_FLAG="-O"
+                fi
+
+                # Mark this device as tested to avoid duplicates
+                if [ "$PHYS_PORTS" -ge 2 ] 2>/dev/null; then
+                  TESTED_SOURCE_RDMA_DEVS[$SOURCE_RDMA_DEV]=$PORT
+                fi
+
+                oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw $DUALPORT_FLAG -d $SOURCE_RDMA_DEV -p $PORT -s $MSG_SIZE -D $TEST_DURATION -F --report_gbits -q 1 > /tmp/ib_host_${NIC}_par.log 2>&1 &"
+                PORT=$((PORT + 1))
+              done
+              sleep 3
+
+              # Start clients on all NICs (will run in parallel with reduced contention)
+              # Build command to start all clients simultaneously in one oc exec
+              CLIENT_CMD="set +m; "  # Enable job control
+              declare -A CLIENT_TESTED_TARGET_RDMA_DEVS
+              PORT=18515
+              for NIC in "${VALID_NICS[@]}"; do
+                TARGET_RDMA_DEV=${NIC_TARGET_RDMA_DEVS[$NIC]}
+                PHYS_PORTS=${NIC_RDMA_PHYS_PORTS[$NIC]}
+                SOURCE_IP=${NIC_SOURCE_IPS[$NIC]}
+
+                # Check if this is a multi-port device that we've already tested
+                if [ "$PHYS_PORTS" -ge 2 ] 2>/dev/null && [ -n "${CLIENT_TESTED_TARGET_RDMA_DEVS[$TARGET_RDMA_DEV]}" ]; then
+                  continue
+                fi
+
+                # Determine if dual-port mode should be used (only for 2-port HCAs)
+                DUALPORT_FLAG=""
+                if [ "$PHYS_PORTS" -eq 2 ] 2>/dev/null; then
+                  DUALPORT_FLAG="-O"
+                fi
+
+                # Mark this device as tested to avoid duplicates
+                if [ "$PHYS_PORTS" -ge 2 ] 2>/dev/null; then
+                  CLIENT_TESTED_TARGET_RDMA_DEVS[$TARGET_RDMA_DEV]=$PORT
+                fi
+
+                CLIENT_CMD="${CLIENT_CMD}(ulimit -l unlimited; timeout $TEST_TIMEOUT ib_write_bw $DUALPORT_FLAG -d $TARGET_RDMA_DEV -p $PORT -s $MSG_SIZE -D $TEST_DURATION -F --report_gbits -q 1 $SOURCE_IP > /tmp/ib_host_${NIC}_par_result.log 2>&1) & "
+                PORT=$((PORT + 1))
+              done
+              CLIENT_CMD="${CLIENT_CMD}wait"
+              oc exec $TARGET_POD -- bash -c "$CLIENT_CMD" &
+              EXEC_PID=$!
+              sleep 2  # Give oc exec time to start
+
+              # Wait for tests to complete
+              echo "  Waiting for RoCE tests to complete..."
+              wait $EXEC_PID 2>/dev/null || true
+              echo "  RoCE tests finished."
+
+              # Collect results
+              for NIC in "${VALID_NICS[@]}"; do
+                HOST_RESULT=$(oc exec $TARGET_POD -- bash -c "cat /tmp/ib_host_${NIC}_par_result.log 2>/dev/null | grep '$MSG_SIZE' | grep -v '#' | tail -1" || echo "")
+
+                if [ -n "$HOST_RESULT" ]; then
+                  HOST_PAR_GBPS=$(echo "$HOST_RESULT" | awk '{print $4}')
+                  HOST_PAR_ITERS=$(echo "$HOST_RESULT" | awk '{print $2}')
+                  echo -e "  [$NIC] RoCE: ${GREEN}$HOST_PAR_GBPS Gb/s ($HOST_PAR_ITERS iters)${RESET} (see $TARGET_POD:/tmp/ib_host_${NIC}_par_result.log)"
+                else
+                  HOST_PAR_GBPS="FAIL"
+                  HOST_PAR_ITERS="0"
+                  echo "  [$NIC] RoCE: FAIL"
+                fi
+                NIC_HOST_PAR_GBPS[$NIC]=$HOST_PAR_GBPS
+                NIC_HOST_PAR_ITERS[$NIC]=$HOST_PAR_ITERS
+              done
+
+              # Cleanup
+              oc exec $SOURCE_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+              oc exec $TARGET_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+              sleep 2
+
+              echo ""
+              echo "  Running RoCE+CUDA tests on ALL NICs in parallel (GPUDirect RDMA)..."
+
+              # Check if GPUs are available on both pods
+              SOURCE_GPU_CHECK=$(oc exec $SOURCE_POD -- bash -c "nvidia-smi -L 2>/dev/null | head -1" || echo "")
+              TARGET_GPU_CHECK=$(oc exec $TARGET_POD -- bash -c "nvidia-smi -L 2>/dev/null | head -1" || echo "")
+
+              # Check if IOMMU is disabled on both nodes (reuse from sequential test)
+              SOURCE_NODE=$(oc get pod $SOURCE_POD -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+              TARGET_NODE=$(oc get pod $TARGET_POD -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+              SOURCE_IOMMU_OK=true
+              TARGET_IOMMU_OK=true
+              for node in "${IOMMU_ENABLED_NODES[@]}"; do
+                if [[ "$SOURCE_NODE" == *"$node"* ]]; then
+                  SOURCE_IOMMU_OK=false
+                fi
+                if [[ "$TARGET_NODE" == *"$node"* ]]; then
+                  TARGET_IOMMU_OK=false
+                fi
+              done
+
+              if [ -n "$SOURCE_GPU_CHECK" ] && [ -n "$TARGET_GPU_CHECK" ] && [ "$SOURCE_IOMMU_OK" = true ] && [ "$TARGET_IOMMU_OK" = true ]; then
+                echo "  Distributing NICs across GPUs with round-robin..."
+
+                # Map each NIC to its closest GPU based on PCIe topology with load balancing
+                declare -A NIC_GPU_AFFINITY_SOURCE
+                declare -A NIC_GPU_AFFINITY_TARGET
+
+                # Get GPU count for round-robin distribution (with timeout)
+                SOURCE_GPU_COUNT=$(timeout 10 oc exec $SOURCE_POD -- bash -c "nvidia-smi -L 2>/dev/null | wc -l" 2>/dev/null | tr -d ' \n')
+                TARGET_GPU_COUNT=$(timeout 10 oc exec $TARGET_POD -- bash -c "nvidia-smi -L 2>/dev/null | wc -l" 2>/dev/null | tr -d ' \n')
+
+                # Validate GPU counts
+                if [ -z "$SOURCE_GPU_COUNT" ] || [ "$SOURCE_GPU_COUNT" -eq 0 ] 2>/dev/null; then
+                  echo "  ERROR: Could not detect GPU count on source pod, skipping GPU tests"
+                  SOURCE_GPU_COUNT=1
+                fi
+                if [ -z "$TARGET_GPU_COUNT" ] || [ "$TARGET_GPU_COUNT" -eq 0 ] 2>/dev/null; then
+                  echo "  ERROR: Could not detect GPU count on target pod, skipping GPU tests"
+                  TARGET_GPU_COUNT=1
+                fi
+
+                echo "  Source GPUs: $SOURCE_GPU_COUNT, Target GPUs: $TARGET_GPU_COUNT"
+
+                # Use round-robin to distribute NICs across GPUs
+                nic_index=0
+                for NIC in "${VALID_NICS[@]}"; do
+                  # Assign GPU using round-robin: GPU = nic_index % gpu_count
+                  SOURCE_GPU=$((nic_index % SOURCE_GPU_COUNT))
+                  TARGET_GPU=$((nic_index % TARGET_GPU_COUNT))
+
+                  NIC_GPU_AFFINITY_SOURCE[$NIC]=$SOURCE_GPU
+                  NIC_GPU_AFFINITY_TARGET[$NIC]=$TARGET_GPU
+                  nic_index=$((nic_index + 1))
+                done
+
+                echo "  Assigned $nic_index NICs across $SOURCE_GPU_COUNT GPUs (round-robin)"
+
+                echo ""
+                echo "  GPU Affinity Mapping (Round-Robin):"
+                echo "  -----------------------------------------------------------------------"
+                printf "  %-8s %-15s %-12s %-12s\n" "NIC" "RDMA Device" "Source GPU" "Target GPU"
+                echo "  -----------------------------------------------------------------------"
+                for NIC in "${VALID_NICS[@]}"; do
+                  SOURCE_RDMA_DEV=${NIC_SOURCE_RDMA_DEVS[$NIC]}
+                  TARGET_RDMA_DEV=${NIC_TARGET_RDMA_DEVS[$NIC]}
+                  SOURCE_GPU=${NIC_GPU_AFFINITY_SOURCE[$NIC]}
+                  TARGET_GPU=${NIC_GPU_AFFINITY_TARGET[$NIC]}
+
+                  printf "  %-8s %-15s GPU %-8d GPU %-8d\n" "$NIC" "$SOURCE_RDMA_DEV" "$SOURCE_GPU" "$TARGET_GPU"
+                done
+                echo "  -----------------------------------------------------------------------"
+
+                # Show GPU load distribution
+                declare -A GPU_LOAD
+                for NIC in "${VALID_NICS[@]}"; do
+                  SOURCE_GPU=${NIC_GPU_AFFINITY_SOURCE[$NIC]}
+                  GPU_LOAD[$SOURCE_GPU]=$((GPU_LOAD[$SOURCE_GPU] + 1))
+                done
+
+                echo "  GPU Load Distribution:"
+                # Sort GPU indices numerically and display load
+                for gpu in $(printf '%s\n' "${!GPU_LOAD[@]}" | sort -n); do
+                  load=${GPU_LOAD[$gpu]}
+                  echo "    GPU $gpu: $load NICs"
+                done
+                echo ""
+
+                # Start GPU servers on all NICs (use different ports, reduced queue pairs, dual-port if available)
+                declare -A GPU_TESTED_SOURCE_RDMA_DEVS
+                PORT=18615
+                for NIC in "${VALID_NICS[@]}"; do
+                  SOURCE_RDMA_DEV=${NIC_SOURCE_RDMA_DEVS[$NIC]}
+                  SOURCE_GPU=${NIC_GPU_AFFINITY_SOURCE[$NIC]}
+                  PHYS_PORTS=${NIC_RDMA_PHYS_PORTS[$NIC]}
+
+                  # Check if this is a multi-port device that we've already tested
+                  if [ "$PHYS_PORTS" -ge 2 ] 2>/dev/null && [ -n "${GPU_TESTED_SOURCE_RDMA_DEVS[$SOURCE_RDMA_DEV]}" ]; then
+                    continue
+                  fi
+
+                  # Determine if dual-port mode should be used (only for 2-port HCAs)
+                  DUALPORT_FLAG=""
+                  if [ "$PHYS_PORTS" -eq 2 ] 2>/dev/null; then
+                    DUALPORT_FLAG="-O"
+                  fi
+
+                  # Mark this device as tested to avoid duplicates
+                  if [ "$PHYS_PORTS" -ge 2 ] 2>/dev/null; then
+                    GPU_TESTED_SOURCE_RDMA_DEVS[$SOURCE_RDMA_DEV]=$PORT
+                  fi
+
+                  oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw $DUALPORT_FLAG -d $SOURCE_RDMA_DEV -p $PORT -s $MSG_SIZE -D $TEST_DURATION -F --report_gbits -q 1 --use_cuda=$SOURCE_GPU > /tmp/ib_gpu_${NIC}_par.log 2>&1 &"
+                  PORT=$((PORT + 1))
+                done
+                sleep 3
+
+                # Start GPU clients on all NICs (will run in parallel with reduced contention)
+                GPU_CLIENT_CMD="set +m; "
+                declare -A GPU_CLIENT_TESTED_TARGET_RDMA_DEVS
+                PORT=18615
+                for NIC in "${VALID_NICS[@]}"; do
+                  TARGET_RDMA_DEV=${NIC_TARGET_RDMA_DEVS[$NIC]}
+                  TARGET_GPU=${NIC_GPU_AFFINITY_TARGET[$NIC]}
+                  PHYS_PORTS=${NIC_RDMA_PHYS_PORTS[$NIC]}
+                  SOURCE_IP=${NIC_SOURCE_IPS[$NIC]}
+
+                  # Check if this is a multi-port device that we've already tested
+                  if [ "$PHYS_PORTS" -ge 2 ] 2>/dev/null && [ -n "${GPU_CLIENT_TESTED_TARGET_RDMA_DEVS[$TARGET_RDMA_DEV]}" ]; then
+                    continue
+                  fi
+
+                  # Determine if dual-port mode should be used (only for 2-port HCAs)
+                  DUALPORT_FLAG=""
+                  if [ "$PHYS_PORTS" -eq 2 ] 2>/dev/null; then
+                    DUALPORT_FLAG="-O"
+                  fi
+
+                  # Mark this device as tested to avoid duplicates
+                  if [ "$PHYS_PORTS" -ge 2 ] 2>/dev/null; then
+                    GPU_CLIENT_TESTED_TARGET_RDMA_DEVS[$TARGET_RDMA_DEV]=$PORT
+                  fi
+
+                  GPU_CLIENT_CMD+="timeout $TEST_TIMEOUT ib_write_bw $DUALPORT_FLAG -d $TARGET_RDMA_DEV -p $PORT -s $MSG_SIZE -D $TEST_DURATION -F --report_gbits -q 1 --use_cuda=$TARGET_GPU $SOURCE_IP > /tmp/ib_gpu_${NIC}_par_result.log 2>&1 & "
+                  PORT=$((PORT + 1))
+                done
+                GPU_CLIENT_CMD+="wait"
+
+                # Run all GPU clients in parallel
+                oc exec $TARGET_POD -- bash -c "ulimit -l unlimited; $GPU_CLIENT_CMD"
+
+                echo "  Waiting for RoCE+CUDA tests to complete..."
+                sleep 2
+                echo "  RoCE+CUDA tests finished."
+
+                # Collect results for each NIC
+                for NIC in "${VALID_NICS[@]}"; do
+                  GPU_RESULT=$(oc exec $TARGET_POD -- bash -c "cat /tmp/ib_gpu_${NIC}_par_result.log 2>/dev/null | grep '$MSG_SIZE' | grep -v '#' | tail -1" || echo "")
+
+                  if [ -n "$GPU_RESULT" ]; then
+                    GPU_PAR_GBPS=$(echo "$GPU_RESULT" | awk '{print $4}')
+                    GPU_PAR_ITERS=$(echo "$GPU_RESULT" | awk '{print $2}')
+                    echo "  [$NIC] RoCE+CUDA: $GPU_PAR_GBPS Gb/s ($GPU_PAR_ITERS iters) (see $TARGET_POD:/tmp/ib_gpu_${NIC}_par_result.log)"
+                  else
+                    GPU_PAR_GBPS="0.0"
+                    GPU_PAR_ITERS="0"
+                    echo "  [$NIC] RoCE+CUDA: 0.0 Gb/s (FAIL)"
+                  fi
+                  NIC_GPU_PAR_GBPS[$NIC]=$GPU_PAR_GBPS
+                  NIC_GPU_PAR_ITERS[$NIC]=$GPU_PAR_ITERS
+                done
+
+                # Cleanup
+                oc exec $SOURCE_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                oc exec $TARGET_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+              else
+                # Determine skip reason
+                SKIP_REASON=""
+                if [ -z "$SOURCE_GPU_CHECK" ] || [ -z "$TARGET_GPU_CHECK" ]; then
+                  SKIP_REASON="GPUs not available"
+                elif [ "$SOURCE_IOMMU_OK" = false ] || [ "$TARGET_IOMMU_OK" = false ]; then
+                  SKIP_REASON="IOMMU enabled"
+                fi
+                echo "  ${YELLOW}Tests SKIPPED - $SKIP_REASON${RESET}"
+                # Output 0.0 for each NIC for parseable results
+                for NIC in "${VALID_NICS[@]}"; do
+                  echo "  [$NIC] RoCE+CUDA: 0.0 Gb/s (SKIPPED - $SKIP_REASON)"
+                  NIC_GPU_PAR_GBPS[$NIC]="0.0"
+                  NIC_GPU_PAR_ITERS[$NIC]="0"
+                done
+              fi
+
+              # Store results in SQLite database and in-memory arrays for display
+              for NIC in "${VALID_NICS[@]}"; do
+                HOST_SEQ=${NIC_HOST_SEQ_GBPS[$NIC]}
+                GPU_SEQ=${NIC_GPU_SEQ_GBPS[$NIC]}
+                HOST_PAR=${NIC_HOST_PAR_GBPS[$NIC]}
+                GPU_PAR=${NIC_GPU_PAR_GBPS[$NIC]}
+                HOST_SEQ_ITER=${NIC_HOST_SEQ_ITERS[$NIC]}
+                GPU_SEQ_ITER=${NIC_GPU_SEQ_ITERS[$NIC]}
+                HOST_PAR_ITER=${NIC_HOST_PAR_ITERS[$NIC]}
+                GPU_PAR_ITER=${NIC_GPU_PAR_ITERS[$NIC]}
+                NIC_SPEED=${NIC_SPEEDS[$NIC]}
+                SOURCE_RDMA_DEV=${NIC_SOURCE_RDMA_DEVS[$NIC]}
+                TARGET_RDMA_DEV=${NIC_TARGET_RDMA_DEVS[$NIC]}
+
+                # Determine status (PASS if > 1000 iterations, FAIL otherwise)
+                [ "$HOST_SEQ_ITER" -gt 1000 ] 2>/dev/null && HOST_SEQ_STATUS="PASS" || HOST_SEQ_STATUS="FAIL"
+                [ "$GPU_SEQ_ITER" -gt 1000 ] 2>/dev/null && GPU_SEQ_STATUS="PASS" || GPU_SEQ_STATUS="FAIL"
+                [ "$HOST_PAR_ITER" -gt 1000 ] 2>/dev/null && HOST_PAR_STATUS="PASS" || HOST_PAR_STATUS="FAIL"
+                [ "$GPU_PAR_ITER" -gt 1000 ] 2>/dev/null && GPU_PAR_STATUS="PASS" || GPU_PAR_STATUS="FAIL"
+
+                # Calculate utilization percentages
+                if [ "$HOST_SEQ" != "FAIL" ] && [ "$NIC_SPEED" != "Unknown" ]; then
+                  HOST_SEQ_UTIL=$(awk "BEGIN {printf \"%.1f\", $HOST_SEQ / $NIC_SPEED * 100}")
+                else
+                  HOST_SEQ_UTIL="N/A"
+                fi
+
+                if [ "$GPU_SEQ" != "FAIL" ] && [ "$NIC_SPEED" != "Unknown" ]; then
+                  GPU_SEQ_UTIL=$(awk "BEGIN {printf \"%.1f\", $GPU_SEQ / $NIC_SPEED * 100}")
+                else
+                  GPU_SEQ_UTIL="N/A"
+                fi
+
+                if [ "$HOST_PAR" != "FAIL" ] && [ "$NIC_SPEED" != "Unknown" ]; then
+                  HOST_PAR_UTIL=$(awk "BEGIN {printf \"%.1f\", $HOST_PAR / $NIC_SPEED * 100}")
+                else
+                  HOST_PAR_UTIL="N/A"
+                fi
+
+                if [ "$GPU_PAR" != "FAIL" ] && [ "$NIC_SPEED" != "Unknown" ]; then
+                  GPU_PAR_UTIL=$(awk "BEGIN {printf \"%.1f\", $GPU_PAR / $NIC_SPEED * 100}")
+                else
+                  GPU_PAR_UTIL="N/A"
+                fi
+
+                # Insert into database - Sequential Host Memory Test
+                sqlite3 "$DB_FILE" "INSERT INTO roce_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, nic_interface, rdma_device_source, rdma_device_target, link_speed_gbps, message_size, test_mode, memory_type, bandwidth_gbps, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', '$NIC', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', $NIC_SPEED, $MSG_SIZE, 'sequential', 'host', ${HOST_SEQ:-0.0}, ${HOST_SEQ_ITER:-0}, '$HOST_SEQ_STATUS', $(date +%s));" 2>/dev/null || true
+
+                # Insert into database - Sequential GPU Memory Test
+                sqlite3 "$DB_FILE" "INSERT INTO roce_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, nic_interface, rdma_device_source, rdma_device_target, link_speed_gbps, message_size, test_mode, memory_type, bandwidth_gbps, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', '$NIC', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', $NIC_SPEED, $MSG_SIZE, 'sequential', 'gpu', ${GPU_SEQ:-0.0}, ${GPU_SEQ_ITER:-0}, '$GPU_SEQ_STATUS', $(date +%s));" 2>/dev/null || true
+
+                # Insert into database - Parallel Host Memory Test
+                sqlite3 "$DB_FILE" "INSERT INTO roce_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, nic_interface, rdma_device_source, rdma_device_target, link_speed_gbps, message_size, test_mode, memory_type, bandwidth_gbps, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', '$NIC', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', $NIC_SPEED, $MSG_SIZE, 'parallel', 'host', ${HOST_PAR:-0.0}, ${HOST_PAR_ITER:-0}, '$HOST_PAR_STATUS', $(date +%s));" 2>/dev/null || true
+
+                # Insert into database - Parallel GPU Memory Test
+                sqlite3 "$DB_FILE" "INSERT INTO roce_results (test_run_id, source_pod, target_pod, source_node, target_node, source_gpu, target_gpu, nic_interface, rdma_device_source, rdma_device_target, link_speed_gbps, message_size, test_mode, memory_type, bandwidth_gbps, iterations, test_status, timestamp) VALUES ('$TEST_RUN_ID', '$SOURCE_POD', '$TARGET_POD', '$SOURCE_NODE', '$TARGET_NODE', '$SOURCE_GPUS', '$TARGET_GPUS', '$NIC', '$SOURCE_RDMA_DEV', '$TARGET_RDMA_DEV', $NIC_SPEED, $MSG_SIZE, 'parallel', 'gpu', ${GPU_PAR:-0.0}, ${GPU_PAR_ITER:-0}, '$GPU_PAR_STATUS', $(date +%s));" 2>/dev/null || true
+              done
+
+              # Display results for this pod pair immediately
+              echo ""
+              echo -e "${CYAN}======================================================================"
+              echo -e "RoCE Test Results for $SOURCE_POD → $TARGET_POD"
+              echo -e "======================================================================${RESET}"
+              echo ""
+
+              # Query database for RoCE results for this pod pair
+      cat > /tmp/sql_query.sql << 'HEREDOC_EOF_ROCE_DISPLAY' 
+          .mode column
+          .width 30 30 10 10 5 8 10 8 10 8 10 8 10 8
+          .headers on
+          SELECT
+            substr(source_pod, 1, 30) as Source,
+            substr(target_pod, 1, 30) as Target,
+            substr(source_gpu, 1, 10) as "Src-GPU",
+            substr(target_gpu, 1, 10) as "Tgt-GPU",
+            nic_interface as NIC,
+            message_size as Size,
+            link_speed_gbps || 'G' as Link,
+            COALESCE(
+              (SELECT printf('%.2f', bandwidth_gbps) FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'sequential' AND r2.memory_type = 'host' LIMIT 1),
+              'N/A') as "Host-Seq",
+            COALESCE(
+              (SELECT iterations FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'sequential' AND r2.memory_type = 'host' LIMIT 1),
+              0) as "Iters",
+            COALESCE(
+              (SELECT printf('%.2f', bandwidth_gbps) FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'sequential' AND r2.memory_type = 'gpu' LIMIT 1),
+              'N/A') as "GPU-Seq",
+            COALESCE(
+              (SELECT iterations FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'sequential' AND r2.memory_type = 'gpu' LIMIT 1),
+              0) as "Iters",
+            COALESCE(
+              (SELECT printf('%.2f', bandwidth_gbps) FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'parallel' AND r2.memory_type = 'host' LIMIT 1),
+              'N/A') as "Host-Par",
+            COALESCE(
+              (SELECT iterations FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'parallel' AND r2.memory_type = 'host' LIMIT 1),
+              0) as "Iters",
+            COALESCE(
+              (SELECT printf('%.2f', bandwidth_gbps) FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'parallel' AND r2.memory_type = 'gpu' LIMIT 1),
+              'N/A') as "GPU-Par",
+            COALESCE(
+              (SELECT iterations FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'parallel' AND r2.memory_type = 'gpu' LIMIT 1),
+              0) as "Iters"
+          FROM roce_results r
+          WHERE test_run_id = '$TEST_RUN_ID'
+          AND source_pod = '$SOURCE_POD'
+          AND target_pod = '$TARGET_POD'
+          AND test_mode = 'sequential'
+          AND memory_type = 'host'
+          GROUP BY source_pod, target_pod, nic_interface
+          ORDER BY nic_interface;
+              HEREDOC_EOF_ROCE_DISPLAY
+      sqlite3 -separator " " "$DB_FILE" < /tmp/sql_query.sql
+
+              echo ""
+              fi
+
+              tested_targets=$((tested_targets + 1))
+              echo ""
+            fi
+          done
+
+          echo ""
+          echo -e "${CYAN}======================================================================"
+          echo -e "Network Performance Test Results Summary"
+          echo -e "======================================================================${RESET}"
+          echo ""
+
+          # Check if we have IB results or RoCE results
+          IB_COUNT=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM ib_results WHERE test_run_id = '$TEST_RUN_ID';")
+          ROCE_COUNT=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM roce_results WHERE test_run_id = '$TEST_RUN_ID';")
+
+          if [ "$IB_COUNT" -gt 0 ]; then
+            echo ""
+            echo -e "${CYAN}======================================================================"
+            echo -e "InfiniBand Test Results (Native IB using RDMA Shared Devices)"
+            echo -e "======================================================================${RESET}"
+            echo ""
+
+            # Query database for IB results
+            sqlite3 -separator ' ' "$DB_FILE" << 'EOF_IB_QUERY'
+          .mode column
+          .width 30 30 15 15 10 10 10 8 10 8
+          .headers on
+          SELECT
+            substr(source_pod, 1, 30) as Source,
+            substr(target_pod, 1, 30) as Target,
+            rdma_device_source as "Src-Dev",
+            rdma_device_target as "Tgt-Dev",
+            test_mode as Mode,
+            memory_type as Memory,
+            printf('%.2f', bandwidth_gbps) as "BW (Gb/s)",
+            iterations as Iters,
+            test_status as Status,
+            datetime(timestamp, 'unixepoch', 'localtime') as Time
+          FROM ib_results
+          WHERE test_run_id = '$TEST_RUN_ID'
+          ORDER BY source_pod, target_pod, rdma_device_source, test_mode DESC, memory_type;
+          EOF_IB_QUERY
+
+            echo ""
+            echo "Column Descriptions:"
+            echo "  Mode    - sequential (one device) or parallel (all devices)"
+            echo "  Memory  - host (system RAM) or gpu (GPUDirect RDMA)"
+            echo "  Iters   - Number of iterations completed (>1000 = full run)"
+            echo "  Status  - PASS if test completed, FAIL if terminated early"
+            echo ""
+          fi
+
+          if [ "$ROCE_COUNT" -gt 0 ]; then
+            echo ""
+            echo -e "${CYAN}======================================================================"
+            echo -e "RoCE Test Results (RDMA over Ethernet using SR-IOV)"
+            echo -e "======================================================================${RESET}"
+            echo ""
+
+            # Query database for RoCE results
+          sqlite3 -separator ' ' "$DB_FILE" << 'EOF_ROCE_QUERY'
+          .mode column
+          .width 30 30 10 10 5 8 10 6 6 10 6 6 10 6 6 10 6 6
+          .headers on
+          SELECT
+            substr(source_pod, 1, 30) as Source,
+            substr(target_pod, 1, 30) as Target,
+            substr(source_gpu, 1, 10) as "Src-GPU",
+            substr(target_gpu, 1, 10) as "Tgt-GPU",
+            nic_interface as NIC,
+            message_size as Size,
+            link_speed_gbps || 'G' as Link,
+            COALESCE(
+              (SELECT printf('%.2f', bandwidth_gbps) FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'sequential' AND r2.memory_type = 'host' LIMIT 1),
+              'N/A') as "RoCE-Seq",
+            COALESCE(
+              (SELECT iterations FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'sequential' AND r2.memory_type = 'host' LIMIT 1),
+              0) as "Iters",
+            COALESCE(
+              (SELECT test_status FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'sequential' AND r2.memory_type = 'host' LIMIT 1),
+              'N/A') as "Stat",
+            COALESCE(
+              (SELECT printf('%.2f', bandwidth_gbps) FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'sequential' AND r2.memory_type = 'gpu' LIMIT 1),
+              'N/A') as "RoCE+C-Seq",
+            COALESCE(
+              (SELECT iterations FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'sequential' AND r2.memory_type = 'gpu' LIMIT 1),
+              0) as "Iters",
+            COALESCE(
+              (SELECT test_status FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'sequential' AND r2.memory_type = 'gpu' LIMIT 1),
+              'N/A') as "Stat",
+            COALESCE(
+              (SELECT printf('%.2f', bandwidth_gbps) FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'parallel' AND r2.memory_type = 'host' LIMIT 1),
+              'N/A') as "RoCE-Par",
+            COALESCE(
+              (SELECT iterations FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'parallel' AND r2.memory_type = 'host' LIMIT 1),
+              0) as "Iters",
+            COALESCE(
+              (SELECT test_status FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'parallel' AND r2.memory_type = 'host' LIMIT 1),
+              'N/A') as "Stat",
+            COALESCE(
+              (SELECT printf('%.2f', bandwidth_gbps) FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'parallel' AND r2.memory_type = 'gpu' LIMIT 1),
+              'N/A') as "RoCE+C-Par",
+            COALESCE(
+              (SELECT iterations FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'parallel' AND r2.memory_type = 'gpu' LIMIT 1),
+              0) as "Iters",
+            COALESCE(
+              (SELECT test_status FROM roce_results r2
+               WHERE r2.test_run_id = r.test_run_id
+               AND r2.source_pod = r.source_pod
+               AND r2.target_pod = r.target_pod
+               AND r2.nic_interface = r.nic_interface
+               AND r2.test_mode = 'parallel' AND r2.memory_type = 'gpu' LIMIT 1),
+              'N/A') as "Stat"
+          FROM (
+            SELECT DISTINCT source_pod, target_pod, source_gpu, target_gpu, nic_interface, message_size, link_speed_gbps, test_run_id
+            FROM roce_results
+            WHERE test_run_id = '$TEST_RUN_ID'
+          ) r
+          ORDER BY source_pod, target_pod, nic_interface;
+          EOF_ROCE_QUERY
+
+            echo ""
+            echo "Column Descriptions:"
+            echo "  Src/Tgt-GPU    - GPU model(s) on each pod (comma-separated if multiple)"
+            echo "  Link           - NIC speed capability (Gb/s)"
+            echo "  RoCE-Seq       - RDMA from system memory, sequential (Gb/s)"
+            echo "  RoCE+C-Seq     - RDMA from GPU memory (GPUDirect), sequential (Gb/s)"
+            echo "  RoCE-Par       - RDMA from system memory, parallel (Gb/s)"
+            echo "  RoCE+C-Par     - RDMA from GPU memory (GPUDirect), parallel (Gb/s)"
+            echo "  Iters          - Number of iterations completed (>1000 = full run)"
+            echo "  Stat           - PASS if test completed, FAIL if terminated early"
+            echo ""
+            echo "Result files available on target pod for verification:"
+            echo "  Sequential: /tmp/ib_{host,gpu}_{nic}_seq_result.log"
+            echo "  Parallel:   /tmp/ib_{host,gpu}_{nic}_par_result.log"
+            echo ""
+          fi

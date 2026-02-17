@@ -1,0 +1,374 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: network-perf-latency-under-load
+  namespace: default
+data:
+  latency-under-load.py: |
+    #!/usr/bin/env python3
+    """Latency Under Bandwidth Load Tests
+
+    Measures latency while bandwidth is saturated to show real-world
+    performance degradation under heavy network load.
+    """
+
+    import os
+    import sys
+    import subprocess
+    import sqlite3
+    import re
+    import time
+
+    DB_FILE = os.environ.get('DB_FILE', '/tmp/network-perf-results.db')
+    TEST_RUN_ID = os.environ.get('TEST_RUN_ID')
+    MSG_SIZE = int(os.environ.get('MSG_SIZE', '4194304'))
+    BW_DURATION = int(os.environ.get('BW_DURATION', '30'))  # Seconds to saturate bandwidth
+
+    def run_oc_exec(pod, cmd):
+        """Execute command in pod"""
+        result = subprocess.run(
+            ['oc', 'exec', pod, '--', 'bash', '-c', cmd],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, check=False
+        )
+        return result.stdout, result.stderr, result.returncode
+
+    def get_active_devices(pod):
+        """Get active RDMA devices"""
+        stdout, _, _ = run_oc_exec(pod,
+            'for dev in $(ibv_devices 2>/dev/null | grep "mlx5_" | awk "{print $1}"); do '
+            'if ibv_devinfo -d $dev 2>/dev/null | grep -q "PORT_ACTIVE"; then echo $dev; fi; done')
+        return stdout.strip().split()
+
+    def get_optimal_gpu(pod, device):
+        """Get optimal GPU ID for a given RDMA device from topology database"""
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            result = c.execute("""
+                SELECT gpu_id FROM gpu_nic_topology
+                WHERE pod_name = ? AND nic_device = ? AND connection_type = 'PXB'
+                LIMIT 1
+            """, (pod, device)).fetchone()
+            conn.close()
+            return result[0] if result else 0
+        except:
+            return 0
+
+    def insert_latency_under_load_result(source_pod, target_pod, source_node, target_node,
+                                        source_gpu, target_gpu, rdma_src, rdma_tgt,
+                                        msg_size, test_type, mem_type, lat_usec, status):
+        """Insert latency-under-load test result into database"""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO latency_under_load_results
+            (test_run_id, source_pod, target_pod, source_node, target_node,
+             source_gpu, target_gpu, rdma_device_source, rdma_device_target,
+             message_size, test_type, memory_type, latency_usec, test_status, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+        """, (TEST_RUN_ID, source_pod, target_pod, source_node, target_node,
+              source_gpu, target_gpu, rdma_src, rdma_tgt, msg_size, test_type, mem_type,
+              lat_usec, status))
+        conn.commit()
+        conn.close()
+
+    def run_ib_latency_under_bw_load(source_pod, target_pod, source_node, target_node, source_gpus, target_gpus):
+        """
+        IB: Measure latency while bandwidth is saturated
+        Strategy: Saturate BW on all NICs, then measure latency on each NIC
+        """
+        print("\n" + "="*70)
+        print("IB Latency Under Bandwidth Load Tests")
+        print("="*70)
+
+        # Get active RDMA devices
+        cmd = """
+        for dev in $(ibv_devices 2>/dev/null | grep "mlx5_" | awk "{print \\$1}"); do
+          if ibv_devinfo -d $dev 2>/dev/null | grep -q "PORT_ACTIVE"; then
+            echo $dev
+          fi
+        done
+        """
+
+        source_devs, _, _ = run_oc_exec(source_pod, cmd)
+        target_devs, _, _ = run_oc_exec(target_pod, cmd)
+
+        source_active = source_devs.strip().split()
+        target_active = target_devs.strip().split()
+
+        if not source_active or not target_active:
+            print("No RDMA devices found")
+            return
+
+        # Get target IP
+        target_ip_cmd = f"oc get pod {target_pod} -o jsonpath='{{.status.podIP}}'"
+        target_ip = subprocess.check_output(target_ip_cmd, shell=True, universal_newlines=True).strip()
+
+        # Test both host and GPU memory
+        for mem_type, mem_flag_template in [('host', ''), ('cuda', '--use_cuda={}')]:
+            print(f"\n{mem_type.upper()} latency under BW load on {len(source_active)} NICs...")
+
+            # Use ib_send_lat for CUDA (ib_write_lat doesn't support CUDA), ib_write_lat for HOST
+            lat_cmd = 'ib_send_lat' if mem_type == 'cuda' else 'ib_write_lat'
+            n_lat_iters = 1000  # Use 1000 iterations for both HOST and CUDA for statistical accuracy
+
+            # Kill any existing processes
+            run_oc_exec(target_pod, 'pkill -9 ib_write_bw || true')
+            run_oc_exec(source_pod, 'pkill -9 ib_write_bw || true')
+            run_oc_exec(target_pod, 'pkill -9 ib_write_lat || true; pkill -9 ib_send_lat || true')
+            run_oc_exec(source_pod, 'pkill -9 ib_write_lat || true; pkill -9 ib_send_lat || true')
+            time.sleep(2)
+
+            # Step 1: Start bandwidth saturation on ALL NICs (background, long duration)
+            print(f"  Saturating bandwidth on all {len(source_active)} NICs...")
+            bw_base_port = 20000 if mem_type == 'host' else 22000
+
+            for i, (src_dev, tgt_dev) in enumerate(zip(source_active, target_active)):
+                target_gpu_id = get_optimal_gpu(target_pod, tgt_dev)
+                source_gpu_id = get_optimal_gpu(source_pod, src_dev)
+                target_mem_flag = mem_flag_template.format(target_gpu_id) if mem_type == 'cuda' else ''
+                source_mem_flag = mem_flag_template.format(source_gpu_id) if mem_type == 'cuda' else ''
+                port = bw_base_port + i
+
+                # Start BW server (background)
+                server_cmd = f'nohup ib_write_bw -d {tgt_dev} -p {port} -s {MSG_SIZE} -D {BW_DURATION} -F --report_gbits -q 1 {target_mem_flag} > /dev/null 2>&1 &'
+                run_oc_exec(target_pod, server_cmd)
+
+                time.sleep(1)
+
+                # Start BW client (background)
+                client_cmd = f'nohup ib_write_bw -d {src_dev} -p {port} -s {MSG_SIZE} -D {BW_DURATION} -F --report_gbits -q 1 {source_mem_flag} {target_ip} > /dev/null 2>&1 &'
+                run_oc_exec(source_pod, client_cmd)
+
+            # Wait for bandwidth to saturate
+            print(f"  Waiting for bandwidth to saturate...")
+            time.sleep(5)
+
+            # Step 2: NOW measure latency on each NIC while BW is saturated
+            print(f"  Measuring latency while bandwidth is saturated...")
+            lat_base_port = 21000 if mem_type == 'host' else 23000
+
+            for i, (src_dev, tgt_dev) in enumerate(zip(source_active, target_active)):
+                target_gpu_id = get_optimal_gpu(target_pod, tgt_dev)
+                source_gpu_id = get_optimal_gpu(source_pod, src_dev)
+                target_mem_flag = mem_flag_template.format(target_gpu_id) if mem_type == 'cuda' else ''
+                source_mem_flag = mem_flag_template.format(source_gpu_id) if mem_type == 'cuda' else ''
+                lat_port = lat_base_port + i
+
+                # Start latency server
+                lat_server_cmd = f'{lat_cmd} -d {tgt_dev} -p {lat_port} -s {MSG_SIZE} -n {n_lat_iters} -F {target_mem_flag}'
+                server_proc = subprocess.Popen(
+                    ['oc', 'exec', target_pod, '--', 'bash', '-c', lat_server_cmd],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+                )
+
+                time.sleep(2)
+
+                # Run latency client
+                lat_client_cmd = f'{lat_cmd} -d {src_dev} -p {lat_port} -s {MSG_SIZE} -n {n_lat_iters} -F {source_mem_flag} {target_ip}'
+                stdout, stderr, rc = run_oc_exec(source_pod, lat_client_cmd)
+
+                # Parse latency result
+                found_result = False
+                for line in stdout.split('\n'):
+                    if str(MSG_SIZE) in line and '#' not in line:
+                        parts = line.split()
+                        if len(parts) >= 3:
+                            lat_usec = float(parts[2])  # Average latency
+                            iters = int(parts[1])
+                            status = 'PASS' if iters > 100 else 'FAIL'
+
+                            print(f"    [{src_dev}] {mem_type.upper()}: {lat_usec:.2f} μs - {status}")
+                            insert_latency_under_load_result(
+                                source_pod, target_pod, source_node, target_node,
+                                source_gpus, target_gpus, src_dev, tgt_dev,
+                                MSG_SIZE, 'ib_under_bw_load', mem_type, lat_usec, status
+                            )
+                            found_result = True
+                            break
+
+                if not found_result:
+                    print(f"    [{src_dev}] {mem_type.upper()}: FAIL - no results")
+
+                # Cleanup latency server
+                server_proc.terminate()
+                try:
+                    server_proc.wait(timeout=2)
+                except:
+                    server_proc.kill()
+
+            # Cleanup all BW and latency tests
+            run_oc_exec(target_pod, 'pkill -9 ib_write_bw || true; pkill -9 ib_write_lat || true; pkill -9 ib_send_lat || true')
+            run_oc_exec(source_pod, 'pkill -9 ib_write_bw || true; pkill -9 ib_write_lat || true; pkill -9 ib_send_lat || true')
+            time.sleep(2)
+
+        print("\n✓ IB latency-under-load tests completed")
+
+    def run_ucx_latency_under_bw_load(source_pod, target_pod, source_node, target_node, source_gpus, target_gpus):
+        """
+        UCX: Measure latency while bandwidth is saturated
+        """
+        print("\n" + "="*70)
+        print("UCX Latency Under Bandwidth Load Tests")
+        print("="*70)
+
+        # Get devices
+        source_devices = get_active_devices(source_pod)
+        target_devices = get_active_devices(target_pod)
+        common_devices = sorted(set(source_devices) & set(target_devices))
+
+        if not common_devices:
+            print("No common RDMA devices found between pods!")
+            return
+
+        # Get target IP
+        target_ip_cmd = f"oc get pod {target_pod} -o jsonpath='{{.status.podIP}}'"
+        target_ip = subprocess.check_output(target_ip_cmd, shell=True, universal_newlines=True).strip()
+
+        # Test both HOST and CUDA memory
+        for mem_type in ['host', 'cuda']:
+            print(f"\n{mem_type.upper()} latency under BW load on {len(common_devices)} NICs...")
+
+            # Kill any existing processes
+            run_oc_exec(target_pod, 'pkill -9 ucx_perftest || true')
+            run_oc_exec(source_pod, 'pkill -9 ucx_perftest || true')
+            time.sleep(2)
+
+            # Step 1: Saturate bandwidth on ALL NICs
+            print(f"  Saturating bandwidth on all {len(common_devices)} NICs...")
+            bw_base_port = 24000 if mem_type == 'host' else 25000
+            server_procs = []
+
+            for idx, dev in enumerate(common_devices):
+                target_gpu_id = get_optimal_gpu(target_pod, dev)
+                source_gpu_id = get_optimal_gpu(source_pod, dev)
+                # Force UCX to use specific RDMA device
+                # UCX_TLS: Use generic rc (not rc_mlx5) + cuda transports
+                # NOTE: UCX_IB_GID_INDEX removed - only GID[0] exists on these devices
+                ucx_env = f'UCX_TLS=rc,cuda_copy,cuda_ipc UCX_NET_DEVICES={dev}:1'
+                port = bw_base_port + idx
+
+                if mem_type == 'cuda':
+                    target_env = f'{ucx_env} CUDA_VISIBLE_DEVICES={target_gpu_id} '
+                    source_env = f'{ucx_env} CUDA_VISIBLE_DEVICES={source_gpu_id} '
+                    mem_flag = '-m cuda'
+                else:
+                    target_env = f'{ucx_env} '
+                    source_env = f'{ucx_env} '
+                    mem_flag = ''
+
+                # Start BW server (using Popen to keep it alive)
+                # Use timeout to run for 60 seconds guaranteed (much longer than latency measurement)
+                # Infinite iterations with timeout ensures BW load stays active during entire latency test
+                # Use 'env' command to properly pass environment variables to timeout
+                server_cmd = f'ulimit -l unlimited; timeout 60 env {target_env}ucx_perftest {mem_flag} -t tag_bw -s {MSG_SIZE} -p {port} -n 999999999'
+                proc = subprocess.Popen(
+                    ['oc', 'exec', target_pod, '--', 'bash', '-c', server_cmd],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+                )
+                server_procs.append((dev, proc))
+
+                time.sleep(1)
+
+                # Start BW client (background with 60 second timeout)
+                # This ensures BW saturation lasts entire duration of latency measurements
+                # Use 'env' command to properly pass environment variables to timeout
+                client_cmd = f'ulimit -l unlimited; timeout 60 env {source_env}ucx_perftest {mem_flag} -t tag_bw -s {MSG_SIZE} -p {port} -n 999999999 {target_ip} > /dev/null 2>&1 &'
+                run_oc_exec(source_pod, client_cmd)
+
+            # Wait for bandwidth to saturate
+            print(f"  Waiting for bandwidth to saturate...")
+            time.sleep(5)
+
+            # Step 2: Measure latency on each NIC while BW is saturated
+            print(f"  Measuring latency while bandwidth is saturated...")
+            lat_base_port = 26000 if mem_type == 'host' else 27000
+
+            for idx, dev in enumerate(common_devices):
+                target_gpu_id = get_optimal_gpu(target_pod, dev)
+                source_gpu_id = get_optimal_gpu(source_pod, dev)
+                # Force UCX to use specific RDMA device
+                # UCX_TLS: Use generic rc (not rc_mlx5) + cuda transports
+                # NOTE: UCX_IB_GID_INDEX removed - only GID[0] exists on these devices
+                ucx_env = f'UCX_TLS=rc,cuda_copy,cuda_ipc UCX_NET_DEVICES={dev}:1'
+                lat_port = lat_base_port + idx
+
+                if mem_type == 'cuda':
+                    target_env = f'{ucx_env} CUDA_VISIBLE_DEVICES={target_gpu_id} '
+                    source_env = f'{ucx_env} CUDA_VISIBLE_DEVICES={source_gpu_id} '
+                    mem_flag = '-m cuda'
+                else:
+                    target_env = f'{ucx_env} '
+                    source_env = f'{ucx_env} '
+                    mem_flag = ''
+
+                # Start latency server
+                lat_server_cmd = f'ulimit -l unlimited; {target_env}ucx_perftest {mem_flag} -t tag_lat -s {MSG_SIZE} -p {lat_port}'
+                lat_server_proc = subprocess.Popen(
+                    ['oc', 'exec', target_pod, '--', 'bash', '-c', lat_server_cmd],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+                )
+
+                time.sleep(3)
+
+                # Run latency client
+                lat_client_cmd = f'ulimit -l unlimited; {source_env}ucx_perftest {mem_flag} -t tag_lat -s {MSG_SIZE} -p {lat_port} -n 1000 {target_ip}'
+                stdout, stderr, rc = run_oc_exec(source_pod, lat_client_cmd)
+
+                # Parse latency
+                lat_match = re.search(r'Final:\s+\d+\s+[\d.]+\s+([\d.]+)', stdout)
+                if lat_match:
+                    lat_usec = float(lat_match.group(1))
+                    print(f"    [{dev}] {mem_type.upper()}: {lat_usec:.2f} μs - PASS")
+
+                    insert_latency_under_load_result(
+                        source_pod, target_pod, source_node, target_node,
+                        source_gpus, target_gpus, dev, dev,
+                        MSG_SIZE, 'ucx_under_bw_load', mem_type, lat_usec, 'PASS'
+                    )
+                else:
+                    print(f"    [{dev}] {mem_type.upper()}: FAIL - no results")
+
+                # Cleanup latency server
+                lat_server_proc.terminate()
+                try:
+                    lat_server_proc.wait(timeout=2)
+                except:
+                    lat_server_proc.kill()
+
+            # Cleanup all BW tests
+            for dev, proc in server_procs:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except:
+                    proc.kill()
+
+            run_oc_exec(target_pod, 'pkill -9 ucx_perftest || true')
+            run_oc_exec(source_pod, 'pkill -9 ucx_perftest || true')
+            time.sleep(2)
+
+        print("\n✓ UCX latency-under-load tests completed")
+
+    if __name__ == '__main__':
+        # Run IB tests
+        run_ib_latency_under_bw_load(
+            sys.argv[1],  # source_pod
+            sys.argv[2],  # target_pod
+            sys.argv[3],  # source_node
+            sys.argv[4],  # target_node
+            sys.argv[5],  # source_gpus
+            sys.argv[6]   # target_gpus
+        )
+
+        # Run UCX tests
+        run_ucx_latency_under_bw_load(
+            sys.argv[1],  # source_pod
+            sys.argv[2],  # target_pod
+            sys.argv[3],  # source_node
+            sys.argv[4],  # target_node
+            sys.argv[5],  # source_gpus
+            sys.argv[6]   # target_gpus
+        )

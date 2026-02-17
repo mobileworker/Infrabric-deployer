@@ -1,0 +1,196 @@
+---
+# Example pod using all RDMA NICs for RDMA-only communication
+# No IP networking - direct RDMA verbs communication
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rdma-test-pod
+  namespace: default
+  labels:
+    app: rdma-test
+spec:
+  restartPolicy: Never
+  containers:
+  - name: rdma-app
+    image: registry.access.redhat.com/ubi9/ubi:latest
+    command:
+    - /bin/bash
+    - -c
+    - |
+      echo "=== RDMA Test Pod ==="
+      echo "Hostname: $(hostname)"
+      echo ""
+
+      echo "=== Available RDMA Devices ==="
+      ls -la /dev/infiniband/
+
+      echo ""
+      echo "=== InfiniBand HCAs ==="
+      ls -la /sys/class/infiniband/
+
+      echo ""
+      echo "=== RDMA Device Details ==="
+      for dev in /sys/class/infiniband/mlx5_*; do
+        if [ -d "$dev" ]; then
+          devname=$(basename $dev)
+          echo "Device: $devname"
+          echo "  Node GUID: $(cat $dev/node_guid 2>/dev/null || echo 'N/A')"
+          echo "  Sys Image GUID: $(cat $dev/sys_image_guid 2>/dev/null || echo 'N/A')"
+          echo "  Firmware: $(cat $dev/fw_ver 2>/dev/null || echo 'N/A')"
+          echo "  Ports: $(ls -d $dev/ports/* 2>/dev/null | wc -l)"
+          for port in $dev/ports/*; do
+            if [ -d "$port" ]; then
+              portnum=$(basename $port)
+              state=$(cat $port/state 2>/dev/null || echo 'unknown')
+              phys_state=$(cat $port/phys_state 2>/dev/null || echo 'unknown')
+              rate=$(cat $port/rate 2>/dev/null || echo 'unknown')
+              echo "    Port $portnum: state=$state, phys_state=$phys_state, rate=$rate"
+            fi
+          done
+          echo ""
+        fi
+      done
+
+      echo "=== Pod Ready for RDMA Communication ==="
+      echo "Install rdma-core tools: dnf install -y rdma-core perftest"
+      echo "Test RDMA: ibv_devices, ibv_devinfo, ibstat"
+      echo "RDMA performance test: ib_write_bw, ib_read_lat, etc."
+      echo ""
+      echo "Sleeping... Use 'oc exec' to run RDMA tests"
+      sleep infinity
+
+    resources:
+      requests:
+        # Request all 7 RDMA NICs
+        rdma/rdma_shared_nic0: 1
+        rdma/rdma_shared_nic1: 1
+        rdma/rdma_shared_nic2: 1
+        rdma/rdma_shared_nic3: 1
+        rdma/rdma_shared_nic4: 1
+        rdma/rdma_shared_nic5: 1
+        rdma/rdma_shared_nic6: 1
+      limits:
+        rdma/rdma_shared_nic0: 1
+        rdma/rdma_shared_nic1: 1
+        rdma/rdma_shared_nic2: 1
+        rdma/rdma_shared_nic3: 1
+        rdma/rdma_shared_nic4: 1
+        rdma/rdma_shared_nic5: 1
+        rdma/rdma_shared_nic6: 1
+
+    securityContext:
+      capabilities:
+        add:
+        - IPC_LOCK        # Required for RDMA memory registration
+        - SYS_RESOURCE    # Required for setting resource limits
+
+    volumeMounts:
+    - name: devinfiniband
+      mountPath: /dev/infiniband
+    - name: sysinfiniband
+      mountPath: /sys/class/infiniband
+      readOnly: true
+
+  volumes:
+  - name: devinfiniband
+    hostPath:
+      path: /dev/infiniband
+  - name: sysinfiniband
+    hostPath:
+      path: /sys/class/infiniband
+---
+# DaemonSet version - one pod per node for testing RDMA between nodes
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rdma-test-daemonset
+  namespace: default
+  labels:
+    app: rdma-test-ds
+spec:
+  selector:
+    matchLabels:
+      app: rdma-test-ds
+  template:
+    metadata:
+      labels:
+        app: rdma-test-ds
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/worker: ""
+      containers:
+      - name: rdma-app
+        image: registry.access.redhat.com/ubi9/ubi:latest
+        command:
+        - /bin/bash
+        - -c
+        - |
+          # Install RDMA tools
+          echo "Installing RDMA tools..."
+          dnf install -y rdma-core perftest iproute iputils procps-ng >/dev/null 2>&1
+
+          echo ""
+          echo "=== RDMA Test Pod on $(hostname) ==="
+          echo "Node: $(cat /etc/hostname 2>/dev/null || hostname)"
+
+          echo ""
+          echo "=== Available IB Devices ==="
+          ibv_devices 2>/dev/null || echo "ibv_devices not available yet"
+
+          echo ""
+          echo "=== Device Info ==="
+          ibv_devinfo 2>/dev/null || echo "ibv_devinfo not available yet"
+
+          echo ""
+          echo "=== Ready for RDMA Testing ==="
+          echo ""
+          echo "Server mode (on one pod):"
+          echo "  ib_write_bw -d mlx5_0 -a"
+          echo ""
+          echo "Client mode (on another pod):"
+          echo "  ib_write_bw -d mlx5_0 <server-hostname-or-ip>"
+          echo ""
+          echo "Other tests:"
+          echo "  ib_read_bw, ib_send_bw, ib_read_lat, ib_write_lat"
+          echo ""
+
+          sleep infinity
+
+        resources:
+          requests:
+            rdma/rdma_shared_nic0: 1
+            rdma/rdma_shared_nic1: 1
+            rdma/rdma_shared_nic2: 1
+            rdma/rdma_shared_nic3: 1
+            rdma/rdma_shared_nic4: 1
+            rdma/rdma_shared_nic5: 1
+            rdma/rdma_shared_nic6: 1
+          limits:
+            rdma/rdma_shared_nic0: 1
+            rdma/rdma_shared_nic1: 1
+            rdma/rdma_shared_nic2: 1
+            rdma/rdma_shared_nic3: 1
+            rdma/rdma_shared_nic4: 1
+            rdma/rdma_shared_nic5: 1
+            rdma/rdma_shared_nic6: 1
+
+        securityContext:
+          capabilities:
+            add:
+            - IPC_LOCK
+            - SYS_RESOURCE
+
+        volumeMounts:
+        - name: devinfiniband
+          mountPath: /dev/infiniband
+        - name: sysinfiniband
+          mountPath: /sys/class/infiniband
+          readOnly: true
+
+      volumes:
+      - name: devinfiniband
+        hostPath:
+          path: /dev/infiniband
+      - name: sysinfiniband
+        hostPath:
+          path: /sys/class/infiniband

@@ -1,0 +1,498 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: network-perf-test
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: network-perf-test
+rules:
+- apiGroups: [""]
+  resources: ["pods", "nodes", "configmaps"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  verbs: ["get", "list", "create", "delete", "patch", "update"]
+- apiGroups: ["sriovnetwork.openshift.io"]
+  resources: ["sriovnetworks"]
+  verbs: ["get", "list"]
+- apiGroups: ["route.openshift.io"]
+  resources: ["routes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: network-perf-test
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: network-perf-test
+subjects:
+- kind: ServiceAccount
+  name: network-perf-test
+  namespace: default
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: network-perf-test
+  namespace: default
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      serviceAccountName: network-perf-test
+      restartPolicy: Never
+      containers:
+      - name: test-coordinator
+        image: registry.redhat.io/openshift4/ose-cli:latest
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: db-init
+          mountPath: /opt/scripts/db-init
+          readOnly: true
+        - name: ib-tests
+          mountPath: /opt/scripts/ib-tests
+          readOnly: true
+        - name: roce-tests
+          mountPath: /opt/scripts/roce-tests
+          readOnly: true
+        - name: nccl-tests
+          mountPath: /opt/scripts/nccl-tests
+          readOnly: true
+        - name: ucx-tests
+          mountPath: /opt/scripts/ucx-tests
+          readOnly: true
+        - name: latency-tests
+          mountPath: /opt/scripts/latency-tests
+          readOnly: true
+        - name: tcp-tests
+          mountPath: /opt/scripts/tcp-tests
+          readOnly: true
+        - name: latency-under-load
+          mountPath: /opt/scripts/latency-under-load
+          readOnly: true
+        - name: report-scripts
+          mountPath: /opt/report-generator
+          readOnly: true
+        - name: daemonset-builder
+          mountPath: /opt/scripts/daemonset-builder
+          readOnly: true
+        env:
+        - name: CLEANUP_WORKERS
+          value: "false"
+        - name: KEEP_COORDINATOR_ALIVE
+          value: "true"
+        - name: TEST_DURATION
+          value: "5"
+        - name: RUN_LATENCY_UNDER_LOAD
+          value: "true"
+        - name: BW_DURATION
+          value: "30"
+        - name: KUBE_CACHE_MUTATION_DETECTOR
+          value: "false"
+        command:
+        - /bin/bash
+        - -c
+        - |
+          # Redirect stdout to log file and filter stderr to remove memcache warnings
+          exec > >(tee /tmp/test-output.log)
+          exec 2> >(grep -v "memcache.go\|external.metrics.k8s.io" >&2)
+
+          set -e
+          
+          TEST_DURATION=${TEST_DURATION:-60}
+          TEST_TIMEOUT=$((TEST_DURATION + 10))
+          MSG_SIZE=4194304  # 4MB
+          
+          # Install dependencies
+          if ! command -v sqlite3 &> /dev/null; then
+            echo "Installing sqlite3..."
+            microdnf install -y sqlite >/dev/null 2>&1 || yum install -y sqlite >/dev/null 2>&1 || true
+            echo "✓ sqlite3 installed"
+          fi
+          
+          # Color definitions
+          CYAN='\033[1;36m'
+          GREEN='\033[1;32m'
+          YELLOW='\033[1;33m'
+          BLUE='\033[1;34m'
+          MAGENTA='\033[1;35m'
+          RED='\033[1;31m'
+          BOLD='\033[1m'
+          RESET='\033[0m'
+          
+          # Install jq for NCCL JSON parsing
+          if ! command -v jq &> /dev/null; then
+            echo "Installing jq..."
+            microdnf install -y jq >/dev/null 2>&1 || yum install -y jq >/dev/null 2>&1 || true
+            echo "✓ jq installed"
+          fi
+          
+          # Source database initialization script (bash)
+          source /opt/scripts/db-init/init-db.sh
+
+          # Export environment for Python scripts
+          export DB_FILE TEST_RUN_ID TEST_DURATION TEST_TIMEOUT MSG_SIZE
+          export CYAN GREEN YELLOW BLUE MAGENTA RED RESET
+          
+          echo -e "${CYAN}==========================================="
+          echo "Network Performance Testing"
+          echo -e "===========================================${RESET}"
+          echo ""
+          
+          # Step 1: Discover SR-IOV networks
+          echo -e "${BLUE}Step 1: Discovering SR-IOV networks by type...${RESET}"
+          
+          IB_NETS=$(oc get sriovnetworks -o json | jq -r '.items[] | select(.spec.linkState=="enable" and (.spec.networkNamespace=="default" or .spec.networkNamespace=="")) | select(.spec.vlan==0 or .spec.vlan==null) | .metadata.name' 2>/dev/null | grep -E "ib|infiniband" || true)
+          IB_COUNT=$(echo "$IB_NETS" | grep -v '^$' | wc -l | tr -d ' ')
+          
+          ROCE_NETS=$(oc get sriovnetworks -o json | jq -r '.items[] | select(.spec.linkState=="enable" and (.spec.networkNamespace=="default" or .spec.networkNamespace=="")) | select(.spec.vlan==0 or .spec.vlan==null) | .metadata.name' 2>/dev/null | grep -v -E "ib|infiniband" || true)
+          ROCE_COUNT=$(echo "$ROCE_NETS" | grep -v '^$' | wc -l | tr -d ' ')
+          
+          echo "Found InfiniBand (IB) SR-IOV networks: $IB_COUNT"
+          echo "Found RoCE/Ethernet SR-IOV networks: $ROCE_COUNT"
+          echo ""
+          
+          # Discover RDMA shared device resources (only those with value > 0)
+          echo "Discovering RDMA shared device resources..."
+          RDMA_RESOURCES=$(oc get node -l 'node-role.kubernetes.io/worker' -o json | \
+            jq -r '.items[].status.allocatable | to_entries[] | select(.key | startswith("rdma/")) | select(.value != "0") | .key' 2>/dev/null | \
+            sort -u || true)
+          RDMA_COUNT=$(echo "$RDMA_RESOURCES" | grep -v '^$' | wc -l | tr -d ' ')
+
+          if [ "$RDMA_COUNT" -gt 0 ]; then
+            echo "Found $RDMA_COUNT RDMA shared device resources (with capacity > 0):"
+            echo "$RDMA_RESOURCES" | sed 's/^/  - /'
+          fi
+          echo ""
+          
+          TOTAL_RESOURCES=$((RDMA_COUNT + IB_COUNT + ROCE_COUNT))
+          
+          echo "=========================================="
+          echo "Network Resources Summary"
+          echo "=========================================="
+          echo "  RDMA Shared Devices: $RDMA_COUNT"
+          echo "  SR-IOV IB Networks: $IB_COUNT"
+          echo "  SR-IOV RoCE Networks: $ROCE_COUNT"
+          echo "  Total Resources: $TOTAL_RESOURCES"
+          echo ""
+          echo "Test Plan:"
+          if [ "$RDMA_COUNT" -gt 0 ] || [ "$IB_COUNT" -gt 0 ]; then
+            echo "  1. IB Bandwidth Tests (using RDMA shared devices mlx5_*)"
+          fi
+          if [ "$ROCE_COUNT" -gt 0 ]; then
+            echo "  2. RoCE Bandwidth Tests (using SR-IOV VFs net*)"
+            echo "  3. TCP Bandwidth Tests (baseline comparison)"
+          fi
+          echo "  4. NCCL GPU Tests"
+          echo ""
+          
+          # Step 2: Create DaemonSet with discovered networks
+          echo -e "${BLUE}Step 2: Creating DaemonSet with all discovered network resources...${RESET}"
+
+          # Build SR-IOV network annotation string
+          SRIOV_ANNOTATION=""
+          if [ "$ROCE_COUNT" -gt 0 ]; then
+            SRIOV_ANNOTATION=$(echo "$ROCE_NETS" | tr '\n' ',' | sed 's/,$//')
+          fi
+
+          # Build DaemonSet using Python script (clean YAML manipulation)
+          python3 /opt/scripts/daemonset-builder/build-daemonset.py "$SRIOV_ANNOTATION" $RDMA_RESOURCES | oc apply -f -
+          echo -e "${GREEN}✓ DaemonSet created:${RESET}"
+          echo "  - RDMA shared devices: $RDMA_COUNT"
+          echo ""
+          
+          # Step 3: Wait for worker pods
+          echo -e "${BLUE}Step 3: Waiting for worker pods to be ready...${RESET}"
+          echo "Note: The container image is large (~10GB), this may take 5-10 minutes..."
+          echo ""
+          
+          MAX_WAIT=900
+          INTERVAL=10
+          ELAPSED=0
+          
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            READY_PODS=$(oc get pods -l app=network-perf-test-worker --field-selector=status.phase=Running -o json | jq '[.items[] | select(.status.conditions[] | select(.type=="Ready" and .status=="True"))] | length')
+            TOTAL_WORKER_PODS=$(oc get daemonset network-perf-test-worker -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo "0")
+            
+            if [ "$READY_PODS" -ge 2 ] && [ "$READY_PODS" -eq "$TOTAL_WORKER_PODS" ]; then
+              echo "  All pods ready!"
+              break
+            fi
+            
+            CHECK_NUM=$((ELAPSED / INTERVAL + 1))
+            MAX_CHECKS=$((MAX_WAIT / INTERVAL))
+            echo "  Ready: $READY_PODS/$TOTAL_WORKER_PODS pods (check $CHECK_NUM/$MAX_CHECKS)"
+            
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+          
+          echo ""
+          
+          # Get worker pods
+          PODS=$(oc get pods -l app=network-perf-test-worker --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.name}')
+          PODS=($PODS)
+          
+          if [ ${#PODS[@]} -lt 2 ]; then
+            echo "ERROR: Need at least 2 worker pods, found ${#PODS[@]}"
+            exit 1
+          fi
+          
+          echo -e "${GREEN}Found ${#PODS[@]} worker pods ready for testing${RESET}"
+          echo "Worker pods: ${PODS[@]}"
+          echo ""
+          
+          # Check IOMMU status
+          echo -e "${BLUE}Checking IOMMU status on worker nodes...${RESET}"
+          IOMMU_ENABLED_NODES=()
+          for pod in ${PODS[@]}; do
+            NODE=$(oc get pod $pod -o jsonpath='{.spec.nodeName}')
+            IOMMU_STATUS=$(oc exec $pod -- bash -c "dmesg 2>/dev/null | grep -i iommu | grep -i enabled" || echo "")
+            if [ -n "$IOMMU_STATUS" ]; then
+              IOMMU_ENABLED_NODES+=("$NODE")
+            fi
+          done
+
+          if [ ${#IOMMU_ENABLED_NODES[@]} -gt 0 ]; then
+            echo "⚠ IOMMU enabled on nodes: ${IOMMU_ENABLED_NODES[@]}"
+            echo "  GPUDirect RDMA tests will be skipped on these nodes"
+          else
+            echo "✓ IOMMU is disabled on all nodes (required for GPUDirect RDMA)"
+          fi
+          echo ""
+
+          # Check ACS status
+          echo -e "${BLUE}Checking PCIe ACS (Access Control Services) status...${RESET}"
+          ACS_ENABLED_NODES=()
+          ACS_DISABLED_NODES=()
+          for pod in ${PODS[@]}; do
+            NODE=$(oc get pod $pod -o jsonpath='{.spec.nodeName}')
+            # Check if any PCIe bridges have ACS enabled (SrcValid+)
+            ACS_STATUS=$(oc exec $pod -- bash -c "lspci -vvv 2>/dev/null | grep -E 'ACSCtl:.*SrcValid\\+' | head -1" || echo "")
+            if [ -n "$ACS_STATUS" ]; then
+              ACS_ENABLED_NODES+=("$NODE")
+            else
+              ACS_DISABLED_NODES+=("$NODE")
+            fi
+          done
+
+          if [ ${#ACS_ENABLED_NODES[@]} -gt 0 ]; then
+            echo "⚠ ACS is ENABLED on nodes: ${ACS_ENABLED_NODES[@]}"
+            echo "  This may block PCIe peer-to-peer (GPUDirect RDMA)"
+            echo "  Kernel parameter 'pci=noacscheck' should be set to disable ACS"
+          fi
+          if [ ${#ACS_DISABLED_NODES[@]} -gt 0 ]; then
+            echo "✓ ACS is DISABLED on nodes: ${ACS_DISABLED_NODES[@]}"
+            echo "  PCIe peer-to-peer communication enabled (required for GPUDirect RDMA)"
+          fi
+          echo ""
+          
+          # Detect active RDMA devices on all pods
+          echo "Detecting active RDMA devices on pods..."
+          declare -A POD_RDMA_DEVICES
+          for pod in ${PODS[@]}; do
+            ACTIVE_DEVICES=$(oc exec $pod -- bash -c '
+              for dev in $(ibv_devices 2>/dev/null | grep "mlx5_" | awk "{print \$1}"); do
+                if ibv_devinfo -d $dev 2>/dev/null | grep -q "PORT_ACTIVE"; then
+                  echo $dev
+                fi
+              done
+            ' 2>/dev/null | tr '\n' ' ')
+            POD_RDMA_DEVICES[$pod]="$ACTIVE_DEVICES"
+            echo "  $pod: ${ACTIVE_DEVICES:-None}"
+          done
+          echo ""
+
+          # Build GPU-NIC topology database for all pods
+          echo "Building GPU-NIC topology database..."
+          for pod in ${PODS[@]}; do
+            NODE=$(oc get pod $pod -o jsonpath='{.spec.nodeName}')
+
+            # Get nvidia-smi topology output
+            TOPO_OUTPUT=$(oc exec $pod -- nvidia-smi topo -m 2>/dev/null || echo "")
+            if [ -n "$TOPO_OUTPUT" ]; then
+              # Parse NIC legend (NIC0: mlx5_0, etc.) and store in bash array
+              declare -A NIC_NUM_TO_DEV
+              while IFS= read -r line; do
+                if [[ $line =~ NIC([0-9]+):[[:space:]]+(mlx5_[0-9]+) ]]; then
+                  NIC_NUM_TO_DEV["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+                fi
+              done <<< "$TOPO_OUTPUT"
+
+              # Parse GPU rows and store all GPU-NIC connections in database
+              while IFS= read -r gpu_line; do
+                if [[ $gpu_line =~ ^GPU([0-9]+) ]]; then
+                  GPU_NUM="${BASH_REMATCH[1]}"
+                  # Extract connection types for each NIC
+                  for nic_idx in "${!NIC_NUM_TO_DEV[@]}"; do
+                    NIC_DEV="${NIC_NUM_TO_DEV[$nic_idx]}"
+                    # awk fields: $1=GPU_NAME, $2-9=GPU connections, $10+=NIC connections
+                    COL_IDX=$((10 + nic_idx))
+                    CONN=$(echo "$gpu_line" | awk -v col=$COL_IDX '{print $col}')
+
+                    # Store in database
+                    if [ -n "$CONN" ] && [ "$CONN" != "X" ]; then
+                      sqlite3 "$DB_FILE" "INSERT INTO gpu_nic_topology (test_run_id, pod_name, node_name, nic_device, gpu_id, connection_type, timestamp) VALUES ('$TEST_RUN_ID', '$pod', '$NODE', '$NIC_DEV', $GPU_NUM, '$CONN', $(date +%s));" 2>/dev/null || true
+                    fi
+                  done
+                fi
+              done <<< "$TOPO_OUTPUT"
+
+              # Display PXB (optimal) mappings for this pod
+              echo "  $pod optimal GPU-NIC mappings (PXB connections):"
+              sqlite3 -separator ' → ' "$DB_FILE" "SELECT '    ' || nic_device, 'GPU' || gpu_id FROM gpu_nic_topology WHERE test_run_id = '$TEST_RUN_ID' AND pod_name = '$pod' AND connection_type = 'PXB' ORDER BY nic_device;" 2>/dev/null || echo "    None found"
+
+              # Cleanup
+              unset NIC_NUM_TO_DEV
+            else
+              echo "  $pod: No GPU topology data available"
+            fi
+          done
+          echo ""
+
+          echo -e "${CYAN}=========================================="
+          echo "Network Performance Tests"
+          echo -e "==========================================${RESET}"
+          echo ""
+
+          # Use first worker as source, test against all other workers
+          SOURCE_POD="${PODS[0]}"
+          SOURCE_NODE=$(oc get pod $SOURCE_POD -o jsonpath='{.spec.nodeName}')
+          SOURCE_GPUS=$(oc exec $SOURCE_POD -- nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')
+
+          echo "Source pod: $SOURCE_POD (testing against ${#PODS[@]} workers total)"
+          echo ""
+
+          # Test from source to each target worker
+          for i in $(seq 1 $((${#PODS[@]} - 1))); do
+            TARGET_POD="${PODS[$i]}"
+            TARGET_NODE=$(oc get pod $TARGET_POD -o jsonpath='{.spec.nodeName}')
+            TARGET_GPUS=$(oc exec $TARGET_POD -- nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')
+
+            echo -e "${CYAN}Testing pair: $SOURCE_POD → $TARGET_POD${RESET}"
+            echo ""
+
+            # Run IB tests (Python)
+            python3 -u /opt/scripts/ib-tests/ib-tests.py "$SOURCE_POD" "$TARGET_POD" "$SOURCE_NODE" "$TARGET_NODE" "$SOURCE_GPUS" "$TARGET_GPUS"
+
+            # Run UCX tests (Python)
+            python3 -u /opt/scripts/ucx-tests/ucx-tests.py "$SOURCE_POD" "$TARGET_POD" "$SOURCE_NODE" "$TARGET_NODE" "$SOURCE_GPUS" "$TARGET_GPUS"
+
+            # Run Latency tests (Python)
+            python3 -u /opt/scripts/latency-tests/latency-tests.py "$SOURCE_POD" "$TARGET_POD" "$SOURCE_NODE" "$TARGET_NODE" "$SOURCE_GPUS" "$TARGET_GPUS"
+
+            # Run TCP tests (Python)
+            python3 -u /opt/scripts/tcp-tests/tcp-tests.py "$SOURCE_POD" "$TARGET_POD" "$SOURCE_NODE" "$TARGET_NODE" "$SOURCE_GPUS" "$TARGET_GPUS"
+
+            # Run Latency-Under-Load tests (Python) - Optional, disabled by default
+            if [ "${RUN_LATENCY_UNDER_LOAD:-false}" = "true" ]; then
+              echo -e "${CYAN}Running latency-under-load tests (experimental)...${RESET}"
+              python3 -u /opt/scripts/latency-under-load/latency-under-load.py "$SOURCE_POD" "$TARGET_POD" "$SOURCE_NODE" "$TARGET_NODE" "$SOURCE_GPUS" "$TARGET_GPUS"
+            fi
+
+            # Run RoCE tests (Python)
+            python3 -u /opt/scripts/roce-tests/roce-tests.py "$SOURCE_POD" "$TARGET_POD" "$SOURCE_NODE" "$TARGET_NODE" "$SOURCE_GPUS" "$TARGET_GPUS"
+
+            echo ""
+          done
+
+          # Run NCCL tests once (tests all workers collectively)
+          echo -e "${CYAN}Running NCCL collective tests across all workers...${RESET}"
+          python3 -u /opt/scripts/nccl-tests/nccl-tests.py
+          
+          echo ""
+          echo -e "${GREEN}All tests completed!${RESET}"
+          echo ""
+
+          # Update test run status
+          sqlite3 "$DB_FILE" "UPDATE test_runs SET end_time = $(date +%s), test_status = 'completed' WHERE test_run_id = '$TEST_RUN_ID';" 2>/dev/null || true
+
+          # Generate HTML report
+          echo -e "${CYAN}Generating HTML report...${RESET}"
+          python3 /opt/report-generator/generate-report.py
+          echo ""
+
+          # Prepare web server directory
+          mkdir -p /tmp/www
+          cp /tmp/network-perf-report.html /tmp/www/index.html 2>/dev/null || echo "Warning: Report file not found"
+          cp /tmp/network-perf-report.html /tmp/www/details.html 2>/dev/null || true
+          cp "$DB_FILE" /tmp/www/network-perf-results.db 2>/dev/null || true
+
+          # Keep pod alive if requested
+          if [ "$KEEP_COORDINATOR_ALIVE" = "true" ]; then
+            # Start web server
+            echo ""
+            echo -e "${CYAN}Starting web server on port 8080...${RESET}"
+            cd /tmp/www
+            python3 -m http.server 8080 > /dev/null 2>&1 &
+
+            sleep 2
+            ROUTE_URL=$(oc get route network-perf-report -n default -o jsonpath='{.spec.host}' 2>/dev/null)
+
+            echo -e "${GREEN}✓ Web server started${RESET}"
+            if [ -n "$ROUTE_URL" ]; then
+              echo ""
+              echo -e "${GREEN}=========================================="
+              echo "Web Report Available!"
+              echo -e "==========================================${RESET}"
+              echo ""
+              echo -e "${BOLD}${CYAN}Open in browser: https://${ROUTE_URL}${RESET}"
+              echo ""
+            else
+              echo -e "${YELLOW}Warning: Route not found. Create it with: oc apply -f web-service.yaml${RESET}"
+            fi
+
+            echo -e "${YELLOW}Coordinator staying alive to serve web report...${RESET}"
+            sleep infinity
+          fi
+      volumes:
+      - name: db-init
+        configMap:
+          name: network-perf-db-init
+          defaultMode: 0755
+      - name: ib-tests
+        configMap:
+          name: network-perf-ib-tests
+          defaultMode: 0755
+      - name: roce-tests
+        configMap:
+          name: network-perf-roce-tests
+          defaultMode: 0755
+      - name: nccl-tests
+        configMap:
+          name: network-perf-nccl-tests
+          defaultMode: 0755
+      - name: ucx-tests
+        configMap:
+          name: network-perf-ucx-tests
+          defaultMode: 0755
+      - name: latency-tests
+        configMap:
+          name: network-perf-latency-tests
+          defaultMode: 0755
+      - name: tcp-tests
+        configMap:
+          name: network-perf-tcp-tests
+          defaultMode: 0755
+      - name: latency-under-load
+        configMap:
+          name: network-perf-latency-under-load
+          defaultMode: 0755
+      - name: report-scripts
+        configMap:
+          name: report-generator-scripts
+          defaultMode: 0755
+      - name: daemonset-builder
+        configMap:
+          name: daemonset-builder
+          defaultMode: 0755

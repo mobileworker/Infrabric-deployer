@@ -1,0 +1,180 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sriov-mcp-waiter
+  namespace: nvidia-network-operator
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sriov-mcp-waiter
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  - apiGroups:
+      - machineconfiguration.openshift.io
+    resources:
+      - machineconfigpools
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+    verbs:
+      - get
+      - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sriov-mcp-waiter
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sriov-mcp-waiter
+subjects:
+  - kind: ServiceAccount
+    name: sriov-mcp-waiter
+    namespace: nvidia-network-operator
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wait-for-sriov-mcp-ready
+  namespace: nvidia-network-operator
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 100
+  ttlSecondsAfterFinished: 300  # Auto-cleanup 5 minutes after completion
+  template:
+    metadata:
+      labels:
+        app: sriov-mcp-waiter
+    spec:
+      serviceAccountName: sriov-mcp-waiter
+      restartPolicy: OnFailure
+      containers:
+        - name: wait-for-mcp
+          image: registry.redhat.io/openshift4/ose-cli:latest
+          command:
+            - /bin/bash
+            - -c
+            - |
+              #!/bin/bash
+              set -euo pipefail
+
+              echo "=========================================="
+              echo "Waiting for SR-IOV MachineConfig Rollout"
+              echo "=========================================="
+              echo ""
+              echo "SR-IOV Network Operator creates VFs which may trigger"
+              echo "node reboots via MachineConfig updates."
+              echo ""
+              echo "This job ensures all nodes have completed SR-IOV"
+              echo "configuration before deploying NVIDIA Network Operator."
+              echo ""
+
+              # Give MCO time to detect SR-IOV changes and start updating
+              echo "Waiting 2 minutes for MCO to detect SR-IOV changes..."
+              sleep 120
+              echo ""
+
+              MAX_WAIT_TIME=5400  # 90 minutes maximum wait
+              CHECK_INTERVAL=30   # Check every 30 seconds
+              elapsed=0
+
+              while [ $elapsed -lt $MAX_WAIT_TIME ]; do
+                echo "[$(date +%H:%M:%S)] Checking MachineConfigPools status..."
+                echo ""
+
+                # Get all MCP names
+                mcp_names=$(oc get mcp -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+
+                # Check each MCP's Updating status
+                any_updating=false
+                all_ready=true
+
+                for mcp_name in $mcp_names; do
+                  updating=$(oc get mcp "$mcp_name" -o jsonpath='{.status.conditions[?(@.type=="Updating")].status}' 2>/dev/null)
+                  updated=$(oc get mcp "$mcp_name" -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}' 2>/dev/null)
+                  degraded=$(oc get mcp "$mcp_name" -o jsonpath='{.status.conditions[?(@.type=="Degraded")].status}' 2>/dev/null)
+
+                  machine_count=$(oc get mcp "$mcp_name" -o jsonpath='{.status.machineCount}' 2>/dev/null)
+                  updated_count=$(oc get mcp "$mcp_name" -o jsonpath='{.status.updatedMachineCount}' 2>/dev/null)
+                  ready_count=$(oc get mcp "$mcp_name" -o jsonpath='{.status.readyMachineCount}' 2>/dev/null)
+
+                  if [ "$updating" = "True" ]; then
+                    echo "  $mcp_name: UPDATING ($updated_count/$machine_count updated, $ready_count/$machine_count ready)"
+                    any_updating=true
+                    all_ready=false
+                  elif [ "$degraded" = "True" ]; then
+                    echo "  $mcp_name: DEGRADED"
+                    all_ready=false
+                  elif [ "$updated" = "True" ] && [ "$updated_count" = "$machine_count" ] && [ "$ready_count" = "$machine_count" ]; then
+                    echo "  $mcp_name: ✓ Ready ($ready_count/$machine_count)"
+                  else
+                    echo "  $mcp_name: Not ready ($updated_count/$machine_count updated, $ready_count/$machine_count ready)"
+                    all_ready=false
+                  fi
+                done
+
+                echo ""
+
+                if [ "$all_ready" = "true" ]; then
+                  echo "=========================================="
+                  echo "✅ All MachineConfigPools are Ready!"
+                  echo "=========================================="
+                  echo ""
+                  oc get mcp
+                  echo ""
+                  echo "SR-IOV VF configuration complete."
+                  echo "Safe to proceed with NVIDIA Network Operator (MOFED) deployment."
+                  echo ""
+                  exit 0
+                fi
+
+                if [ "$any_updating" = "true" ]; then
+                  echo "SR-IOV is triggering node updates. Waiting for completion..."
+                else
+                  echo "Waiting for all MCPs to become ready..."
+                fi
+
+                echo "(${elapsed}s/${MAX_WAIT_TIME}s elapsed)"
+                sleep $CHECK_INTERVAL
+                elapsed=$((elapsed + CHECK_INTERVAL))
+                echo ""
+              done
+
+              echo ""
+              echo "=========================================="
+              echo "❌ TIMEOUT: MachineConfigPools did not become ready"
+              echo "=========================================="
+              echo "  Waited: ${MAX_WAIT_TIME} seconds (90 minutes)"
+              echo ""
+              echo "Current MCP status:"
+              oc get mcp
+              echo ""
+              echo "This may indicate:"
+              echo "  - SR-IOV VF configuration is still in progress"
+              echo "  - Node reboot stuck or failed"
+              echo "  - MachineConfig update degraded"
+              echo ""
+              echo "Check:"
+              echo "  oc get mcp"
+              echo "  oc get nodes"
+              echo "  oc logs -n openshift-sriov-network-operator -l app=sriov-network-config-daemon"
+              echo ""
+              exit 1

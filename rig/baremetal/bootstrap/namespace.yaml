@@ -1,0 +1,6 @@
+kind: Namespace
+apiVersion: v1
+metadata:
+  name: helm-charts
+  labels:
+    openshift.io/cluster-monitoring: "true"

@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: default
+resources:
+  # PreSync Hook - wait for wave 25b IB normalization MachineConfig rollout
+  - presync-wait-for-ib-normalization-mcp.yaml
+
+  # RBAC - shared by all jobs/daemonsets
+  - rbac.yaml
+
+  # NIC Discovery DaemonSet - runs on all worker nodes
+  - configmap-discovery-script.yaml
+  - daemonset-discovery.yaml
+
+  # NIC Resource Generator - exports IB devices and creates SR-IOV resources for RoCE
+  - configmap-nic-generator-script.yaml
+  - job-nic-generator.yaml
+
+  # NicClusterPolicy generator - creates base NicClusterPolicy with MOFED drivers
+  - configmap-generator-script.yaml
+  - job-generator.yaml

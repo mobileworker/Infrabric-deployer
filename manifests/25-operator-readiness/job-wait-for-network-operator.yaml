@@ -1,0 +1,177 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: network-operator-waiter
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: network-operator-waiter
+rules:
+  - apiGroups:
+      - operators.coreos.com
+    resources:
+      - clusterserviceversions
+      - subscriptions
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+    verbs:
+      - get
+      - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: network-operator-waiter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: network-operator-waiter
+subjects:
+  - kind: ServiceAccount
+    name: network-operator-waiter
+    namespace: default
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wait-for-network-operator-ready
+  namespace: default
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 50
+  template:
+    metadata:
+      labels:
+        app: network-operator-waiter
+    spec:
+      serviceAccountName: network-operator-waiter
+      restartPolicy: OnFailure
+      containers:
+        - name: wait-for-operator
+          image: registry.redhat.io/openshift4/ose-cli:latest
+          command:
+            - /bin/bash
+            - -c
+            - |
+              #!/bin/bash
+              set -euo pipefail
+
+              echo "=========================================="
+              echo "Waiting for NVIDIA Network Operator to be Ready"
+              echo "=========================================="
+              echo ""
+
+              MAX_WAIT_TIME=1800  # 30 minutes maximum wait
+              CHECK_INTERVAL=10   # Check every 10 seconds
+              elapsed=0
+
+              while [ $elapsed -lt $MAX_WAIT_TIME ]; do
+                echo "[$(date +%H:%M:%S)] Checking NVIDIA Network Operator status..."
+
+                # Check if subscription exists
+                if ! oc get subscription.operators.coreos.com nvidia-network-operator -n nvidia-network-operator &>/dev/null; then
+                  echo "  ⚠ Subscription not found yet, waiting..."
+                  sleep $CHECK_INTERVAL
+                  elapsed=$((elapsed + CHECK_INTERVAL))
+                  continue
+                fi
+
+                # Get subscription state
+                sub_state=$(oc get subscription.operators.coreos.com nvidia-network-operator -n nvidia-network-operator -o jsonpath='{.status.state}' 2>/dev/null || echo "")
+                current_csv=$(oc get subscription.operators.coreos.com nvidia-network-operator -n nvidia-network-operator -o jsonpath='{.status.currentCSV}' 2>/dev/null || echo "")
+
+                echo "  Subscription state: ${sub_state:-Unknown}"
+                echo "  Current CSV: ${current_csv:-None}"
+
+                # Check if CSV exists and is in Succeeded phase
+                if [ -n "$current_csv" ]; then
+                  if oc get csv "$current_csv" -n nvidia-network-operator &>/dev/null; then
+                    csv_phase=$(oc get csv "$current_csv" -n nvidia-network-operator -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+                    csv_reason=$(oc get csv "$current_csv" -n nvidia-network-operator -o jsonpath='{.status.reason}' 2>/dev/null || echo "")
+
+                    echo "  CSV phase: ${csv_phase}"
+
+                    if [ "$csv_phase" = "Succeeded" ]; then
+                      # Verify operator deployment is ready
+                      echo ""
+                      echo "  CSV is Succeeded, checking operator deployment..."
+
+                      if oc get deployment nvidia-network-operator-controller-manager -n nvidia-network-operator &>/dev/null; then
+                        ready_replicas=$(oc get deployment nvidia-network-operator-controller-manager -n nvidia-network-operator -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+                        desired_replicas=$(oc get deployment nvidia-network-operator-controller-manager -n nvidia-network-operator -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+
+                        echo "  Deployment ready: $ready_replicas/$desired_replicas"
+
+                        if [ "$ready_replicas" -ge "$desired_replicas" ] && [ "$ready_replicas" -gt 0 ]; then
+                          echo ""
+                          echo "=========================================="
+                          echo "✅ NVIDIA Network Operator is Ready!"
+                          echo "=========================================="
+                          echo "  CSV: $current_csv (Succeeded)"
+                          echo "  Deployment: nvidia-network-operator-controller-manager ($ready_replicas/$desired_replicas ready)"
+                          echo ""
+                          exit 0
+                        else
+                          echo "  ⚠ Deployment not ready yet, waiting..."
+                        fi
+                      else
+                        echo "  ⚠ Deployment not found yet, waiting..."
+                      fi
+                    elif [ "$csv_phase" = "Failed" ]; then
+                      echo ""
+                      echo "  ❌ ERROR: CSV is in Failed state"
+                      echo "  Reason: ${csv_reason}"
+                      echo ""
+                      echo "  This requires manual intervention. Check:"
+                      echo "    oc describe csv $current_csv -n nvidia-network-operator"
+                      exit 1
+                    else
+                      echo "  ⚠ CSV phase: ${csv_phase}, waiting..."
+                    fi
+                  else
+                    echo "  ⚠ CSV ${current_csv} not found yet, waiting for OLM to create it..."
+                  fi
+                else
+                  echo "  ⚠ No CSV assigned yet, waiting for subscription to resolve..."
+                fi
+
+                sleep $CHECK_INTERVAL
+                elapsed=$((elapsed + CHECK_INTERVAL))
+                echo ""
+              done
+
+              echo ""
+              echo "=========================================="
+              echo "❌ TIMEOUT: NVIDIA Network Operator did not become ready"
+              echo "=========================================="
+              echo "  Waited: ${MAX_WAIT_TIME} seconds"
+              echo ""
+              echo "Debugging information:"
+              echo ""
+              echo "Subscription status:"
+              oc get subscription.operators.coreos.com nvidia-network-operator -n nvidia-network-operator -o yaml 2>&1 || echo "Subscription not found"
+              echo ""
+              echo "CSV status:"
+              if [ -n "$current_csv" ]; then
+                oc get csv "$current_csv" -n nvidia-network-operator -o yaml 2>&1 || echo "CSV not found"
+              else
+                echo "No CSV assigned to subscription"
+              fi
+              echo ""
+              echo "OperatorGroups in namespace:"
+              oc get operatorgroup -n nvidia-network-operator 2>&1 || echo "No OperatorGroups found"
+              echo ""
+
+              exit 1

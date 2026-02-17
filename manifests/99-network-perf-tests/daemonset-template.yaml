@@ -1,0 +1,145 @@
+---
+# This ConfigMap contains the DaemonSet template that will be dynamically
+# populated with discovered SR-IOV networks by the test coordinator Job
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: network-perf-test-daemonset-template
+  namespace: default
+data:
+  daemonset.yaml: |
+    apiVersion: apps/v1
+    kind: DaemonSet
+    metadata:
+      name: network-perf-test-worker
+      namespace: default
+      labels:
+        app: network-perf-test
+    spec:
+      selector:
+        matchLabels:
+          app: network-perf-test-worker
+      template:
+        metadata:
+          labels:
+            app: network-perf-test-worker
+          annotations:
+            # This will be replaced with auto-discovered SR-IOV networks (RoCE only)
+            # IB networks use RDMA shared device plugin (no network annotation needed)
+            k8s.v1.cni.cncf.io/networks: "SRIOV_NETWORKS_PLACEHOLDER"
+        spec:
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - key: node-role.kubernetes.io/worker
+                    operator: Exists
+                  - key: node-role.kubernetes.io/master
+                    operator: DoesNotExist
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+                  - key: feature.node.kubernetes.io/pci-15b3.present
+                    operator: In
+                    values:
+                    - "true"
+                  - key: nvidia.com/gpu.present
+                    operator: In
+                    values:
+                    - "true"
+          hostNetwork: false
+          volumes:
+          - name: dev-infiniband
+            hostPath:
+              path: /dev/infiniband
+          containers:
+          - name: perf-test
+            volumeMounts:
+            - name: dev-infiniband
+              mountPath: /dev/infiniband
+            image: quay.io/bbenshab/perf-test:ucx-v2
+            imagePullPolicy: Always
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+
+              # Check if running custom pre-built image or base image
+              if [ -f /usr/local/bin/detect-gpu.sh ]; then
+                echo "Using pre-built image with tools already installed"
+                /usr/local/bin/detect-gpu.sh
+              else
+                echo "Using base image, installing tools..."
+                apt-get update -qq && apt-get install -y -qq perftest infiniband-diags iproute2 > /dev/null 2>&1 || true
+
+                if [ ! -f /opt/nccl-tests/build/all_reduce_perf ]; then
+                  echo "Installing nccl-tests..."
+                  apt-get install -y -qq git make > /dev/null 2>&1
+                  mkdir -p /opt
+                  cd /opt
+                  git clone https://github.com/NVIDIA/nccl-tests.git
+                  cd nccl-tests
+                  make MPI=0 CUDA_HOME=/usr/local/cuda
+                fi
+
+                echo "========================================="
+                echo "Network Performance Test Worker Ready"
+                echo "========================================="
+                echo "Node: $(hostname)"
+                echo "Available tools:"
+                which ib_write_bw || echo "  ib_write_bw: NOT FOUND"
+                echo ""
+                echo "Checking RDMA devices:"
+                ibv_devices || echo "  No RDMA devices found"
+                echo ""
+                echo "Network interfaces:"
+                ip -br addr show 2>/dev/null || echo "  ip command not available"
+                echo ""
+              fi
+
+              echo "Waiting for test coordinator..."
+              sleep infinity
+            env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            # UCX environment variables for proper loopback testing with GPUDirect
+            - name: UCX_TLS
+              value: "rc_x,cuda_copy"
+            - name: UCX_GDR_COPY
+              value: "y"
+            # NCCL environment variables for multi-node GPU communication
+            # Note: NCCL_SOCKET_IFNAME and NCCL_IB_HCA are set dynamically by test scripts
+            - name: NCCL_NET_GDR_LEVEL
+              value: "5"
+            - name: NCCL_DEBUG
+              value: "WARN"
+            - name: NCCL_DEBUG_SUBSYS
+              value: "INIT,NET"
+            readinessProbe:
+              exec:
+                command:
+                - /bin/bash
+                - -c
+                - |
+                  command -v ib_write_bw > /dev/null && \
+                  ([ -f /opt/nccl-tests/build/all_reduce_perf ] || [ -f /workspace/nccl-tests/build/all_reduce_perf ])
+              initialDelaySeconds: 60
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 30
+            resources:
+              requests:
+                nvidia.com/gpu: 8
+                memory: "64Gi"
+                cpu: "32"
+              limits:
+                nvidia.com/gpu: 8
+                memory: "128Gi"
+                cpu: "64"
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE

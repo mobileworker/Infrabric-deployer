@@ -1,0 +1,133 @@
+{{ $ns := .Release.Namespace }}
+{{ $revision := .Release.Revision }}
+{{ $rname := .Release.Name }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: llmd-ocp-infra-console-plugin-patcher-{{ $rname }}
+  namespace: {{ $ns }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: llmd-ocp-infra-console-plugin-patcher-{{ $rname }}
+rules:
+  - apiGroups: ["operator.openshift.io"]
+    resources: ["consoles"]
+    verbs: ["get","patch","update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: llmd-ocp-infra-console-plugin-patcher-{{ $rname }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: llmd-ocp-infra-console-plugin-patcher-{{ $rname }}
+subjects:
+  - kind: ServiceAccount
+    name: llmd-ocp-infra-console-plugin-patcher-{{ $rname }}
+    namespace: {{ $ns }}
+---
+{{- $cliImage := .Values.cliImage }}
+{{- $id := uuidv4 -}}
+{{ range $op := .Values.operators }}
+{{ if $op.consolePlugins }}
+{{ range $cp := $op.consolePlugins }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $cp }}-enable-{{ substr 0 8 $id }}
+  namespace: {{ $ns }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 4
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: llmd-ocp-infra-console-plugin-patcher-{{ $rname }}
+      restartPolicy: Never
+      containers:
+        - name: patch
+          image: {{ $cliImage }}
+          command: ["/bin/bash","-ceu"]
+          args:
+            - |
+              set -o pipefail
+              plugin="{{ $cp }}"
+
+              # Ensure Console CR exists
+              kubectl get console.operator cluster -o name
+
+              # If spec.plugins is missing, create it as an empty array
+              if ! kubectl get console.operator cluster -o jsonpath='{.spec.plugins}' 2>/dev/null | grep -q .; then
+                kubectl patch console.operator cluster --type=json \
+                  -p='[{"op":"add","path":"/spec/plugins","value":[]}]'
+              fi
+
+              # Append the plugin if not present
+              if ! kubectl get console.operator cluster -o jsonpath='{.spec.plugins[*]}' | tr ' ' '\n' | grep -qx "$plugin"; then
+                for i in {1..10}; do
+                    kubectl patch console.operator cluster --type=json \
+                      -p="[ { \"op\": \"add\", \"path\": \"/spec/plugins/-\", \"value\": \"${plugin}\" } ]" && break
+                    sleep 10
+                done
+                echo "Added plugin ${plugin} to Console spec.plugins"
+              else
+                echo "Plugin ${plugin} already present; nothing to do."
+              fi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $cp }}-disable-{{ substr 0 8 $id }}
+  namespace: {{ $ns }}
+  annotations:
+    "helm.sh/hook": pre-delete
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 4
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: llmd-ocp-infra-console-plugin-patcher-{{ $rname }}
+      restartPolicy: Never
+      containers:
+        - name: patch
+          image: {{ $cliImage }}
+          command: ["/bin/bash","-ceu"]
+          args:
+            - |
+              set -o pipefail
+              plugin="{{ $cp }}"
+
+              # If spec.plugins is missing or empty, nothing to do
+              if ! kubectl get console.operator cluster -o jsonpath='{.spec.plugins}' 2>/dev/null | grep -q .; then
+                echo "No plugins configured on Console; nothing to remove."
+                exit 0
+              fi
+
+              # Load plugins into a bash array (one per line)
+              readarray -t plugins < <(kubectl get console.operator cluster -o jsonpath='{.spec.plugins[*]}' | tr ' ' '\n')
+
+              # Find index of plugin and remove by index using JSON Patch (remove requires index)
+              idx=-1
+              for i in "${!plugins[@]}"; do
+                if [ "${plugins[$i]}" = "$plugin" ]; then
+                  idx="$i"
+                  break
+                fi
+              done
+
+              if [ "$idx" -ge 0 ]; then
+                kubectl patch console.operator cluster --type=json \
+                  -p="[ { \"op\": \"remove\", \"path\": \"/spec/plugins/${idx}\" } ]" && echo "Removed plugin ${plugin} from Console spec.plugins" || echo "Failed to remove plugin ${plugin}"
+              else
+                echo "Plugin ${plugin} not present; nothing to do."
+              fi
+---
+{{- end }}
+{{- end }}
+{{- end }}

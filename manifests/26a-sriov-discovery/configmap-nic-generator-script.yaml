@@ -1,0 +1,411 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nic-resource-generator-script
+  namespace: default
+data:
+  generate_nic_resources.py: |
+    import json
+    import sys
+    import os
+    import glob
+    import subprocess
+    from collections import defaultdict
+
+    discovery_dir = os.getenv('DISCOVERY_DIR', '/discovery')
+    output_dir = os.getenv('OUTPUT_DIR', '/output')
+    mtu = int(os.getenv('MTU', '9000'))
+    ip_range_base = os.getenv('IP_RANGE_BASE', '10.0')
+    network_namespace = os.getenv('NETWORK_NAMESPACE', 'default')
+    route_dest_base = os.getenv('ROUTE_DEST', '192.168.75.0/24')
+    subnet_mode = os.getenv('SUBNET_MODE', 'separate').lower()  # 'shared' or 'separate'
+
+    print("\n=== Processing NIC Discovery Results ===")
+
+    # Collect all ports from all nodes
+    all_ports = []
+    node_ports = defaultdict(list)  # Group ports by node
+    node_count = 0
+
+    for discovery_file in glob.glob(f"{discovery_dir}/*-ports.json"):
+        node_name = os.path.basename(discovery_file).replace('-ports.json', '')
+        node_count += 1
+
+        print(f"Reading discovery from node: {node_name}")
+
+        try:
+            with open(discovery_file, 'r') as f:
+                ports = json.load(f)
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"  ⚠ WARNING: Skipping {node_name} - corrupted/empty JSON file: {e}")
+            print(f"  This node will be excluded from NIC configuration")
+            continue
+
+        for port in ports:
+            port['_node_name'] = node_name
+            # Normalize field name for consistency
+            port['totalvfs'] = port.get('sriovTotalVfs', port.get('totalvfs', 0))
+            all_ports.append(port)
+
+            # Track carrier status
+            carrier = port.get('carrier', '0')
+            link_status = port.get('linkStatus', 'unknown')
+            carrier_str = "UP" if carrier == '1' else "DOWN"
+            print(f"  Found: {port['pfName']} at PCI {port['pciAddress']} (device ID: {port['deviceID']}, Link: {link_status}, Carrier: {carrier_str})")
+
+    print(f"\nTotal ports discovered: {len(all_ports)} across {node_count} nodes")
+
+    # Separate IB and RoCE ports - SR-IOV only for RoCE, NVIDIA Network Operator for IB
+    roce_ports = []
+    ib_ports = []
+
+    for port in all_ports:
+        link_type = port.get('linkType', 'eth').lower()
+        if link_type == 'ib':
+            ib_ports.append(port)
+        else:
+            roce_ports.append(port)
+
+    print(f"\nSeparated by link type:")
+    print(f"  RoCE ports (for SR-IOV): {len(roce_ports)}")
+    print(f"  InfiniBand ports (for NVIDIA Network Operator): {len(ib_ports)}")
+
+    # Export IB ports for NVIDIA Network Operator configuration (ALL IB ports, even without carrier)
+    ib_export_file = f"{output_dir}/ib-devices.json"
+    with open(ib_export_file, 'w') as f:
+        json.dump(ib_ports, f, indent=2)
+
+    if ib_ports:
+        print(f"\n✓ Exported {len(ib_ports)} IB devices to: {ib_export_file}")
+        print(f"  This will be used by NVIDIA Network Operator for RDMA shared device configuration")
+    else:
+        print(f"\n✓ Exported empty IB devices list to: {ib_export_file}")
+
+    # Filter RoCE ports by carrier status and SR-IOV capability for SR-IOV operator
+    roce_ports_with_carrier = []
+    for port in roce_ports:
+        if port.get('sriovCapable') and port.get('carrier') == '1':
+            roce_ports_with_carrier.append(port)
+
+    print(f"\nFiltered RoCE ports for SR-IOV:")
+    print(f"  Total RoCE ports: {len(roce_ports)}")
+    print(f"  RoCE ports with SR-IOV + carrier: {len(roce_ports_with_carrier)}")
+
+    # Only process RoCE ports with SR-IOV capability and carrier for SR-IOV
+    if not roce_ports_with_carrier:
+        print("\n⚠ No RoCE ports with SR-IOV capability and connectivity found - skipping SR-IOV configuration")
+        if ib_ports:
+            print("  All RDMA devices are InfiniBand and will be handled by NVIDIA Network Operator")
+        # Still create empty output dir so ArgoCD doesn't fail
+        with open(f"{output_dir}/.empty", 'w') as f:
+            f.write("No RoCE devices with SR-IOV - IB only\n")
+        sys.exit(0)
+
+    # Update all_ports to only include RoCE with carrier for SR-IOV configuration
+    all_ports = roce_ports_with_carrier
+    node_ports = defaultdict(list)
+    for port in all_ports:
+        node_ports[port['_node_name']].append(port)
+
+    # Group NICs by totalvfs capacity
+    nics_by_vf_count = defaultdict(list)
+    for port in all_ports:
+        vf_count = port.get('totalvfs', 0)
+        if vf_count > 0:
+            nics_by_vf_count[vf_count].append(port)
+
+    print(f"\nNICs grouped by VF capacity:")
+    for vf_count in sorted(nics_by_vf_count.keys(), reverse=True):
+        nics = nics_by_vf_count[vf_count]
+        print(f"  {vf_count} VFs: {len(nics)} NICs")
+
+    # Generate one SriovNetworkNodePolicy per NIC
+    print("\n=== Generating SriovNetworkNodePolicy Resources (one per NIC) ===")
+
+    policy_index = 0
+    for port in sorted(all_ports, key=lambda x: (x.get('_node_name', ''), x.get('pfName', ''))):
+        node_name = port.get('_node_name', 'unknown')
+        pf_name = port['pfName']
+        vf_count = port.get('totalvfs', 0)
+        link_type = port.get('linkType', 'eth').lower()
+        pci_address = port['pciAddress']
+
+        # Resource name: {pfName}_{ib|roce}
+        # Note: Same pfName across nodes is intentional - allows portable pod specs
+        link_suffix = 'ib' if link_type == 'ib' else 'roce'
+        resource_name = f"{pf_name}_{link_suffix}"
+
+        print(f"\nPolicy: {resource_name}")
+        print(f"  Node: {node_name}")
+        print(f"  PF Name: {pf_name}")
+        print(f"  VF Count: {vf_count}")
+        print(f"  Link Type: {link_type.upper()}")
+        print(f"  PCI Address: {pci_address}")
+
+        # Build SriovNetworkNodePolicy YAML
+        policy_lines = []
+        policy_lines.append("---")
+        policy_lines.append("apiVersion: sriovnetwork.openshift.io/v1")
+        policy_lines.append("kind: SriovNetworkNodePolicy")
+        policy_lines.append("metadata:")
+        policy_lines.append(f"  name: policy-{node_name}-{pf_name}".replace('_', '-'))
+        policy_lines.append("  namespace: openshift-sriov-network-operator")
+        policy_lines.append("  annotations:")
+        policy_lines.append(f"    node: \"{node_name}\"")
+        policy_lines.append(f"    pf: \"{pf_name}\"")
+        policy_lines.append(f"    pci: \"{pci_address}\"")
+        policy_lines.append("spec:")
+        policy_lines.append("  # Auto-generated from NIC discovery - one policy per NIC")
+        policy_lines.append("  nodeSelector:")
+        policy_lines.append(f"    kubernetes.io/hostname: \"{node_name}\"")
+        policy_lines.append("")
+        policy_lines.append(f"  resourceName: {resource_name}")
+        policy_lines.append(f"  priority: {99 - policy_index}")  # Unique priority per NIC
+        policy_lines.append(f"  numVfs: {vf_count}")
+        policy_lines.append("")
+        policy_lines.append("  nicSelector:")
+        policy_lines.append("    pfNames:")
+        policy_lines.append(f"      - {pf_name}")
+        policy_lines.append("")
+        policy_lines.append("  deviceType: netdevice")
+        policy_lines.append("  isRdma: true")
+        policy_lines.append(f"  linkType: {link_type}")
+        policy_lines.append("  excludeTopology: false")
+
+        policy_yaml = '\n'.join(policy_lines)
+
+        policy_file = f"{output_dir}/sriovnetworknodepolicy-{node_name}-{pf_name}.yaml".replace('_', '-')
+        with open(policy_file, 'w') as f:
+            f.write(policy_yaml)
+        print(f"  ✓ Created: {policy_file}")
+
+        policy_index += 1
+
+    # Generate GLOBAL SriovNetwork/SriovIBNetwork resources (one per unique resourceName)
+    print("\n=== Generating GLOBAL SriovNetwork/SriovIBNetwork Resources ===")
+    print("Creating cluster-wide networks that work across all nodes")
+
+    # Group ports by resourceName to create global networks
+    ports_by_resource = defaultdict(list)
+    for port in all_ports:
+        pf_name = port['pfName']
+        link_type = port.get('linkType', 'eth').lower()
+        link_suffix = 'ib' if link_type == 'ib' else 'roce'
+        resource_name = f"{pf_name}_{link_suffix}"
+        ports_by_resource[resource_name].append(port)
+
+    print(f"\nFound {len(ports_by_resource)} unique resource types:")
+    for resource_name, ports in sorted(ports_by_resource.items()):
+        nodes = [p.get('_node_name', 'unknown') for p in ports]
+        print(f"  {resource_name}: {len(ports)} NICs across nodes {', '.join(sorted(set(nodes)))}")
+
+    network_index = 0
+    for resource_name in sorted(ports_by_resource.keys()):
+        ports = ports_by_resource[resource_name]
+
+        # Use first port as reference for metadata
+        ref_port = ports[0]
+        pf_name = ref_port['pfName']
+        link_type = ref_port.get('linkType', 'eth').lower()
+
+        # Calculate IP range and route destination (one per unique resource)
+        if subnet_mode == 'shared':
+            ip_range = f"{ip_range_base}.100.0/24"
+            route_dest = route_dest_base
+        else:
+            subnet_third_octet = 101 + network_index
+            ip_range = f"{ip_range_base}.{subnet_third_octet}.0/24"
+            route_base_parts = route_dest_base.split('/')
+            route_ip_parts = route_base_parts[0].split('.')
+            route_third_octet = int(route_ip_parts[2]) + network_index
+            route_dest = f"{route_ip_parts[0]}.{route_ip_parts[1]}.{route_third_octet}.0/{route_base_parts[1]}"
+
+        # GLOBAL network name: {pfName}-{link_suffix}-network (no node name)
+        network_name = f"{pf_name}-{link_type}-network".replace('_', '-')
+
+        print(f"\nGlobal Network: {network_name}")
+        print(f"  Resource Name: openshift.io/{resource_name}")
+        print(f"  Link Type: {link_type.upper()}")
+        print(f"  Available on {len(ports)} nodes: {', '.join(sorted(set([p.get('_node_name', 'unknown') for p in ports])))}")
+        print(f"  IP Range: {ip_range}")
+        print(f"  Route Destination: {route_dest}")
+
+        # Build SriovNetwork or SriovIBNetwork YAML depending on link type
+        network_lines = []
+        network_lines.append("---")
+        network_lines.append("apiVersion: sriovnetwork.openshift.io/v1")
+
+        # Use SriovIBNetwork for InfiniBand, SriovNetwork for RoCE/Ethernet
+        if link_type == 'ib':
+            network_kind = "SriovIBNetwork"
+            print(f"  Creating SriovIBNetwork for InfiniBand interface")
+        else:
+            network_kind = "SriovNetwork"
+            print(f"  Creating SriovNetwork for RoCE/Ethernet interface")
+
+        network_lines.append(f"kind: {network_kind}")
+        network_lines.append("metadata:")
+        network_lines.append(f"  name: {network_name}")
+        network_lines.append("  namespace: openshift-sriov-network-operator")
+        network_lines.append("  annotations:")
+        network_lines.append(f"    pf: \"{pf_name}\"")
+        network_lines.append(f"    resource: \"{resource_name}\"")
+        network_lines.append(f"    nodes: \"{','.join(sorted(set([p.get('_node_name', 'unknown') for p in ports])))}\"")
+        network_lines.append("spec:")
+        network_lines.append(f"  resourceName: {resource_name}")
+        network_lines.append(f"  networkNamespace: {network_namespace}")
+        network_lines.append("  ipam: |-")
+        network_lines.append("    {")
+        network_lines.append("      \"type\": \"whereabouts\",")
+        network_lines.append(f"      \"range\": \"{ip_range}\",")
+        network_lines.append("      \"routes\": [")
+        network_lines.append("        {")
+        network_lines.append(f"          \"dst\": \"{route_dest}\"")
+        network_lines.append("        }")
+        network_lines.append("      ]")
+        network_lines.append("    }")
+
+        network_yaml = '\n'.join(network_lines)
+
+        network_file = f"{output_dir}/sriov{link_type}network-{pf_name}.yaml".replace('_', '-')
+        with open(network_file, 'w') as f:
+            f.write(network_yaml)
+        print(f"  ✓ Created: {network_file}")
+
+        network_index += 1
+
+    print(f"\n✓ Total SriovNetworkNodePolicy resources: {len(all_ports)} (one per NIC per node)")
+    print(f"✓ Total GLOBAL SriovIBNetwork + SriovNetwork resources: {len(ports_by_resource)} (one per resource type)")
+    print("\n=== SR-IOV Resource generation complete! ===")
+
+  generate-nic-resources.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    echo "=== NIC Resource Generator ==="
+    echo "Collecting discovery results from all nodes..."
+
+    DISCOVERY_DIR="/discovery"
+    OUTPUT_DIR="/output"
+    mkdir -p "$DISCOVERY_DIR" "$OUTPUT_DIR"
+
+    # Configuration
+    MTU=${MTU:-9000}
+    IP_RANGE_BASE=${IP_RANGE_BASE:-"10.0"}
+    NETWORK_NAMESPACE=${NETWORK_NAMESPACE:-"default"}
+    ROUTE_DEST=${ROUTE_DEST:-"192.168.75.0/24"}
+    SUBNET_MODE=${SUBNET_MODE:-"separate"}  # "shared" or "separate"
+
+    # Collect discovery files from nodes via hostPath
+    echo "Collecting discovery files from nodes..."
+
+    # Get list of worker nodes with Mellanox NICs
+    WORKER_NODES=$(oc get nodes -l feature.node.kubernetes.io/pci-15b3.present=true -o jsonpath='{.items[*].metadata.name}')
+
+    if [ -z "$WORKER_NODES" ]; then
+      echo "Error: No worker nodes with Mellanox NICs found"
+      exit 1
+    fi
+
+    NODE_COUNT=$(echo "$WORKER_NODES" | wc -w)
+    echo "Found $NODE_COUNT nodes with Mellanox NICs: $WORKER_NODES"
+    echo ""
+
+    # Collect discovery files from each node's hostPath
+    for node in $WORKER_NODES; do
+      echo "Collecting from node: $node"
+
+      DISCOVERY_FILE="${DISCOVERY_DIR}/${node}-ports.json"
+
+      # Use oc debug to read from hostPath /var/lib/nic-discovery/
+      # The discovery DaemonSet writes {NODE_NAME}-ports.json to this location
+      # Filter out oc debug messages (Starting pod, Removing debug pod, etc.)
+      TEMP_FILE=$(mktemp)
+      oc debug node/"$node" --image=registry.access.redhat.com/ubi9/ubi-minimal:latest -- \
+        chroot /host cat "/var/lib/nic-discovery/${node}-ports.json" > "$TEMP_FILE" 2>&1
+
+      # Extract only the JSON content (starts with [ and ends with ])
+      # Filter out oc debug status messages
+      grep -v "^Starting pod" "$TEMP_FILE" | \
+        grep -v "^To use host binaries" | \
+        grep -v "^Removing debug pod" | \
+        grep -v "^E[0-9]" > "$DISCOVERY_FILE"
+
+      rm -f "$TEMP_FILE"
+
+      # Check if file was collected successfully
+      if [ -s "$DISCOVERY_FILE" ] && head -c 1 "$DISCOVERY_FILE" | grep -q '\['; then
+        LINE_COUNT=$(wc -l < "$DISCOVERY_FILE")
+        echo "  ✓ Collected: ${node}-ports.json ($LINE_COUNT lines)"
+      else
+        echo "  ✗ Failed to collect from $node or file is invalid"
+        rm -f "$DISCOVERY_FILE"
+      fi
+    done
+
+    # Check if any discovery files exist
+    if ! ls "$DISCOVERY_DIR"/*-ports.json 1> /dev/null 2>&1; then
+      echo "Error: No discovery files were collected"
+      exit 1
+    fi
+
+    echo ""
+    echo "Found discovery files:"
+    for file in "$DISCOVERY_DIR"/*-ports.json; do
+      echo "  - $(basename "$file")"
+    done
+
+    # Run Python script to generate SR-IOV resources
+    export DISCOVERY_DIR OUTPUT_DIR MTU IP_RANGE_BASE NETWORK_NAMESPACE ROUTE_DEST SUBNET_MODE
+    python3 /scripts/generate_nic_resources.py
+
+    echo ""
+    echo "=== Exporting IB Devices for NVIDIA Network Operator ==="
+
+    # Create configmap with IB devices data for NVIDIA Network Operator
+    if [ -f "$OUTPUT_DIR/ib-devices.json" ]; then
+      echo "Creating configmap with InfiniBand device data..."
+      oc create configmap generated-sriov-resources \
+        --from-file=ib-devices.json="$OUTPUT_DIR/ib-devices.json" \
+        -n default \
+        --dry-run=client -o yaml | oc apply -f -
+      echo "✓ ConfigMap created: generated-sriov-resources"
+      echo "  This will be used by NVIDIA Network Operator to configure RDMA shared devices"
+    else
+      echo "No InfiniBand devices found - creating empty configmap"
+      oc create configmap generated-sriov-resources \
+        --from-literal=ib-devices.json='[]' \
+        -n default \
+        --dry-run=client -o yaml | oc apply -f -
+    fi
+
+    echo ""
+    echo "=== Applying generated resources to cluster ==="
+
+    # Apply all generated resources
+    APPLIED_COUNT=0
+    for yaml_file in "$OUTPUT_DIR"/*.yaml; do
+      if [ -f "$yaml_file" ]; then
+        echo "Applying: $(basename "$yaml_file")"
+        if oc apply -f "$yaml_file"; then
+          APPLIED_COUNT=$((APPLIED_COUNT + 1))
+          echo "✓ Applied: $(basename "$yaml_file")"
+        else
+          echo "⚠ Warning: Failed to apply $(basename "$yaml_file")"
+        fi
+      fi
+    done
+
+    echo ""
+    echo "=== Summary ==="
+    echo "Total resources applied: $APPLIED_COUNT"
+    echo "NIC resource generation complete!"
+
+    echo ""
+    echo "=== Cleanup Discovery Resources ==="
+    echo "Deleting discovery DaemonSet (no longer needed)..."
+    if oc delete daemonset nic-port-discovery -n default --ignore-not-found=true; then
+      echo "✓ Discovery DaemonSet deleted"
+    else
+      echo "⚠ Warning: Failed to delete discovery DaemonSet"
+    fi

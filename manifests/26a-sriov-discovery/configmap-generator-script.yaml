@@ -1,0 +1,420 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nicclusterpolicy-generator-script
+  namespace: default
+data:
+  generate_resources.py: |
+    import json
+    import sys
+    import os
+    import glob
+    import subprocess
+
+    discovery_dir = os.getenv('DISCOVERY_DIR', '/discovery')
+    output_dir = os.getenv('OUTPUT_DIR', '/output')
+    mtu = int(os.getenv('MTU', '9000'))
+    ip_range_base = os.getenv('IP_RANGE_BASE', '10.0')
+    network_namespace = os.getenv('NETWORK_NAMESPACE', 'default')
+    route_dest_base = os.getenv('ROUTE_DEST', '192.168.75.0/24')
+    subnet_mode = os.getenv('SUBNET_MODE', 'separate').lower()  # 'shared' or 'separate'
+
+    print("\n=== Discovering NVIDIA Network Operator OFED version ===")
+
+    # Find NVIDIA Network Operator CSV
+    try:
+        csv_result = subprocess.run(
+            ['oc', 'get', 'csv', '-n', 'nvidia-network-operator', '-o', 'name'],
+            capture_output=True, text=True, check=True
+        )
+        csv_list = [line for line in csv_result.stdout.strip().split('\n') if 'nvidia-network-operator' in line]
+        if not csv_list:
+            print("ERROR: Could not find NVIDIA Network Operator CSV")
+            sys.exit(1)
+        csv_name = csv_list[0]
+        print(f"Found CSV: {csv_name}")
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: Failed to get CSV list: {e}")
+        sys.exit(1)
+
+    # Extract OFED version from CSV alm-examples
+    try:
+        alm_examples_result = subprocess.run(
+            ['oc', 'get', csv_name, '-n', 'nvidia-network-operator', '-o',
+             'jsonpath={.metadata.annotations.alm-examples}'],
+            capture_output=True, text=True, check=True
+        )
+        alm_examples = json.loads(alm_examples_result.stdout)
+        ofed_version = None
+        for item in alm_examples:
+            if item.get('kind') == 'NicClusterPolicy':
+                ofed_version = item.get('spec', {}).get('ofedDriver', {}).get('version', '')
+                break
+
+        if not ofed_version:
+            print("ERROR: Could not extract OFED version from CSV alm-examples")
+            sys.exit(1)
+
+        print(f"Discovered OFED version: {ofed_version}")
+    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as e:
+        print(f"ERROR: Failed to discover OFED version: {e}")
+        sys.exit(1)
+
+    print("\n=== Processing NIC discovery files ===")
+
+    # Collect all ports from all nodes
+    all_ports = []
+    node_count = 0
+
+    for discovery_file in glob.glob(f"{discovery_dir}/*-ports.json"):
+        node_name = os.path.basename(discovery_file).replace('-ports.json', '')
+        node_count += 1
+
+        print(f"Reading discovery from node: {node_name}")
+
+        try:
+            with open(discovery_file, 'r') as f:
+                ports = json.load(f)
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"  ⚠ WARNING: Skipping {node_name} - corrupted/empty JSON file: {e}")
+            print(f"  This node will be excluded from NIC configuration")
+            continue
+
+        for port in ports:
+            if port.get('sriovCapable'):
+                port['_node_name'] = node_name
+                all_ports.append(port)
+                print(f"  Found: {port['pfName']} at PCI {port['pciAddress']} (device ID: {port['deviceID']})")
+
+    print(f"\nTotal ports discovered: {len(all_ports)} across {node_count} nodes")
+
+    # Collect unique (PCI address, link type) combinations for NicClusterPolicy SR-IOV device plugin config
+    # Same PCI address can have different link types across nodes (IB on one node, RoCE on another)
+    unique_pci_link_combos = {}
+    for port in all_ports:
+        pci_addr = port['pciAddress']
+        link_type = port.get('linkType', 'eth').lower()
+        # Use tuple of (pci_addr, link_type) as key to handle mixed modes
+        combo_key = (pci_addr, link_type)
+        if combo_key not in unique_pci_link_combos:
+            unique_pci_link_combos[combo_key] = port
+
+    print(f"Unique (PCI address, link type) combinations: {len(unique_pci_link_combos)}")
+
+    # Generate NicClusterPolicy with SR-IOV device plugin configuration
+    print("\n=== Generating NicClusterPolicy (MOFED drivers only) ===")
+    print("SR-IOV device plugin and VF management handled by OpenShift SR-IOV Network Operator")
+
+    # SR-IOV device plugin configuration removed - now managed by OpenShift SR-IOV Network Operator
+    # # Build SR-IOV device plugin resourceList
+    # resource_list = []
+    # for (pci_addr, link_type), port in sorted(unique_pci_link_combos.items()):
+    #     pf_name = port['pfName']
+    #     link_type_suffix = 'ib' if link_type == 'ib' else 'roce'
+    #     resource_name = f"{pf_name}_{link_type_suffix}"
+    #     if link_type == 'ib':
+    #         link_types = ["infiniband"]
+    #     else:
+    #         link_types = ["ether"]
+    #     resource = {
+    #         "resourcePrefix": "nvidia.com",
+    #         "resourceName": resource_name,
+    #         "selectors": {
+    #             "vendors": ["15b3"],
+    #             "drivers": ["mlx5_core"],
+    #             "rootDevices": [pci_addr],
+    #             "isRdma": True,
+    #             "linkTypes": link_types
+    #         }
+    #     }
+    #     resource_list.append(resource)
+
+    # Calculate startup probe timeout for MOFED driver initialization
+    probe_period = 20
+    failure_threshold = 60  # 20 minutes total for MOFED driver initialization
+
+    print(f"Calculated MOFED driver startup probe failureThreshold: {failure_threshold} (= {failure_threshold * probe_period}s / {failure_threshold * probe_period // 60} min)")
+
+    # Build NicClusterPolicy YAML with proper structure
+    nicclusterpolicy_parts = []
+    nicclusterpolicy_parts.append("---")
+    nicclusterpolicy_parts.append("apiVersion: mellanox.com/v1alpha1")
+    nicclusterpolicy_parts.append("kind: NicClusterPolicy")
+    nicclusterpolicy_parts.append("metadata:")
+    nicclusterpolicy_parts.append("  name: nic-cluster-policy")
+    nicclusterpolicy_parts.append("  namespace: nvidia-network-operator")
+    nicclusterpolicy_parts.append("spec:")
+    nicclusterpolicy_parts.append("  # Tolerations for all DaemonSets (OFED, SR-IOV, RDMA plugins)")
+    nicclusterpolicy_parts.append("  tolerations:")
+    nicclusterpolicy_parts.append("  - key: \"UpdateInProgress\"")
+    nicclusterpolicy_parts.append("    operator: \"Exists\"")
+    nicclusterpolicy_parts.append("    effect: \"PreferNoSchedule\"")
+    nicclusterpolicy_parts.append("  - key: \"nvidia.com/gpu\"")
+    nicclusterpolicy_parts.append("    operator: \"Exists\"")
+    nicclusterpolicy_parts.append("    effect: \"NoSchedule\"")
+    nicclusterpolicy_parts.append("")
+    nicclusterpolicy_parts.append("  nodeAffinity:")
+    nicclusterpolicy_parts.append("    requiredDuringSchedulingIgnoredDuringExecution:")
+    nicclusterpolicy_parts.append("      nodeSelectorTerms:")
+    nicclusterpolicy_parts.append("      - matchExpressions:")
+    nicclusterpolicy_parts.append("        - key: node-role.kubernetes.io/worker")
+    nicclusterpolicy_parts.append("          operator: Exists")
+    nicclusterpolicy_parts.append("        - key: node-role.kubernetes.io/master")
+    nicclusterpolicy_parts.append("          operator: DoesNotExist")
+    nicclusterpolicy_parts.append("")
+    nicclusterpolicy_parts.append("  # Secondary Network components for InfiniBand support")
+    nicclusterpolicy_parts.append("  secondaryNetwork:")
+    nicclusterpolicy_parts.append("    multus:")
+    nicclusterpolicy_parts.append("      image: multus-cni")
+    nicclusterpolicy_parts.append("      repository: ghcr.io/k8snetworkplumbingwg")
+    nicclusterpolicy_parts.append("      version: v4.1.0")
+    nicclusterpolicy_parts.append("    ipoib:")
+    nicclusterpolicy_parts.append("      image: ipoib-cni")
+    nicclusterpolicy_parts.append("      repository: nvcr.io/nvidia/mellanox")
+    nicclusterpolicy_parts.append("      version: network-operator-v25.10.0")
+    nicclusterpolicy_parts.append("    cniPlugins:")
+    nicclusterpolicy_parts.append("      image: plugins")
+    nicclusterpolicy_parts.append("      repository: ghcr.io/containernetworking")
+    nicclusterpolicy_parts.append("      version: v1.6.0")
+    nicclusterpolicy_parts.append("")
+    nicclusterpolicy_parts.append("  # OFED Driver")
+    nicclusterpolicy_parts.append("  ofedDriver:")
+    nicclusterpolicy_parts.append("    image: doca-driver")
+    nicclusterpolicy_parts.append("    repository: nvcr.io/nvidia/mellanox")
+    nicclusterpolicy_parts.append(f"    version: {ofed_version}")
+    nicclusterpolicy_parts.append("    env:")
+    nicclusterpolicy_parts.append("    - name: UNLOAD_STORAGE_MODULES")
+    nicclusterpolicy_parts.append("      value: \"true\"")
+    nicclusterpolicy_parts.append("    - name: RESTORE_DRIVER_ON_POD_TERMINATION")
+    nicclusterpolicy_parts.append("      value: \"false\"")
+    nicclusterpolicy_parts.append("    - name: CREATE_IFNAMES_UDEV")
+    nicclusterpolicy_parts.append("      value: \"true\"")
+    nicclusterpolicy_parts.append("    livenessProbe:")
+    nicclusterpolicy_parts.append("      initialDelaySeconds: 30")
+    nicclusterpolicy_parts.append("      periodSeconds: 30")
+    nicclusterpolicy_parts.append("    readinessProbe:")
+    nicclusterpolicy_parts.append("      initialDelaySeconds: 10")
+    nicclusterpolicy_parts.append("      periodSeconds: 30")
+    nicclusterpolicy_parts.append("    startupProbe:")
+    nicclusterpolicy_parts.append("      initialDelaySeconds: 10")
+    nicclusterpolicy_parts.append("      periodSeconds: 20")
+    nicclusterpolicy_parts.append(f"      failureThreshold: {failure_threshold}")  # Dynamically calculated based on VF count
+    nicclusterpolicy_parts.append("    terminationGracePeriodSeconds: 300")
+    nicclusterpolicy_parts.append("    upgradePolicy:")
+    nicclusterpolicy_parts.append("      autoUpgrade: true")
+    nicclusterpolicy_parts.append("      drain:")
+    nicclusterpolicy_parts.append("        enable: true")
+    nicclusterpolicy_parts.append("        force: true")
+    nicclusterpolicy_parts.append("        deleteEmptyDir: true")
+    nicclusterpolicy_parts.append("        timeoutSeconds: 300")
+    nicclusterpolicy_parts.append("        podSelector: ''")
+    nicclusterpolicy_parts.append("      maxParallelUpgrades: 1")
+    nicclusterpolicy_parts.append("")
+    nicclusterpolicy_parts.append("  # Secondary Network - VF creation handled by MachineConfig (wave 26)")
+    nicclusterpolicy_parts.append("  # The Network Operator does not support secondaryNetwork.sriovNetworkOperator in this version")
+    nicclusterpolicy_parts.append("  # VFs are created at boot time by the sriov-configure-max-vfs systemd service")
+    nicclusterpolicy_parts.append("  secondaryNetwork: {}")
+    # SR-IOV Device Plugin is now managed by OpenShift SR-IOV Network Operator
+    # nicclusterpolicy_parts.append("")
+    # nicclusterpolicy_parts.append("  # SR-IOV Device Plugin - PCI address-based resource allocation")
+    # nicclusterpolicy_parts.append("  sriovDevicePlugin:")
+    # nicclusterpolicy_parts.append("    image: sriov-network-device-plugin")
+    # nicclusterpolicy_parts.append("    repository: nvcr.io/nvidia/mellanox")
+    # nicclusterpolicy_parts.append("    version: network-operator-v25.10.0")
+    # nicclusterpolicy_parts.append("    config: |")
+    # for line in device_plugin_config_json.split('\n'):
+    #     nicclusterpolicy_parts.append('      ' + line)
+
+    nicclusterpolicy_yaml = '\n'.join(nicclusterpolicy_parts)
+
+    nicclusterpolicy_file = f"{output_dir}/nicclusterpolicy.yaml"
+    with open(nicclusterpolicy_file, 'w') as f:
+        f.write(nicclusterpolicy_yaml)
+    print(f"\n✓ Created: {nicclusterpolicy_file}")
+
+    # Generate NetworkAttachmentDefinitions (one per unique PF name)
+    print("\n=== Generating NetworkAttachmentDefinitions ===")
+
+    # Collect unique PF names for network creation
+    unique_pf_names = {}
+    for port in all_ports:
+        pf_name = port['pfName']
+        if pf_name not in unique_pf_names:
+            unique_pf_names[pf_name] = port
+
+    network_index = 0
+    for pf_name, port in sorted(unique_pf_names.items()):
+        pci_addr = port['pciAddress']
+        link_type = port.get('linkType', 'eth').lower()
+
+        # Resource name: <pf_name>_<ib|roce>
+        link_type_suffix = 'ib' if link_type == 'ib' else 'roce'
+        resource_name = f"{pf_name}_{link_type_suffix}"
+
+        # Calculate IP range and route destination
+        if subnet_mode == 'shared':
+            ip_range = f"{ip_range_base}.100.0/24"
+            route_dest = route_dest_base
+        else:
+            subnet_third_octet = 101 + network_index
+            ip_range = f"{ip_range_base}.{subnet_third_octet}.0/24"
+            route_base_parts = route_dest_base.split('/')
+            route_ip_parts = route_base_parts[0].split('.')
+            route_third_octet = int(route_ip_parts[2]) + network_index
+            route_dest = f"{route_ip_parts[0]}.{route_ip_parts[1]}.{route_third_octet}.0/{route_base_parts[1]}"
+
+        print(f"\nGenerating network for PF: {pf_name}")
+        print(f"  Resource Name: nvidia.com/{resource_name}")
+        print(f"  Link Type: {link_type.upper()}")
+        print(f"  PCI Address: {pci_addr}")
+        print(f"  IP Range: {ip_range}")
+        print(f"  Route Destination: {route_dest}")
+
+        # NetworkAttachmentDefinition using host-device CNI plugin
+        network_yaml_lines = []
+        network_yaml_lines.append("---")
+        network_yaml_lines.append("apiVersion: k8s.cni.cncf.io/v1")
+        network_yaml_lines.append("kind: NetworkAttachmentDefinition")
+        network_yaml_lines.append("metadata:")
+        network_yaml_lines.append(f"  name: {pf_name}-network")
+        network_yaml_lines.append(f"  namespace: {network_namespace}")
+        network_yaml_lines.append("  annotations:")
+        network_yaml_lines.append(f"    k8s.v1.cni.cncf.io/resourceName: nvidia.com/{resource_name}")
+        network_yaml_lines.append("spec:")
+        network_yaml_lines.append("  config: |-")
+        network_yaml_lines.append("    {")
+        network_yaml_lines.append("      \"cniVersion\": \"0.4.0\",")
+        network_yaml_lines.append("      \"type\": \"host-device\",")
+        network_yaml_lines.append(f"      \"name\": \"{pf_name}-network\",")
+        network_yaml_lines.append("      \"ipam\": {")
+        network_yaml_lines.append("        \"type\": \"whereabouts\",")
+        network_yaml_lines.append(f"        \"range\": \"{ip_range}\",")
+        network_yaml_lines.append("        \"routes\": [")
+        network_yaml_lines.append("          {")
+        network_yaml_lines.append(f"            \"dst\": \"{route_dest}\"")
+        network_yaml_lines.append("          }")
+        network_yaml_lines.append("        ]")
+        network_yaml_lines.append("      }")
+        network_yaml_lines.append("    }")
+        network_yaml = '\n'.join(network_yaml_lines)
+
+        network_file = f"{output_dir}/network-{pf_name}.yaml"
+        with open(network_file, 'w') as f:
+            f.write(network_yaml)
+        print(f"  ✓ Created: {network_file}")
+
+        network_index += 1
+
+    print(f"\n✓ Total networks created: {len(unique_pf_names)}")
+    print("\n=== Resource generation complete! ===")
+
+  generate-nic-resources.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    echo "=== NVIDIA Network Operator NIC Resource Generator ==="
+    echo "Collecting discovery results from all nodes..."
+
+    DISCOVERY_DIR="/discovery"
+    OUTPUT_DIR="/output"
+    mkdir -p "$DISCOVERY_DIR" "$OUTPUT_DIR"
+
+    # Configuration
+    MTU=${MTU:-9000}
+    IP_RANGE_BASE=${IP_RANGE_BASE:-"10.0"}
+    NETWORK_NAMESPACE=${NETWORK_NAMESPACE:-"default"}
+    ROUTE_DEST=${ROUTE_DEST:-"192.168.75.0/24"}
+    SUBNET_MODE=${SUBNET_MODE:-"separate"}  # "shared" or "separate"
+
+    # Collect discovery results from all discovery pods
+    echo "Finding NIC discovery pods..."
+    DISCOVERY_PODS=$(oc get pods -n default -l app=nic-port-discovery -o jsonpath='{.items[*].metadata.name}')
+
+    if [ -z "$DISCOVERY_PODS" ]; then
+      echo "Error: No NIC discovery pods found"
+      exit 1
+    fi
+
+    echo "Found discovery pods: $DISCOVERY_PODS"
+
+    # Collect discovery files from each pod
+    for pod in $DISCOVERY_PODS; do
+      echo "Collecting discovery results from pod: $pod"
+
+      NODE_NAME=$(oc get pod "$pod" -n default -o jsonpath='{.spec.nodeName}')
+      echo "  Node: $NODE_NAME"
+
+      DISCOVERY_FILE="${DISCOVERY_DIR}/${NODE_NAME}-ports.json"
+      if oc exec -n default "$pod" -- cat /discovery/ports.json > "$DISCOVERY_FILE" 2>/dev/null; then
+        echo "  ✓ Collected discovery file: $DISCOVERY_FILE"
+      else
+        echo "  ✗ Failed to collect from $pod"
+      fi
+    done
+
+    # Check if any discovery files exist
+    if ! ls "$DISCOVERY_DIR"/*-ports.json 1> /dev/null 2>&1; then
+      echo "Error: No discovery files were collected"
+      exit 1
+    fi
+
+    echo ""
+    echo "Found discovery files:"
+    for file in "$DISCOVERY_DIR"/*-ports.json; do
+      echo "  - $(basename "$file")"
+    done
+
+    # Run Python script to generate resources
+    export DISCOVERY_DIR OUTPUT_DIR MTU IP_RANGE_BASE NETWORK_NAMESPACE ROUTE_DEST SUBNET_MODE
+    python3 /scripts/generate_resources.py
+
+    echo ""
+    echo "=== Exporting IB Devices for NVIDIA Network Operator ==="
+
+    # Create configmap with IB devices data for NVIDIA Network Operator
+    if [ -f "$OUTPUT_DIR/ib-devices.json" ]; then
+      echo "Creating configmap with InfiniBand device data..."
+      oc create configmap generated-sriov-resources \
+        --from-file=ib-devices.json="$OUTPUT_DIR/ib-devices.json" \
+        -n default \
+        --dry-run=client -o yaml | oc apply -f -
+      echo "✓ ConfigMap created: generated-sriov-resources"
+      echo "  This will be used by NVIDIA Network Operator to configure RDMA shared devices"
+    else
+      echo "No InfiniBand devices found - creating empty configmap"
+      oc create configmap generated-sriov-resources \
+        --from-literal=ib-devices.json='[]' \
+        -n default \
+        --dry-run=client -o yaml | oc apply -f -
+    fi
+
+    echo ""
+    echo "=== Applying generated resources to cluster ==="
+
+    # Apply all generated resources
+    APPLIED_COUNT=0
+    for yaml_file in "$OUTPUT_DIR"/*.yaml; do
+      if [ -f "$yaml_file" ]; then
+        echo "Applying: $(basename "$yaml_file")"
+        if oc apply -f "$yaml_file"; then
+          APPLIED_COUNT=$((APPLIED_COUNT + 1))
+          echo "✓ Applied: $(basename "$yaml_file")"
+        else
+          echo "⚠ Warning: Failed to apply $(basename "$yaml_file")"
+        fi
+      fi
+    done
+
+    echo ""
+    echo "=== Summary ==="
+    echo "Total resources applied: $APPLIED_COUNT"
+    echo "NIC resource generation complete!"
+
+    echo ""
+    echo "=== Cleanup Discovery Resources ==="
+    echo "Deleting discovery DaemonSet (no longer needed)..."
+    if oc delete daemonset nic-port-discovery -n default --ignore-not-found=true; then
+      echo "✓ Discovery DaemonSet deleted"
+    else
+      echo "⚠ Warning: Failed to delete discovery DaemonSet"
+    fi

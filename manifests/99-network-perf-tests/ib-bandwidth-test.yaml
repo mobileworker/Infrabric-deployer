@@ -1,0 +1,295 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ib-bandwidth-test
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ib-bandwidth-test
+rules:
+- apiGroups: [""]
+  resources: ["pods", "nodes"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  verbs: ["get", "list", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ib-bandwidth-test
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ib-bandwidth-test
+subjects:
+- kind: ServiceAccount
+  name: ib-bandwidth-test
+  namespace: default
+---
+# DaemonSet for IB bandwidth test workers
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ib-bandwidth-test-worker
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: ib-bandwidth-test-worker
+  template:
+    metadata:
+      labels:
+        app: ib-bandwidth-test-worker
+    spec:
+      nodeSelector:
+        feature.node.kubernetes.io/pci-15b3.present: "true"
+      hostNetwork: false
+      containers:
+      - name: test
+        image: quay.io/bbenshab/perf-test:universal
+        command: ["sleep", "infinity"]
+        resources:
+          requests:
+            # Request all available RDMA shared devices
+            # These will be auto-discovered by the coordinator
+            rdma/rdma_shared_nic4: "1"
+            rdma/rdma_shared_nic5: "1"
+            rdma/rdma_shared_nic6: "1"
+            rdma/rdma_shared_nic9: "1"
+            rdma/rdma_shared_nic10: "1"
+            rdma/rdma_shared_nic11: "1"
+            nvidia.com/gpu: 1
+            memory: "8Gi"
+            cpu: "4"
+          limits:
+            rdma/rdma_shared_nic4: "1"
+            rdma/rdma_shared_nic5: "1"
+            rdma/rdma_shared_nic6: "1"
+            rdma/rdma_shared_nic9: "1"
+            rdma/rdma_shared_nic10: "1"
+            rdma/rdma_shared_nic11: "1"
+            nvidia.com/gpu: 1
+            memory: "16Gi"
+            cpu: "8"
+        env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        securityContext:
+          privileged: true
+          capabilities:
+            add:
+            - IPC_LOCK
+            - SYS_RESOURCE
+---
+# Job to coordinate and run the IB bandwidth tests
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ib-bandwidth-test
+  namespace: default
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600  # Keep for 1 hour
+  template:
+    spec:
+      serviceAccountName: ib-bandwidth-test
+      restartPolicy: Never
+      containers:
+      - name: test-coordinator
+        image: registry.redhat.io/openshift4/ose-cli:latest
+        env:
+        - name: TEST_DURATION
+          value: "30"  # Duration in seconds for each test
+        - name: CLEANUP_WORKERS
+          value: "true"  # Set to "false" to keep worker pods for debugging
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+
+          TEST_DURATION=${TEST_DURATION:-30}
+
+          echo "==========================================="
+          echo "InfiniBand RDMA Bandwidth Test"
+          echo "==========================================="
+          echo ""
+          echo "Test Configuration:"
+          echo "  - Duration: ${TEST_DURATION} seconds per test"
+          echo "  - Method: RDMA verbs (ib_write_bw)"
+          echo "  - Message size: 8MB (max)"
+          echo ""
+
+          echo "Step 1: Discovering RDMA shared devices..."
+          RDMA_RESOURCES=$(oc get nodes -o json | \
+            grep -o '"rdma/rdma_shared_nic[0-9]*": "[^"]*"' | \
+            grep -v ': "0"' | \
+            sed 's/"rdma\/\([^"]*\)".*/\1/' || echo "")
+          RDMA_COUNT=$(echo $RDMA_RESOURCES | wc -w | tr -d ' ')
+
+          echo "Found $RDMA_COUNT RDMA shared devices:"
+          for res in $RDMA_RESOURCES; do
+            echo "  - rdma/$res"
+          done
+
+          if [ "$RDMA_COUNT" -eq 0 ]; then
+            echo ""
+            echo "ERROR: No RDMA shared devices found"
+            echo "Ensure NVIDIA Network Operator is deployed with RDMA shared device plugin"
+            exit 1
+          fi
+          echo ""
+
+          echo "Step 2: Waiting for worker pods..."
+          for i in {1..60}; do
+            READY=$(oc get pods -l app=ib-bandwidth-test-worker --no-headers 2>/dev/null | grep "Running" | grep "1/1" | wc -l | tr -d ' ')
+            TOTAL=$(oc get pods -l app=ib-bandwidth-test-worker --no-headers 2>/dev/null | wc -l | tr -d ' ')
+
+            echo "  Ready: $READY/$TOTAL pods"
+
+            if [ "$READY" -ge 2 ] && [ "$READY" -eq "$TOTAL" ]; then
+              echo "  All pods ready!"
+              break
+            fi
+            sleep 5
+          done
+          echo ""
+
+          WORKER_PODS=$(oc get pods -l app=ib-bandwidth-test-worker -o jsonpath='{.items[*].metadata.name}')
+          POD_COUNT=$(echo $WORKER_PODS | wc -w)
+
+          if [ "$POD_COUNT" -lt 2 ]; then
+            echo "ERROR: Need at least 2 worker pods, found $POD_COUNT"
+            exit 1
+          fi
+
+          echo "Found $POD_COUNT worker pods ready for testing"
+          PODS=($WORKER_PODS)
+          echo ""
+
+          # Get pod IPs for reference
+          echo "Pod IP addresses:"
+          for pod in "${PODS[@]}"; do
+            POD_IP=$(oc get pod $pod -o jsonpath='{.status.podIP}')
+            POD_NODE=$(oc get pod $pod -o jsonpath='{.spec.nodeName}')
+            echo "  $pod ($POD_NODE): $POD_IP"
+          done
+          echo ""
+
+          echo "Step 3: Detecting active RDMA devices on each pod..."
+          declare -A POD_DEVICES
+          for pod in "${PODS[@]}"; do
+            # Only get devices with PORT_ACTIVE state
+            DEVICES=$(oc exec $pod -- bash -c 'for dev in $(ibv_devices 2>/dev/null | grep "mlx5_" | awk "{print \$1}"); do if ibv_devinfo -d $dev 2>/dev/null | grep -q "PORT_ACTIVE"; then echo $dev; fi; done' | tr '\n' ' ')
+            POD_DEVICES[$pod]="$DEVICES"
+            echo "  $pod: $DEVICES"
+          done
+          echo ""
+
+          echo "==========================================="
+          echo "Running Bandwidth Tests"
+          echo "==========================================="
+          echo ""
+
+          # Test matrix: first pod as source to all others
+          SOURCE_POD="${PODS[0]}"
+          SOURCE_IP=$(oc get pod $SOURCE_POD -o jsonpath='{.status.podIP}')
+          SOURCE_NODE=$(oc get pod $SOURCE_POD -o jsonpath='{.spec.nodeName}')
+
+          echo "Test Configuration:"
+          echo "  Source Pod: $SOURCE_POD ($SOURCE_NODE - $SOURCE_IP)"
+          echo "  Target Pods: ${#PODS[@]} - 1 = $((POD_COUNT - 1)) targets"
+          echo ""
+
+          # Summary arrays
+          declare -a TEST_RESULTS=()
+
+          for i in "${!PODS[@]}"; do
+            if [ $i -eq 0 ]; then
+              continue  # Skip source pod
+            fi
+
+            TARGET_POD="${PODS[$i]}"
+            TARGET_IP=$(oc get pod $TARGET_POD -o jsonpath='{.status.podIP}')
+            TARGET_NODE=$(oc get pod $TARGET_POD -o jsonpath='{.spec.nodeName}')
+
+            echo "-------------------------------------------"
+            echo "Test: $SOURCE_NODE → $TARGET_NODE"
+            echo "  Source: $SOURCE_POD"
+            echo "  Target: $TARGET_POD"
+            echo "-------------------------------------------"
+            echo ""
+
+            # Get first RDMA device from each pod
+            SOURCE_DEVICES=(${POD_DEVICES[$SOURCE_POD]})
+            TARGET_DEVICES=(${POD_DEVICES[$TARGET_POD]})
+
+            SOURCE_DEV="${SOURCE_DEVICES[0]}"
+            TARGET_DEV="${TARGET_DEVICES[0]}"
+
+            echo "Using RDMA devices:"
+            echo "  Source: $SOURCE_DEV"
+            echo "  Target: $TARGET_DEV"
+            echo ""
+
+            # Kill any existing processes
+            oc exec $SOURCE_POD -- pkill ib_write_bw 2>/dev/null || true
+            oc exec $TARGET_POD -- pkill ib_write_bw 2>/dev/null || true
+            sleep 2
+
+            # Start server on target
+            echo "Starting ib_write_bw server on target..."
+            oc exec $TARGET_POD -- bash -c "ib_write_bw -d $TARGET_DEV -a > /tmp/server.log 2>&1 &" &
+            sleep 3
+
+            # Run client from source
+            echo "Running ib_write_bw client from source..."
+            RESULT=$(oc exec $SOURCE_POD -- timeout $((TEST_DURATION + 10)) ib_write_bw -d $SOURCE_DEV $TARGET_IP -a 2>&1)
+
+            # Extract bandwidth from largest message size (8388608 bytes)
+            BANDWIDTH=$(echo "$RESULT" | grep "8388608" | tail -1 | awk '{print $4}')
+
+            if [ -n "$BANDWIDTH" ]; then
+              # Convert MiB/sec to GB/s (1024 MiB = 1 GiB, 1 GiB = 0.9313 GB)
+              BANDWIDTH_GBPS=$(awk "BEGIN {printf \"%.2f\", $BANDWIDTH / 1024 * 0.9313}")
+              echo ""
+              echo "✓ Bandwidth: $BANDWIDTH MiB/s (~${BANDWIDTH_GBPS} GB/s)"
+              TEST_RESULTS+=("$SOURCE_NODE → $TARGET_NODE: ${BANDWIDTH_GBPS} GB/s ($SOURCE_DEV → $TARGET_DEV)")
+            else
+              echo ""
+              echo "✗ Test failed or no result"
+              TEST_RESULTS+=("$SOURCE_NODE → $TARGET_NODE: FAILED")
+            fi
+
+            # Kill server
+            oc exec $TARGET_POD -- pkill ib_write_bw 2>/dev/null || true
+            echo ""
+          done
+
+          echo "==========================================="
+          echo "Test Results Summary"
+          echo "==========================================="
+          echo ""
+          for result in "${TEST_RESULTS[@]}"; do
+            echo "  $result"
+          done
+          echo ""
+          echo "Test completed successfully!"
+          echo ""
+
+          # Cleanup worker pods if requested
+          if [ "$CLEANUP_WORKERS" = "true" ]; then
+            echo "Cleaning up worker DaemonSet..."
+            oc delete daemonset ib-bandwidth-test-worker -n default --ignore-not-found
+            echo "✓ Cleanup complete"
+          else
+            echo "Worker pods kept for debugging (CLEANUP_WORKERS=false)"
+            echo "To cleanup manually: oc delete daemonset ib-bandwidth-test-worker -n default"
+          fi

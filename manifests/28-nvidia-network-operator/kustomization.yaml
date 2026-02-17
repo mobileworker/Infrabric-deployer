@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nvidia-network-operator
+resources:
+  # PreSync: Wait for SR-IOV MachineConfig rollout to complete
+  # SR-IOV operator may trigger node reboots when creating VFs (RoCE only)
+  # This ensures all nodes are ready before deploying MOFED drivers
+  - presync-wait-for-sriov-mcp.yaml
+
+  # Discover OFED version from operator CSV
+  - 00-version-discovery-job.yaml
+
+  # Deploy NicClusterPolicy (MOFED drivers always, RDMA/IPoIB only if IB devices detected)
+  - nicclusterpolicy.yaml
+
+  # Generate RDMA shared device plugin config for InfiniBand NICs (one resource per NIC)
+  # This reads IB devices from SR-IOV discovery and creates separate RDMA resources
+  # Only applies if InfiniBand devices are detected
+  - job-generate-rdma-config.yaml

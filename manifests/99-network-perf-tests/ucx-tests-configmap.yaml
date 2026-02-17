@@ -1,0 +1,382 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: network-perf-ucx-tests
+  namespace: default
+data:
+  ucx-tests.py: |
+    #!/usr/bin/env python3
+    """UCX Bandwidth and Latency Tests"""
+
+    import os
+    import sys
+    import subprocess
+    import sqlite3
+    import re
+    import time
+
+    DB_FILE = os.environ.get('DB_FILE', '/tmp/network-perf-results.db')
+    TEST_RUN_ID = os.environ.get('TEST_RUN_ID')
+    MSG_SIZE = int(os.environ.get('MSG_SIZE', '4194304'))
+
+    def run_oc_exec(pod, cmd):
+        """Execute command in pod"""
+        result = subprocess.run(
+            ['oc', 'exec', pod, '--', 'bash', '-c', cmd],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, check=False
+        )
+        return result.stdout, result.stderr, result.returncode
+
+    def get_active_devices(pod):
+        """Get active RDMA devices"""
+        stdout, _, _ = run_oc_exec(pod,
+            'for dev in $(ibv_devices 2>/dev/null | grep "mlx5_" | awk "{print $1}"); do '
+            'if ibv_devinfo -d $dev 2>/dev/null | grep -q "PORT_ACTIVE"; then echo $dev; fi; done')
+        return stdout.strip().split()
+
+    def get_optimal_gpu(pod, device):
+        """Get optimal GPU ID for a given RDMA device from topology database"""
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            result = c.execute("""
+                SELECT gpu_id FROM gpu_nic_topology
+                WHERE pod_name = ? AND nic_device = ? AND connection_type = 'PXB'
+                LIMIT 1
+            """, (pod, device)).fetchone()
+            conn.close()
+            return result[0] if result else 0
+        except:
+            return 0
+
+    def run_ucx_tests(source_pod, target_pod, source_node, target_node, source_gpus, target_gpus):
+        """Main UCX test orchestration"""
+        print("\n" + "="*70)
+        print("UCX Bandwidth and Latency Tests")
+        print("="*70)
+
+        # Get devices
+        source_devices = get_active_devices(source_pod)
+        target_devices = get_active_devices(target_pod)
+
+        # Only test devices that exist on both pods
+        common_devices = sorted(set(source_devices) & set(target_devices))
+
+        print(f"Source devices: {source_devices}")
+        print(f"Target devices: {target_devices}")
+        print(f"Testing common devices: {common_devices}")
+        print()
+
+        if not common_devices:
+            print("No common RDMA devices found between pods!")
+            return
+
+        # Get target IP once
+        target_ip_cmd = f"oc get pod {target_pod} -o jsonpath='{{.status.podIP}}'"
+        target_ip = subprocess.check_output(target_ip_cmd, shell=True, universal_newlines=True).strip()
+
+        # Test each common device
+        for dev in common_devices:
+            # Get optimal GPU for this device on each pod
+            source_gpu_id = get_optimal_gpu(source_pod, dev)
+            target_gpu_id = get_optimal_gpu(target_pod, dev)
+
+            print(f"Testing {dev} → {dev} (source GPU{source_gpu_id}, target GPU{target_gpu_id})...")
+
+            # Test both bandwidth and latency for host and GPU memory
+            for test_type in ['tag_bw', 'tag_lat']:
+                for mem_type, mem_flag, cuda_env in [('host', '', ''), ('cuda', '-m cuda', f'CUDA_VISIBLE_DEVICES={target_gpu_id}')]:
+                    # Kill any existing ucx_perftest
+                    run_oc_exec(target_pod, 'pkill -9 ucx_perftest')
+                    run_oc_exec(source_pod, 'pkill -9 ucx_perftest')
+                    time.sleep(1)
+
+                    # Build environment prefix with UCX_NET_DEVICES to avoid loopback
+                    # UCX_TLS: Use generic rc (not rc_mlx5) + cuda transports
+                    # UCX_NET_DEVICES: Force specific RDMA device
+                    # NOTE: UCX_IB_GID_INDEX removed - only GID[0] exists on these devices
+                    ucx_env = f'UCX_TLS=rc,cuda_copy,cuda_ipc UCX_NET_DEVICES={dev}:1'
+
+                    target_env = f'{ucx_env} {cuda_env} ' if cuda_env else f'{ucx_env} '
+                    source_cuda_env = f'CUDA_VISIBLE_DEVICES={source_gpu_id}' if mem_type == 'cuda' else ''
+                    source_env = f'{ucx_env} {source_cuda_env} ' if source_cuda_env else f'{ucx_env} '
+
+                    # Determine iteration count (fewer for CUDA to keep test time reasonable)
+                    n_iters = 100 if mem_type == 'cuda' else 1000
+
+                    # Start server using Popen (keeps process alive)
+                    server_cmd = f'ulimit -l unlimited; {target_env}ucx_perftest {mem_flag} -t {test_type} -s {MSG_SIZE}'
+                    server_proc = subprocess.Popen(
+                        ['oc', 'exec', target_pod, '--', 'bash', '-c', server_cmd],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+                    )
+
+                    time.sleep(3 if mem_type == 'host' else 5)
+
+                    # Run client
+                    stdout, stderr, rc = run_oc_exec(source_pod,
+                        f'ulimit -l unlimited; {source_env}ucx_perftest {mem_flag} -t {test_type} -s {MSG_SIZE} -n {n_iters} {target_ip}')
+
+                    # Parse results from "Final:" line
+                    # Bandwidth test: Final:  N  overhead  avg  overall  bandwidth_avg  bandwidth_overall  msgrate_avg  msgrate_overall
+                    # Latency test:   Final:  N  latency_avg  latency_overall  bandwidth_avg  bandwidth_overall  msgrate_avg  msgrate_overall
+
+                    # DEBUG: Show what we're parsing
+                    final_line = [line for line in stdout.split('\n') if 'Final:' in line]
+                    if final_line:
+                        print(f"    DEBUG Final line: {final_line[0]}")
+
+                    if test_type == 'tag_bw':
+                        # Parse bandwidth (6th column = average bandwidth in MB/s)
+                        # Final: iterations 50%ile avg_overhead overall_overhead avg_bw overall_bw avg_msgrate overall_msgrate
+                        bw_match = re.search(r'Final:\s+\d+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([\d.]+)', stdout)
+                        if bw_match:
+                            bw_mbs = float(bw_match.group(1))
+                            bw_gbps = bw_mbs * 8 / 1000
+                            print(f"  {mem_type.upper()} BW: {bw_gbps:.2f} Gb/s - PASS")
+
+                            # Store in database
+                            conn = sqlite3.connect(DB_FILE)
+                            c = conn.cursor()
+                            c.execute("""
+                                INSERT INTO ucx_results
+                                (test_run_id, source_pod, target_pod, source_node, target_node,
+                                 source_gpu, target_gpu, rdma_device_source, rdma_device_target,
+                                 message_size, test_mode, memory_type, bandwidth_gbps, latency_usec, test_status, timestamp)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'PASS', strftime('%s', 'now'))
+                            """, (TEST_RUN_ID, source_pod, target_pod, source_node, target_node,
+                                  source_gpus, target_gpus, dev, dev, MSG_SIZE, f'{test_type}_sequential', mem_type, bw_gbps))
+                            conn.commit()
+                            conn.close()
+                        else:
+                            print(f"  {mem_type.upper()} BW: FAIL")
+                            if stdout or stderr:
+                                print(f"    stdout: {stdout[:200]}")
+                                print(f"    stderr: {stderr[:200]}")
+                    else:  # tag_lat
+                        # Parse latency (3rd column = average latency in usec)
+                        # Final: iterations 50%ile_lat avg_lat overall_lat bandwidth bandwidth msgrate msgrate
+                        lat_match = re.search(r'Final:\s+\d+\s+[\d.]+\s+([\d.]+)', stdout)
+                        if lat_match:
+                            lat_usec = float(lat_match.group(1))
+                            print(f"  {mem_type.upper()} LAT: {lat_usec:.2f} μs - PASS")
+
+                            # Store in database
+                            conn = sqlite3.connect(DB_FILE)
+                            c = conn.cursor()
+                            c.execute("""
+                                INSERT INTO ucx_results
+                                (test_run_id, source_pod, target_pod, source_node, target_node,
+                                 source_gpu, target_gpu, rdma_device_source, rdma_device_target,
+                                 message_size, test_mode, memory_type, bandwidth_gbps, latency_usec, test_status, timestamp)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'PASS', strftime('%s', 'now'))
+                            """, (TEST_RUN_ID, source_pod, target_pod, source_node, target_node,
+                                  source_gpus, target_gpus, dev, dev, MSG_SIZE, test_type, mem_type, lat_usec))
+                            conn.commit()
+                            conn.close()
+                        else:
+                            print(f"  {mem_type.upper()} LAT: FAIL")
+                            if stdout or stderr:
+                                print(f"    stdout: {stdout[:200]}")
+                                print(f"    stderr: {stderr[:200]}")
+
+                    # Cleanup server process
+                    server_proc.terminate()
+                    try:
+                        server_proc.wait(timeout=2)
+                    except:
+                        server_proc.kill()
+                    run_oc_exec(target_pod, 'pkill -9 ucx_perftest')
+                    run_oc_exec(source_pod, 'pkill -9 ucx_perftest')
+
+        # Parallel UCX tests (all NICs simultaneously)
+        print(f"\n{'='*70}")
+        print("UCX Parallel Bandwidth Tests (all NICs simultaneously)")
+        print('='*70)
+
+        # Test both HOST and CUDA memory in parallel mode
+        for mem_type in ['host', 'cuda']:
+            print(f"\nParallel {mem_type.upper()} bandwidth test on {len(common_devices)} NICs...")
+
+            # Kill any existing processes
+            run_oc_exec(target_pod, 'pkill -9 ucx_perftest')
+            run_oc_exec(source_pod, 'pkill -9 ucx_perftest')
+            time.sleep(2)
+
+            # Start UCX servers on all devices (each on different port)
+            server_procs = []
+            for idx, dev in enumerate(common_devices):
+                target_gpu_id = get_optimal_gpu(target_pod, dev)
+                ucx_net_dev = f'UCX_TLS=rc,cuda_copy,cuda_ipc UCX_NET_DEVICES={dev}:1'
+                port = 13337 + idx  # Use different port for each device
+
+                if mem_type == 'cuda':
+                    target_env = f'{ucx_net_dev} CUDA_VISIBLE_DEVICES={target_gpu_id} '
+                    mem_flag = '-m cuda'
+                else:
+                    target_env = f'{ucx_net_dev} '
+                    mem_flag = ''
+
+                # Run server in background (no iteration limit for server)
+                server_cmd = f"nohup bash -c 'ulimit -l unlimited; {target_env}ucx_perftest {mem_flag} -t tag_bw -s {MSG_SIZE} -p {port}' > /tmp/ucx_server_{dev}_{mem_type}.log 2>&1 &"
+                run_oc_exec(target_pod, server_cmd)
+                server_procs.append((dev, port))
+
+            time.sleep(5 if mem_type == 'cuda' else 3)
+
+            # Start UCX clients on all devices simultaneously
+            # When multiple NICs run in parallel, bandwidth is shared (~18,000 MB/s per NIC instead of 47,000)
+            # At 18,000 MB/s with 4MB messages: 80,000 iterations = ~18 seconds (safe margin)
+            # CUDA: 100 iterations completes fast regardless
+            n_iters = 100 if mem_type == 'cuda' else 80000
+            for idx, dev in enumerate(common_devices):
+                source_gpu_id = get_optimal_gpu(source_pod, dev)
+                ucx_net_dev = f'UCX_TLS=rc,cuda_copy,cuda_ipc UCX_NET_DEVICES={dev}:1'
+                port = 13337 + idx  # Match server port
+
+                if mem_type == 'cuda':
+                    source_env = f'{ucx_net_dev} CUDA_VISIBLE_DEVICES={source_gpu_id} '
+                    mem_flag = '-m cuda'
+                else:
+                    source_env = f'{ucx_net_dev} '
+                    mem_flag = ''
+
+                client_cmd = f'ulimit -l unlimited; {source_env}ucx_perftest {mem_flag} -t tag_bw -s {MSG_SIZE} -n {n_iters} -p {port} {target_ip} > /tmp/ucx_{dev}_par_{mem_type}.log 2>&1 &'
+                run_oc_exec(source_pod, client_cmd)
+
+            # Wait for tests to complete naturally (based on expected iteration time + buffer)
+            # HOST: 80k iters @ shared bandwidth (~18k MB/s) = ~18s, wait 30s for safety margin
+            # CUDA: 100 iters completes quickly, wait 15s
+            time.sleep(15 if mem_type == 'cuda' else 30)
+
+            # Collect results
+            for dev in common_devices:
+                stdout, _, _ = run_oc_exec(source_pod, f'cat /tmp/ucx_{dev}_par_{mem_type}.log 2>/dev/null')
+
+                bw_match = re.search(r'Final:\s+\d+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([\d.]+)', stdout)
+                if bw_match:
+                    bw_mbs = float(bw_match.group(1))
+                    bw_gbps = bw_mbs * 8 / 1000
+                    print(f"  [{dev}] {mem_type.upper()}: {bw_gbps:.2f} Gb/s - PASS")
+
+                    # Store in database with test_mode indicating parallel
+                    conn = sqlite3.connect(DB_FILE)
+                    c = conn.cursor()
+                    c.execute("""
+                        INSERT INTO ucx_results
+                        (test_run_id, source_pod, target_pod, source_node, target_node,
+                         source_gpu, target_gpu, rdma_device_source, rdma_device_target,
+                         message_size, test_mode, memory_type, bandwidth_gbps, latency_usec, test_status, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tag_bw_parallel', ?, ?, NULL, 'PASS', strftime('%s', 'now'))
+                    """, (TEST_RUN_ID, source_pod, target_pod, source_node, target_node,
+                          source_gpus, target_gpus, dev, dev, MSG_SIZE, mem_type, bw_gbps))
+                    conn.commit()
+                    conn.close()
+                else:
+                    print(f"  [{dev}] {mem_type.upper()}: FAIL")
+
+            # Cleanup servers and clients
+            run_oc_exec(target_pod, 'pkill -9 ucx_perftest')
+            run_oc_exec(source_pod, 'pkill -9 ucx_perftest')
+
+        # Parallel UCX Latency Tests (all NICs simultaneously - latency under load)
+        print(f"\n{'='*70}")
+        print("UCX Parallel Latency Tests (all NICs simultaneously)")
+        print('='*70)
+
+        # Test both HOST and CUDA memory latency in parallel mode
+        for mem_type in ['host', 'cuda']:
+            print(f"\nParallel {mem_type.upper()} latency test on {len(common_devices)} NICs...")
+
+            # Kill any existing processes
+            run_oc_exec(target_pod, 'pkill -9 ucx_perftest')
+            run_oc_exec(source_pod, 'pkill -9 ucx_perftest')
+            time.sleep(2)
+
+            # Start UCX latency servers on all devices (each on different port)
+            server_procs = []
+            for idx, dev in enumerate(common_devices):
+                target_gpu_id = get_optimal_gpu(target_pod, dev)
+                ucx_net_dev = f'UCX_TLS=rc,cuda_copy,cuda_ipc UCX_NET_DEVICES={dev}:1'
+                port = 14337 + idx  # Use different port range for latency tests
+
+                if mem_type == 'cuda':
+                    target_env = f'{ucx_net_dev} CUDA_VISIBLE_DEVICES={target_gpu_id} '
+                    mem_flag = '-m cuda'
+                else:
+                    target_env = f'{ucx_net_dev} '
+                    mem_flag = ''
+
+                # Run latency server in background (no iteration limit for server)
+                server_cmd = f"nohup bash -c 'ulimit -l unlimited; {target_env}ucx_perftest {mem_flag} -t tag_lat -s {MSG_SIZE} -p {port}' > /tmp/ucx_lat_server_{dev}_{mem_type}.log 2>&1 &"
+                run_oc_exec(target_pod, server_cmd)
+                server_procs.append((dev, port))
+
+            time.sleep(5 if mem_type == 'cuda' else 3)
+
+            # Start UCX latency clients on all devices simultaneously
+            # Use enough iterations for statistical accuracy while completing in reasonable time
+            n_iters = 10000
+            for idx, dev in enumerate(common_devices):
+                source_gpu_id = get_optimal_gpu(source_pod, dev)
+                ucx_net_dev = f'UCX_TLS=rc,cuda_copy,cuda_ipc UCX_NET_DEVICES={dev}:1'
+                port = 14337 + idx  # Match server port
+
+                if mem_type == 'cuda':
+                    source_env = f'{ucx_net_dev} CUDA_VISIBLE_DEVICES={source_gpu_id} '
+                    mem_flag = '-m cuda'
+                else:
+                    source_env = f'{ucx_net_dev} '
+                    mem_flag = ''
+
+                client_cmd = f'ulimit -l unlimited; {source_env}ucx_perftest {mem_flag} -t tag_lat -s {MSG_SIZE} -n {n_iters} -p {port} {target_ip} > /tmp/ucx_{dev}_par_lat_{mem_type}.log 2>&1 &'
+                run_oc_exec(source_pod, client_cmd)
+
+            # Wait for latency tests to complete (10k iterations @ ~100μs = ~1s per NIC, wait 15s for safety)
+            time.sleep(15 if mem_type == 'cuda' else 15)
+
+            # Collect latency results
+            for dev in common_devices:
+                stdout, _, _ = run_oc_exec(source_pod, f'cat /tmp/ucx_{dev}_par_lat_{mem_type}.log 2>/dev/null')
+
+                # Parse latency (3rd column = average latency in usec)
+                lat_match = re.search(r'Final:\s+\d+\s+[\d.]+\s+([\d.]+)', stdout)
+                if lat_match:
+                    lat_usec = float(lat_match.group(1))
+                    print(f"  [{dev}] {mem_type.upper()}: {lat_usec:.2f} μs - PASS")
+
+                    # Store in database with test_mode = tag_lat_parallel
+                    conn = sqlite3.connect(DB_FILE)
+                    c = conn.cursor()
+                    c.execute("""
+                        INSERT INTO ucx_results
+                        (test_run_id, source_pod, target_pod, source_node, target_node,
+                         source_gpu, target_gpu, rdma_device_source, rdma_device_target,
+                         message_size, test_mode, memory_type, bandwidth_gbps, latency_usec, test_status, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tag_lat_parallel', ?, NULL, ?, 'PASS', strftime('%s', 'now'))
+                    """, (TEST_RUN_ID, source_pod, target_pod, source_node, target_node,
+                          source_gpus, target_gpus, dev, dev, MSG_SIZE, mem_type, lat_usec))
+                    conn.commit()
+                    conn.close()
+                else:
+                    print(f"  [{dev}] {mem_type.upper()}: FAIL")
+
+            # Cleanup servers and clients
+            run_oc_exec(target_pod, 'pkill -9 ucx_perftest')
+            run_oc_exec(source_pod, 'pkill -9 ucx_perftest')
+
+        print("\n✓ UCX parallel latency tests completed")
+        print("\n✓ UCX parallel tests completed")
+        print("\n✓ UCX tests completed")
+
+    if __name__ == '__main__':
+        run_ucx_tests(
+            sys.argv[1],  # source_pod
+            sys.argv[2],  # target_pod
+            sys.argv[3],  # source_node
+            sys.argv[4],  # target_node
+            sys.argv[5],  # source_gpus
+            sys.argv[6]   # target_gpus
+        )

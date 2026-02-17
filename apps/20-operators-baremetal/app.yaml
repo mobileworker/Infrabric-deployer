@@ -1,0 +1,37 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: operators-infra
+  namespace: openshift-gitops
+  labels:
+    app.kubernetes.io/managed-by: fab-rig
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+spec:
+  project: default
+  destination:
+    server: "https://kubernetes.default.svc"
+    namespace: helm-charts
+    name: ''
+  syncPolicy:
+    managedNamespaceMetadata:
+      labels:
+        openshift.io/cluster-monitoring: "true"
+    syncOptions:
+      - ServerSideApply=true
+    automated:
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 8
+      backoff:
+        duration: 5s
+        maxDuration: 5m0s
+        factor: 2
+  source:
+    repoURL: https://github.com/bbenshab/Infrabric-deployer.git
+    targetRevision: main
+    path: manifests/20-operators
+    helm:
+      valueFiles:
+        - ../../rig/baremetal/infra-operators-values.yaml

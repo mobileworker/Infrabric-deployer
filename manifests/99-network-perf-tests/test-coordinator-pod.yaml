@@ -1,0 +1,73 @@
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-coordinator
+  namespace: default
+spec:
+  serviceAccountName: network-perf-test
+  restartPolicy: Never
+  containers:
+  - name: coordinator
+    image: registry.redhat.io/openshift4/ose-cli:latest
+    command:
+    - /bin/bash
+    - -c
+    - |
+      echo "Test Coordinator Pod Ready"
+      echo "=========================="
+      echo ""
+      echo "Available scripts:"
+      echo "  /opt/scripts/db-init/init-db.sh"
+      echo "  /opt/scripts/daemonset-builder/build-daemonset.py"
+      echo "  /opt/scripts/ib-tests/ib-tests.py"
+      echo "  /opt/scripts/roce-tests/roce-tests.py"
+      echo "  /opt/scripts/nccl-tests/nccl-tests.py"
+      echo ""
+      echo "To test manually, exec into this pod and run scripts step by step"
+      echo ""
+      sleep infinity
+    volumeMounts:
+    - name: db-init
+      mountPath: /opt/scripts/db-init
+      readOnly: true
+    - name: daemonset-builder
+      mountPath: /opt/scripts/daemonset-builder
+      readOnly: true
+    - name: ib-tests
+      mountPath: /opt/scripts/ib-tests
+      readOnly: true
+    - name: roce-tests
+      mountPath: /opt/scripts/roce-tests
+      readOnly: true
+    - name: nccl-tests
+      mountPath: /opt/scripts/nccl-tests
+      readOnly: true
+    env:
+    - name: TEST_DURATION
+      value: "5"
+    - name: CLEANUP_WORKERS
+      value: "false"
+    - name: KEEP_COORDINATOR_ALIVE
+      value: "true"
+  volumes:
+  - name: db-init
+    configMap:
+      name: network-perf-db-init
+      defaultMode: 0755
+  - name: daemonset-builder
+    configMap:
+      name: daemonset-builder
+      defaultMode: 0755
+  - name: ib-tests
+    configMap:
+      name: network-perf-ib-tests
+      defaultMode: 0755
+  - name: roce-tests
+    configMap:
+      name: network-perf-roce-tests
+      defaultMode: 0755
+  - name: nccl-tests
+    configMap:
+      name: network-perf-nccl-tests
+      defaultMode: 0755
