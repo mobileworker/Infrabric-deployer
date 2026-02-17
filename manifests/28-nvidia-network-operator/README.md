@@ -61,71 +61,23 @@ Auto-generates RDMA configuration from discovered InfiniBand devices:
 - Only devices with carrier=1 (online, cable connected) are included
 
 **Output:**
-- NicClusterPolicy patch with:
-  - RDMA shared device plugin config (one resource per unique interface name)
-  - IPoIB CNI (only if IB devices detected)
-- NetworkAttachmentDefinitions for IPoIB networking
+- NicClusterPolicy patch with RDMA shared device plugin config (one resource per unique interface name)
 
 **Behavior:**
 - Only runs if InfiniBand devices are detected
-- If no IB devices found: Only deploys MOFED drivers (no RDMA plugin, no IPoIB)
+- If no IB devices found: Only deploys MOFED drivers (no RDMA plugin)
 - Groups by interface name (ib_nicX) after wave 25b normalization
 - Handles heterogeneous configurations (different NICs online per node)
 - Only creates resources for NICs that have carrier=1 on at least one node
+- **Pure RDMA mode**: No IP networking (no IPoIB CNI, no NetworkAttachmentDefinitions)
 
 ### 2. Base NicClusterPolicy (nicclusterpolicy.yaml)
 
 Empty base policy - actual configuration is generated dynamically by:
 1. NIC discovery (manifest 26a): Creates base policy with MOFED drivers
-2. RDMA generator (this manifest): Patches in RDMA shared device plugin + IPoIB CNI
+2. RDMA generator (this manifest): Patches in RDMA shared device plugin
 
-## Configuration
-
-### Environment Variables (job-generate-rdma-config.yaml)
-
-```yaml
-env:
-  # Subnet mode: "separate" (one network per NIC) or "shared" (one network for all NICs)
-  - name: SUBNET_MODE
-    value: "separate"  # Default: separate subnets per NIC
-
-  # IP address management
-  - name: IP_RANGE_BASE
-    value: "10.0"  # First two octets of IP addresses
-
-  # Route destination (auto-incremented in separate mode)
-  - name: ROUTE_DEST
-    value: "192.168.75.0/24"
-
-  # MTU for InfiniBand networks (default: 9000 for jumbo frames)
-  - name: MTU
-    value: "9000"
-
-  # Namespace where NetworkAttachmentDefinitions are created
-  - name: NETWORK_NAMESPACE
-    value: "default"
-```
-
-### SUBNET_MODE Options
-
-#### Option 1: Separate (Default)
-One NetworkAttachmentDefinition per NIC position, each with its own subnet.
-
-**Created Networks:**
-- `rdma-nic0`: 10.0.101.0/24 → route to 192.168.75.0/24
-- `rdma-nic1`: 10.0.102.0/24 → route to 192.168.76.0/24
-- `rdma-nic2`: 10.0.103.0/24 → route to 192.168.77.0/24
-- ... (one per NIC position)
-
-**Use Case:** Network isolation between different NICs
-
-#### Option 2: Shared
-One NetworkAttachmentDefinition for all NICs, shared subnet.
-
-**Created Network:**
-- `rdma-ib-shared`: 10.0.100.0/24 → route to 192.168.75.0/24
-
-**Use Case:** All NICs can reach each other, single subnet for entire cluster
+**Note:** Pods access InfiniBand devices directly via `/dev/infiniband` hostPath mount. No IP networking is configured for InfiniBand devices.
 
 ## Deployment Order
 
@@ -137,68 +89,53 @@ One NetworkAttachmentDefinition for all NICs, shared subnet.
    - Exports IB devices to configmap
 3. **Wave 28**: NVIDIA Network Operator (this directory)
    - Reads IB devices from configmap
-   - Patches NicClusterPolicy with RDMA shared device plugin + IPoIB CNI
-   - Creates NetworkAttachmentDefinitions
+   - Patches NicClusterPolicy with RDMA shared device plugin
+   - Pure RDMA mode: Pods access devices via hostPath (no IP networking)
 
-## Using RDMA Resources in Pods
+## Using InfiniBand RDMA in Pods
 
-### Example: Separate Subnet Mode
+**Pure RDMA Mode:** Pods access InfiniBand devices directly via hostPath mount. No network annotations or RDMA resource requests are needed.
+
+### Example Pod
 
 ```yaml
 apiVersion: v1
 kind: Pod
 metadata:
   name: rdma-test
-  annotations:
-    k8s.v1.cni.cncf.io/networks: rdma-nic0
 spec:
+  hostNetwork: false
+  volumes:
+  - name: dev-infiniband
+    hostPath:
+      path: /dev/infiniband
   containers:
   - name: app
     image: your-rdma-app
-    resources:
-      requests:
-        rdma/rdma_shared_nic0: 1
-      limits:
-        rdma/rdma_shared_nic0: 1
+    volumeMounts:
+    - name: dev-infiniband
+      mountPath: /dev/infiniband
     securityContext:
+      privileged: true
       capabilities:
-        add: ["IPC_LOCK"]
+        add: ["IPC_LOCK", "SYS_RESOURCE"]
+```
+
+**Access InfiniBand devices:**
+```bash
+# List available devices
+ibv_devices
+
+# Use specific device in your RDMA application
+ib_write_bw -d mlx5_3 <target-ip>
+ucx_perftest -d mlx5_4 -t tag_bw <target-ip>
 ```
 
 **Result:**
-- Pod gets scheduled on a node that has NIC position 0
-- Pod gets an IP from 10.0.101.0/24 subnet
-- Pod has access to the InfiniBand NIC via RDMA shared device
-
-### Example: Multi-Node Deployment
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: rdma-workload
-spec:
-  replicas: 5
-  template:
-    metadata:
-      annotations:
-        k8s.v1.cni.cncf.io/networks: rdma-nic0
-    spec:
-      containers:
-      - name: app
-        image: your-rdma-app
-        resources:
-          requests:
-            rdma/rdma_shared_nic0: 1
-          limits:
-            rdma/rdma_shared_nic0: 1
-```
-
-**Result:**
-- All 5 pods request `rdma_shared_nic0`
-- Scheduler places pods across available nodes
-- Each pod gets the 1st NIC on its assigned node
-- All pods have consistent resource naming
+- Pod has direct access to all InfiniBand devices on the node
+- No IP configuration needed (uses regular pod IP for connection establishment)
+- RDMA data transfer bypasses IP stack completely
+- Full bandwidth and lowest latency
 
 ## Heterogeneous Configurations
 
@@ -250,19 +187,6 @@ oc get nodes -o json | jq -r '.items[] | .metadata.name as $node | .status.capac
 
 # Check RDMA device plugin pods
 oc get pods -n nvidia-network-operator -l app=rdma-shared-dp
-
-# Check IPoIB CNI pods
-oc get pods -n nvidia-network-operator -l app=ipoib-cni
-```
-
-### Check NetworkAttachmentDefinitions
-
-```bash
-# List networks
-oc get network-attachment-definitions -n default | grep rdma
-
-# View specific network
-oc get network-attachment-definition rdma-nic0 -n default -o yaml
 ```
 
 ### Check MOFED Drivers
@@ -285,5 +209,4 @@ oc logs -n nvidia-network-operator -l app=mofed-driver -c mofed-container | grep
 
 - [NVIDIA Network Operator Documentation](https://docs.nvidia.com/networking/display/cokan10/network+operator)
 - [RDMA Shared Device Plugin](https://github.com/Mellanox/k8s-rdma-shared-dev-plugin)
-- [IPoIB CNI](https://github.com/Mellanox/ipoib-cni)
 - [Netlink PAGE_SIZE Issue](https://github.com/k8snetworkplumbingwg/sriov-network-operator/pull/1026)

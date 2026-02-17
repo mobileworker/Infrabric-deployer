@@ -59,26 +59,8 @@ spec:
       echo "Sleeping... Use 'oc exec' to run RDMA tests"
       sleep infinity
 
-    resources:
-      requests:
-        # Request all 7 RDMA NICs
-        rdma/rdma_shared_nic0: 1
-        rdma/rdma_shared_nic1: 1
-        rdma/rdma_shared_nic2: 1
-        rdma/rdma_shared_nic3: 1
-        rdma/rdma_shared_nic4: 1
-        rdma/rdma_shared_nic5: 1
-        rdma/rdma_shared_nic6: 1
-      limits:
-        rdma/rdma_shared_nic0: 1
-        rdma/rdma_shared_nic1: 1
-        rdma/rdma_shared_nic2: 1
-        rdma/rdma_shared_nic3: 1
-        rdma/rdma_shared_nic4: 1
-        rdma/rdma_shared_nic5: 1
-        rdma/rdma_shared_nic6: 1
-
     securityContext:
+      privileged: true
       capabilities:
         add:
         - IPC_LOCK        # Required for RDMA memory registration
@@ -156,25 +138,8 @@ spec:
 
           sleep infinity
 
-        resources:
-          requests:
-            rdma/rdma_shared_nic0: 1
-            rdma/rdma_shared_nic1: 1
-            rdma/rdma_shared_nic2: 1
-            rdma/rdma_shared_nic3: 1
-            rdma/rdma_shared_nic4: 1
-            rdma/rdma_shared_nic5: 1
-            rdma/rdma_shared_nic6: 1
-          limits:
-            rdma/rdma_shared_nic0: 1
-            rdma/rdma_shared_nic1: 1
-            rdma/rdma_shared_nic2: 1
-            rdma/rdma_shared_nic3: 1
-            rdma/rdma_shared_nic4: 1
-            rdma/rdma_shared_nic5: 1
-            rdma/rdma_shared_nic6: 1
-
         securityContext:
+          privileged: true
           capabilities:
             add:
             - IPC_LOCK

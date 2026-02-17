@@ -55,20 +55,7 @@ data:
     from collections import defaultdict
 
     print("\n=== NVIDIA Network Operator RDMA Configuration Generator ===")
-
-    # Configuration from environment variables
-    mtu = int(os.getenv('MTU', '9000'))
-    ip_range_base = os.getenv('IP_RANGE_BASE', '10.0')
-    network_namespace = os.getenv('NETWORK_NAMESPACE', 'default')
-    route_dest_base = os.getenv('ROUTE_DEST', '192.168.75.0/24')
-    subnet_mode = os.getenv('SUBNET_MODE', 'separate').lower()  # 'shared' or 'separate'
-
-    print(f"\nNetwork Configuration:")
-    print(f"  SUBNET_MODE: {subnet_mode}")
-    print(f"  IP_RANGE_BASE: {ip_range_base}")
-    print(f"  NETWORK_NAMESPACE: {network_namespace}")
-    print(f"  ROUTE_DEST: {route_dest_base}")
-    print(f"  MTU: {mtu}")
+    print("\nMode: Pure RDMA (no IP networking)")
 
     # Check if IB devices file exists from SR-IOV discovery
     ib_devices_file = "/discovery/ib-devices.json"
@@ -237,13 +224,6 @@ data:
                 "repository": "nvcr.io/nvidia/cloud-native",
                 "version": "v1.5.2",
                 "config": rdma_config_json
-            },
-            "secondaryNetwork": {
-                "ipoib": {
-                    "image": "ipoib-cni",
-                    "repository": "nvcr.io/nvidia/mellanox",
-                    "version": "network-operator-v25.10.0"
-                }
             }
         }
     }
@@ -263,7 +243,6 @@ data:
         print("✓ NicClusterPolicy patched successfully")
         print(f"\nEnabled components:")
         print(f"  - RDMA Shared Device Plugin: {len(config_list)} global resources (one per unique interface)")
-        print(f"  - IPoIB CNI: network-operator-v25.10.0")
 
         print(f"\nAvailable RDMA resources (same interface name = same PCI across nodes):")
         for entry in config_list:
@@ -274,132 +253,9 @@ data:
         print(f"Error: {result.stderr}")
         sys.exit(1)
 
-
-    # Generate NetworkAttachmentDefinitions for IPoIB
-    print("\n=== Generating NetworkAttachmentDefinitions ===")
-
-    if subnet_mode == 'shared':
-        # One global network for all NICs
-        print(f"\nSubnet Mode: SHARED - Creating 1 global network for all {len(config_list)} NICs")
-
-        ip_range = f"{ip_range_base}.100.0/24"
-        route_dest = route_dest_base
-
-        nad_spec = {
-            "apiVersion": "k8s.cni.cncf.io/v1",
-            "kind": "NetworkAttachmentDefinition",
-            "metadata": {
-                "name": "rdma-ib-shared",
-                "namespace": network_namespace,
-                "annotations": {
-                    "description": "Shared IPoIB network for all RDMA NICs"
-                }
-            },
-            "spec": {
-                "config": json.dumps({
-                    "cniVersion": "0.4.0",
-                    "type": "ipoib",
-                    "name": "rdma-ib-shared",
-                    "ipam": {
-                        "type": "whereabouts",
-                        "range": ip_range,
-                        "routes": [{
-                            "dst": route_dest
-                        }]
-                    }
-                })
-            }
-        }
-
-        cmd = ["oc", "apply", "-f", "-"]
-        nad_json = json.dumps(nad_spec)
-        result = subprocess.run(cmd, input=nad_json, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-
-        if result.returncode == 0:
-            print(f"  ✓ Created NetworkAttachmentDefinition: rdma-ib-shared")
-            print(f"    IP Range: {ip_range}")
-            print(f"    Route: {route_dest}")
-            print(f"    All {len(config_list)} NICs share this subnet")
-        else:
-            print(f"  ✗ Failed to create NetworkAttachmentDefinition")
-            print(f"  Error: {result.stderr}")
-
-    else:
-        # Separate network per NIC interface
-        print(f"\nSubnet Mode: SEPARATE - Creating {len(config_list)} networks (one per unique interface)")
-
-        for entry in config_list:
-            resource_name = entry['resourceName']
-
-            # Extract NIC number from resource name (rdma_shared_nic3 -> 3)
-            if 'nic' in resource_name:
-                nic_number = resource_name.split('nic')[-1]
-                try:
-                    nic_index = int(nic_number)
-                except ValueError:
-                    nic_index = 0
-            else:
-                nic_index = 0
-
-            network_name = f"rdma-nic{nic_number}"
-            interface_name = entry['selectors']['ifNames'][0]  # ib_nicX
-
-            # Calculate IP range and route destination based on NIC number
-            subnet_third_octet = 101 + nic_index
-            ip_range = f"{ip_range_base}.{subnet_third_octet}.0/24"
-
-            route_base_parts = route_dest_base.split('/')
-            route_ip_parts = route_base_parts[0].split('.')
-            route_third_octet = int(route_ip_parts[2]) + nic_index
-            route_dest = f"{route_ip_parts[0]}.{route_ip_parts[1]}.{route_third_octet}.0/{route_base_parts[1]}"
-
-            nad_spec = {
-                "apiVersion": "k8s.cni.cncf.io/v1",
-                "kind": "NetworkAttachmentDefinition",
-                "metadata": {
-                    "name": network_name,
-                    "namespace": network_namespace,
-                    "annotations": {
-                        "k8s.v1.cni.cncf.io/resourceName": f"rdma/{resource_name}",
-                        "description": f"IPoIB network for {interface_name}"
-                    }
-                },
-                "spec": {
-                    "config": json.dumps({
-                        "cniVersion": "0.4.0",
-                        "type": "ipoib",
-                        "name": network_name,
-                        "master": interface_name,
-                        "ipam": {
-                            "type": "whereabouts",
-                            "range": ip_range,
-                            "routes": [{
-                                "dst": route_dest
-                            }]
-                        }
-                    })
-                }
-            }
-
-            cmd = ["oc", "apply", "-f", "-"]
-            nad_json = json.dumps(nad_spec)
-            result = subprocess.run(cmd, input=nad_json, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-
-            if result.returncode == 0:
-                print(f"  ✓ Created NetworkAttachmentDefinition: {network_name}")
-                print(f"    Interface: {interface_name}")
-                print(f"    Resource: rdma/{resource_name}")
-                print(f"    IP Range: {ip_range}")
-                print(f"    Route: {route_dest}")
-            else:
-                print(f"  ✗ Failed to create NetworkAttachmentDefinition: {network_name}")
-                print(f"  Error: {result.stderr}")
-
     print(f"\n=== RDMA Configuration Complete ===")
     print(f"Total RDMA resources: {len(config_list)}")
-    print(f"NetworkAttachmentDefinitions: {'1 (shared)' if subnet_mode == 'shared' else len(config_list)}")
-    print(f"Total RDMA resources: {len(config_list)}")
-    print(f"NetworkAttachmentDefinitions: {'1 (shared)' if subnet_mode == 'shared' else len(config_list)}")
+    print(f"Pure RDMA mode: Using direct device access (no IPoIB networking)")
 ---
 apiVersion: batch/v1
 kind: Job
@@ -468,17 +324,6 @@ spec:
 
               # Run the generator script
               python3 /scripts/generate-rdma-config.py
-          env:
-            - name: MTU
-              value: "9000"
-            - name: IP_RANGE_BASE
-              value: "10.0"
-            - name: NETWORK_NAMESPACE
-              value: "default"
-            - name: ROUTE_DEST
-              value: "192.168.75.0/24"
-            - name: SUBNET_MODE
-              value: "separate"  # "separate" (one network per NIC) or "shared" (one network for all NICs)
           volumeMounts:
             - name: script
               mountPath: /scripts
