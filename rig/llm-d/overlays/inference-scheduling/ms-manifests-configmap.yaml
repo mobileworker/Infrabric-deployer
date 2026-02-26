@@ -1,0 +1,251 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ms-inference-scheduling-manifests
+  namespace: llm-d
+  labels:
+    app: llm-d
+    component: inference-scheduling
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+    description: "Model server Kubernetes manifests - Inference Scheduling"
+data:
+  vllm-lws.yaml: |
+    apiVersion: leaderworkerset.x-k8s.io/v1
+    kind: LeaderWorkerSet
+    metadata:
+      name: inference-scheduling
+      namespace: llm-d
+      labels:
+        app: llm-d
+        component: inference-scheduling
+        llm-d.ai/inference-serving: "true"
+        llm-d.ai/guide: inference-scheduling
+      annotations:
+        argocd.argoproj.io/sync-wave: "25"
+    spec:
+      replicas: 8  # PLACEHOLDER: Will be patched dynamically
+      leaderWorkerTemplate:
+        size: 1  # Single pod per group (no workers needed)
+        leaderTemplate:
+          metadata:
+            labels:
+              llm-d.ai/inference-serving: "true"
+              llm-d.ai/guide: inference-scheduling
+              llm-d.ai/accelerator-variant: "gpu"
+              llm-d.ai/accelerator-vendor: "nvidia"
+              llm-d.ai/model: Qwen3-32B
+            annotations:
+              inference.lanl.gov/model-name: Qwen/Qwen3-32B
+          spec:
+            serviceAccountName: llm-d-modelserver
+            volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 20Gi
+              - name: hf-cache
+                emptyDir: {}
+              - name: jit-cache
+                emptyDir: {}
+              - name: rdma-script
+                configMap:
+                  name: ib-hca-discovery-script
+                  defaultMode: 0755
+              - name: dev-infiniband
+                hostPath:
+                  path: /dev/infiniband
+            containers:
+              - name: vllm
+                image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+                securityContext:
+                  capabilities:
+                    add:
+                      - IPC_LOCK
+                      - SYS_RAWIO
+                      - SYS_RESOURCE
+                  runAsGroup: 0
+                  runAsUser: 0
+                imagePullPolicy: Always
+                command:
+                  - /bin/bash
+                  - -c
+                args:
+                  - |
+                    ulimit -l unlimited || true
+
+                    # Source RDMA discovery script if available
+                    if [ -f /scripts/discover_ib_hca.sh ]; then
+                      source /scripts/discover_ib_hca.sh
+                      echo "--- Loaded RDMA environment ---"
+                    fi
+
+                    echo "--- Launching vLLM (Inference Scheduling) ---"
+                    echo "Model: Qwen/Qwen3-32B"
+                    echo "Tensor Parallel Size: ${TP_SIZE}"
+                    echo "NCCL_IB_HCA: ${NCCL_IB_HCA}"
+
+                    vllm serve Qwen/Qwen3-32B \
+                      --port 8000 \
+                      --tensor-parallel-size ${TP_SIZE} \
+                      --disable-uvicorn-access-log \
+                      --gpu-memory-utilization 0.95 \
+                      --max-model-len 8192 \
+                      --trust-remote-code || sleep infinity
+
+                env:
+                  - name: TP_SIZE
+                    value: "2"  # PLACEHOLDER: Will be patched dynamically
+                  - name: NCCL_IB_HCA
+                    value: "mlx"
+                  - name: NCCL_SOCKET_IFNAME
+                    value: "eth0"
+                  - name: GLOO_SOCKET_IFNAME
+                    value: "eth0"
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: llm-d-hf-token
+                        key: HF_TOKEN
+                        optional: true
+                  - name: VLLM_SKIP_P2P_CHECK
+                    value: "1"
+                  - name: NVIDIA_GDRCOPY
+                    value: "enabled"
+
+                ports:
+                  - containerPort: 8000
+                    name: http
+
+                resources:
+                  limits:
+                    cpu: "32"
+                    memory: "128Gi"
+                    nvidia.com/gpu: "2"  # PLACEHOLDER: Will be patched dynamically
+                  requests:
+                    cpu: "16"
+                    memory: "64Gi"
+                    nvidia.com/gpu: "2"  # PLACEHOLDER: Will be patched dynamically
+
+                volumeMounts:
+                  - name: dshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                  - name: jit-cache
+                    mountPath: /root/.triton
+                  - name: rdma-script
+                    mountPath: /scripts
+                  - name: dev-infiniband
+                    mountPath: /dev/infiniband
+        workerTemplate:
+          metadata:
+            labels:
+              llm-d.ai/inference-serving: "true"
+              llm-d.ai/guide: inference-scheduling
+              llm-d.ai/accelerator-variant: "gpu"
+              llm-d.ai/accelerator-vendor: "nvidia"
+              llm-d.ai/model: Qwen3-32B
+            annotations:
+              inference.lanl.gov/model-name: Qwen/Qwen3-32B
+          spec:
+            serviceAccountName: llm-d-modelserver
+            volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 20Gi
+              - name: hf-cache
+                emptyDir: {}
+              - name: jit-cache
+                emptyDir: {}
+              - name: rdma-script
+                configMap:
+                  name: ib-hca-discovery-script
+                  defaultMode: 0755
+              - name: dev-infiniband
+                hostPath:
+                  path: /dev/infiniband
+            containers:
+              - name: vllm
+                image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+                securityContext:
+                  capabilities:
+                    add:
+                      - IPC_LOCK
+                      - SYS_RAWIO
+                      - SYS_RESOURCE
+                  runAsGroup: 0
+                  runAsUser: 0
+                imagePullPolicy: Always
+                command:
+                  - /bin/bash
+                  - -c
+                args:
+                  - |
+                    ulimit -l unlimited || true
+
+                    # Source RDMA discovery script if available
+                    if [ -f /scripts/discover_ib_hca.sh ]; then
+                      source /scripts/discover_ib_hca.sh
+                      echo "--- Loaded RDMA environment ---"
+                    fi
+
+                    echo "--- Launching vLLM (Inference Scheduling) ---"
+                    echo "Model: Qwen/Qwen3-32B"
+                    echo "Tensor Parallel Size: ${TP_SIZE}"
+                    echo "NCCL_IB_HCA: ${NCCL_IB_HCA}"
+
+                    vllm serve Qwen/Qwen3-32B \
+                      --port 8000 \
+                      --tensor-parallel-size ${TP_SIZE} \
+                      --disable-uvicorn-access-log \
+                      --gpu-memory-utilization 0.95 \
+                      --max-model-len 8192 \
+                      --trust-remote-code || sleep infinity
+
+                env:
+                  - name: TP_SIZE
+                    value: "2"  # PLACEHOLDER: Will be patched dynamically
+                  - name: NCCL_IB_HCA
+                    value: "mlx"
+                  - name: NCCL_SOCKET_IFNAME
+                    value: "eth0"
+                  - name: GLOO_SOCKET_IFNAME
+                    value: "eth0"
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: llm-d-hf-token
+                        key: HF_TOKEN
+                        optional: true
+                  - name: VLLM_SKIP_P2P_CHECK
+                    value: "1"
+                  - name: NVIDIA_GDRCOPY
+                    value: "enabled"
+
+                ports:
+                  - containerPort: 8000
+                    name: http
+
+                resources:
+                  limits:
+                    cpu: "32"
+                    memory: "128Gi"
+                    nvidia.com/gpu: "2"  # PLACEHOLDER: Will be patched dynamically
+                  requests:
+                    cpu: "16"
+                    memory: "64Gi"
+                    nvidia.com/gpu: "2"  # PLACEHOLDER: Will be patched dynamically
+
+                volumeMounts:
+                  - name: dshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                  - name: jit-cache
+                    mountPath: /root/.triton
+                  - name: rdma-script
+                    mountPath: /scripts
+                  - name: dev-infiniband
+                    mountPath: /dev/infiniband

@@ -1,0 +1,544 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ms-pd-manifests
+  namespace: llm-d
+  labels:
+    app: llm-d
+    component: pd-disaggregation
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+    description: "Model server Kubernetes manifests - Single-node P/D disaggregation"
+data:
+  pd-lws.yaml: |
+    ---
+    apiVersion: leaderworkerset.x-k8s.io/v1
+    kind: LeaderWorkerSet
+    metadata:
+      name: pd-prefill
+      namespace: llm-d
+      labels:
+        app: llm-d
+        component: pd-disaggregation
+        llm-d.ai/role: prefill
+    spec:
+      replicas: 1
+      leaderWorkerTemplate:
+        size: 1  # Single pod (no workers needed)
+        leaderTemplate:
+          metadata:
+            labels:
+              llm-d.ai/inference-serving: "true"
+              llm-d.ai/role: prefill
+              llm-d.ai/guide: pd-disaggregation
+            annotations:
+              inference.lanl.gov/model-name: RedHatAI/Meta-Llama-3.1-8B-FP8
+          spec:
+            serviceAccountName: llm-d-modelserver
+            # No affinity - prefill schedules first, decode follows
+            volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 256Gi
+              - name: hf-cache
+                emptyDir: {}
+              - name: rdma-script
+                configMap:
+                  name: ib-hca-discovery-script
+                  defaultMode: 0755
+              - name: dev-infiniband
+                hostPath:
+                  path: /dev/infiniband
+            containers:
+              - name: vllm
+                image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+                command:
+                  - /bin/bash
+                  - -c
+                args:
+                  - |
+                    ulimit -l unlimited || true
+
+                    # Source RDMA discovery script if available
+                    if [ -f /scripts/discover_ib_hca.sh ]; then
+                      source /scripts/discover_ib_hca.sh
+                      echo "--- Loaded RDMA environment ---"
+                    fi
+
+                    echo "--- Launching vLLM Prefill (Single-Node P/D) ---"
+                    echo "NCCL_IB_HCA: ${NCCL_IB_HCA}"
+                    echo "Tensor Parallel Size: ${TP_SIZE}"
+
+                    vllm serve RedHatAI/Meta-Llama-3.1-8B-FP8 \
+                      --port 8000 \
+                      --tensor-parallel-size ${TP_SIZE} \
+                      --block-size 128 \
+                      --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}' \
+                      --disable-log-requests \
+                      --disable-uvicorn-access-log \
+                      --max-model-len 8192 \
+                      --trust-remote-code || sleep infinity
+                env:
+                  - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: status.podIP
+                  - name: NCCL_IB_HCA
+                    value: "mlx"
+                  - name: NCCL_SOCKET_IFNAME
+                    value: "eth0"
+                  - name: GLOO_SOCKET_IFNAME
+                    value: "eth0"
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: llm-d-hf-token
+                        key: HF_TOKEN
+                        optional: true
+                  - name: VLLM_SKIP_P2P_CHECK
+                    value: "1"
+                  - name: NVIDIA_GDRCOPY
+                    value: "enabled"
+                  - name: VLLM_LOGGING_LEVEL
+                    value: "INFO"
+                  - name: NCCL_DEBUG
+                    value: "INFO"
+                  - name: VLLM_NIXL_ABORT_REQUEST_TIMEOUT
+                    value: "600"
+                  - name: SHARED_STORAGE_PATH
+                    value: "/data"
+                  - name: DP_SIZE
+                    value: "1"
+                  - name: TP_SIZE
+                    value: "4"
+                ports:
+                  - containerPort: 8000
+                    name: http
+                  - containerPort: 5555
+                    name: rpc
+                securityContext:
+                  runAsUser: 0
+                  privileged: true
+                  capabilities:
+                    add:
+                      - "IPC_LOCK"
+                      - "SYS_RAWIO"
+                      - "SYS_RESOURCE"
+                resources:
+                  limits:
+                    cpu: "32"
+                    memory: "256Gi"
+                    nvidia.com/gpu: "4"
+                  requests:
+                    cpu: "16"
+                    memory: "128Gi"
+                    nvidia.com/gpu: "4"
+
+                volumeMounts:
+                  - name: dshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                  - name: rdma-script
+                    mountPath: /scripts
+                  - name: dev-infiniband
+                    mountPath: /dev/infiniband
+        workerTemplate:
+          metadata:
+            labels:
+              llm-d.ai/inference-serving: "true"
+              llm-d.ai/role: prefill
+              llm-d.ai/guide: pd-disaggregation
+            annotations:
+              inference.lanl.gov/model-name: RedHatAI/Meta-Llama-3.1-8B-FP8
+          spec:
+            serviceAccountName: llm-d-modelserver
+            # No affinity - prefill schedules first, decode follows
+            volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 256Gi
+              - name: hf-cache
+                emptyDir: {}
+              - name: rdma-script
+                configMap:
+                  name: ib-hca-discovery-script
+                  defaultMode: 0755
+              - name: dev-infiniband
+                hostPath:
+                  path: /dev/infiniband
+            containers:
+              - name: vllm
+                image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+                command:
+                  - /bin/bash
+                  - -c
+                args:
+                  - |
+                    ulimit -l unlimited || true
+
+                    # Source RDMA discovery script if available
+                    if [ -f /scripts/discover_ib_hca.sh ]; then
+                      source /scripts/discover_ib_hca.sh
+                      echo "--- Loaded RDMA environment ---"
+                    fi
+
+                    echo "--- Launching vLLM Prefill (Single-Node P/D) ---"
+                    echo "NCCL_IB_HCA: ${NCCL_IB_HCA}"
+                    echo "Tensor Parallel Size: ${TP_SIZE}"
+
+                    vllm serve RedHatAI/Meta-Llama-3.1-8B-FP8 \
+                      --port 8000 \
+                      --tensor-parallel-size ${TP_SIZE} \
+                      --block-size 128 \
+                      --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}' \
+                      --disable-log-requests \
+                      --disable-uvicorn-access-log \
+                      --max-model-len 8192 \
+                      --trust-remote-code || sleep infinity
+                env:
+                  - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: status.podIP
+                  - name: NCCL_IB_HCA
+                    value: "mlx"
+                  - name: NCCL_SOCKET_IFNAME
+                    value: "eth0"
+                  - name: GLOO_SOCKET_IFNAME
+                    value: "eth0"
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: llm-d-hf-token
+                        key: HF_TOKEN
+                        optional: true
+                  - name: VLLM_SKIP_P2P_CHECK
+                    value: "1"
+                  - name: NVIDIA_GDRCOPY
+                    value: "enabled"
+                  - name: VLLM_LOGGING_LEVEL
+                    value: "INFO"
+                  - name: NCCL_DEBUG
+                    value: "INFO"
+                  - name: VLLM_NIXL_ABORT_REQUEST_TIMEOUT
+                    value: "600"
+                  - name: SHARED_STORAGE_PATH
+                    value: "/data"
+                  - name: DP_SIZE
+                    value: "1"
+                  - name: TP_SIZE
+                    value: "4"
+                ports:
+                  - containerPort: 8000
+                    name: http
+                  - containerPort: 5555
+                    name: rpc
+                securityContext:
+                  runAsUser: 0
+                  privileged: true
+                  capabilities:
+                    add:
+                      - "IPC_LOCK"
+                      - "SYS_RAWIO"
+                      - "SYS_RESOURCE"
+                resources:
+                  limits:
+                    cpu: "32"
+                    memory: "256Gi"
+                    nvidia.com/gpu: "4"
+                  requests:
+                    cpu: "16"
+                    memory: "128Gi"
+                    nvidia.com/gpu: "4"
+
+                volumeMounts:
+                  - name: dshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                  - name: rdma-script
+                    mountPath: /scripts
+                  - name: dev-infiniband
+                    mountPath: /dev/infiniband
+    ---
+    apiVersion: leaderworkerset.x-k8s.io/v1
+    kind: LeaderWorkerSet
+    metadata:
+      name: pd-decode
+      namespace: llm-d
+      labels:
+        app: llm-d
+        component: pd-disaggregation
+        llm-d.ai/role: decode
+    spec:
+      replicas: 1
+      leaderWorkerTemplate:
+        size: 1  # Single pod (no workers needed)
+        leaderTemplate:
+          metadata:
+            labels:
+              llm-d.ai/inference-serving: "true"
+              llm-d.ai/role: decode
+              llm-d.ai/guide: pd-disaggregation
+            annotations:
+              inference.lanl.gov/model-name: RedHatAI/Meta-Llama-3.1-8B-FP8
+          spec:
+            serviceAccountName: llm-d-modelserver
+            # Affinity: Ensure decode and prefill are on SAME node
+            affinity:
+              podAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchExpressions:
+                    - key: llm-d.ai/inference-serving
+                      operator: In
+                      values:
+                      - "true"
+                    - key: llm-d.ai/role
+                      operator: In
+                      values:
+                      - prefill
+                  topologyKey: kubernetes.io/hostname
+            volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 256Gi
+              - name: hf-cache
+                emptyDir: {}
+              - name: rdma-script
+                configMap:
+                  name: ib-hca-discovery-script
+                  defaultMode: 0755
+              - name: dev-infiniband
+                hostPath:
+                  path: /dev/infiniband
+            containers:
+              - name: vllm
+                image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+                command:
+                  - /bin/bash
+                  - -c
+                args:
+                  - |
+                    ulimit -l unlimited || true
+
+                    # Source RDMA discovery script if available
+                    if [ -f /scripts/discover_ib_hca.sh ]; then
+                      source /scripts/discover_ib_hca.sh
+                      echo "--- Loaded RDMA environment ---"
+                    fi
+
+                    echo "--- Launching vLLM Decode (Single-Node P/D) ---"
+                    echo "NCCL_IB_HCA: ${NCCL_IB_HCA}"
+                    echo "Tensor Parallel Size: ${TP_SIZE}"
+
+                    vllm serve RedHatAI/Meta-Llama-3.1-8B-FP8 \
+                      --port 8000 \
+                      --tensor-parallel-size ${TP_SIZE} \
+                      --block-size 128 \
+                      --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}' \
+                      --disable-log-requests \
+                      --disable-uvicorn-access-log \
+                      --max-model-len 8192 \
+                      --trust-remote-code || sleep infinity
+                env:
+                  - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: status.podIP
+                  - name: NCCL_IB_HCA
+                    value: "mlx"
+                  - name: NCCL_SOCKET_IFNAME
+                    value: "eth0"
+                  - name: GLOO_SOCKET_IFNAME
+                    value: "eth0"
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: llm-d-hf-token
+                        key: HF_TOKEN
+                        optional: true
+                  - name: VLLM_SKIP_P2P_CHECK
+                    value: "1"
+                  - name: NVIDIA_GDRCOPY
+                    value: "enabled"
+                  - name: VLLM_LOGGING_LEVEL
+                    value: "INFO"
+                  - name: NCCL_DEBUG
+                    value: "INFO"
+                  - name: VLLM_NIXL_ABORT_REQUEST_TIMEOUT
+                    value: "600"
+                  - name: SHARED_STORAGE_PATH
+                    value: "/data"
+                  - name: DP_SIZE
+                    value: "1"
+                  - name: TP_SIZE
+                    value: "4"
+                ports:
+                  - containerPort: 8000
+                    name: http
+                  - containerPort: 5555
+                    name: rpc
+                securityContext:
+                  runAsUser: 0
+                  privileged: true
+                  capabilities:
+                    add:
+                      - "IPC_LOCK"
+                      - "SYS_RAWIO"
+                      - "SYS_RESOURCE"
+                resources:
+                  limits:
+                    cpu: "32"
+                    memory: "256Gi"
+                    nvidia.com/gpu: "4"
+                  requests:
+                    cpu: "16"
+                    memory: "128Gi"
+                    nvidia.com/gpu: "4"
+
+                volumeMounts:
+                  - name: dshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                  - name: rdma-script
+                    mountPath: /scripts
+                  - name: dev-infiniband
+                    mountPath: /dev/infiniband
+        workerTemplate:
+          metadata:
+            labels:
+              llm-d.ai/inference-serving: "true"
+              llm-d.ai/role: decode
+              llm-d.ai/guide: pd-disaggregation
+            annotations:
+              inference.lanl.gov/model-name: RedHatAI/Meta-Llama-3.1-8B-FP8
+          spec:
+            serviceAccountName: llm-d-modelserver
+            affinity:
+              podAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchExpressions:
+                    - key: llm-d.ai/inference-serving
+                      operator: In
+                      values:
+                      - "true"
+                    - key: llm-d.ai/role
+                      operator: In
+                      values:
+                      - prefill
+                  topologyKey: kubernetes.io/hostname
+            volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 256Gi
+              - name: hf-cache
+                emptyDir: {}
+              - name: rdma-script
+                configMap:
+                  name: ib-hca-discovery-script
+                  defaultMode: 0755
+              - name: dev-infiniband
+                hostPath:
+                  path: /dev/infiniband
+            containers:
+              - name: vllm
+                image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+                command:
+                  - /bin/bash
+                  - -c
+                args:
+                  - |
+                    ulimit -l unlimited || true
+
+                    # Source RDMA discovery script if available
+                    if [ -f /scripts/discover_ib_hca.sh ]; then
+                      source /scripts/discover_ib_hca.sh
+                      echo "--- Loaded RDMA environment ---"
+                    fi
+
+                    echo "--- Launching vLLM Decode (Single-Node P/D) ---"
+                    echo "NCCL_IB_HCA: ${NCCL_IB_HCA}"
+                    echo "Tensor Parallel Size: ${TP_SIZE}"
+
+                    vllm serve RedHatAI/Meta-Llama-3.1-8B-FP8 \
+                      --port 8000 \
+                      --tensor-parallel-size ${TP_SIZE} \
+                      --block-size 128 \
+                      --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}' \
+                      --disable-log-requests \
+                      --disable-uvicorn-access-log \
+                      --max-model-len 8192 \
+                      --trust-remote-code || sleep infinity
+                env:
+                  - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: status.podIP
+                  - name: NCCL_IB_HCA
+                    value: "mlx"
+                  - name: NCCL_SOCKET_IFNAME
+                    value: "eth0"
+                  - name: GLOO_SOCKET_IFNAME
+                    value: "eth0"
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: llm-d-hf-token
+                        key: HF_TOKEN
+                        optional: true
+                  - name: VLLM_SKIP_P2P_CHECK
+                    value: "1"
+                  - name: NVIDIA_GDRCOPY
+                    value: "enabled"
+                  - name: VLLM_LOGGING_LEVEL
+                    value: "INFO"
+                  - name: NCCL_DEBUG
+                    value: "INFO"
+                  - name: VLLM_NIXL_ABORT_REQUEST_TIMEOUT
+                    value: "600"
+                  - name: SHARED_STORAGE_PATH
+                    value: "/data"
+                  - name: DP_SIZE
+                    value: "1"
+                  - name: TP_SIZE
+                    value: "4"
+                ports:
+                  - containerPort: 8000
+                    name: http
+                  - containerPort: 5555
+                    name: rpc
+                securityContext:
+                  runAsUser: 0
+                  privileged: true
+                  capabilities:
+                    add:
+                      - "IPC_LOCK"
+                      - "SYS_RAWIO"
+                      - "SYS_RESOURCE"
+                resources:
+                  limits:
+                    cpu: "32"
+                    memory: "256Gi"
+                    nvidia.com/gpu: "4"
+                  requests:
+                    cpu: "16"
+                    memory: "128Gi"
+                    nvidia.com/gpu: "4"
+
+                volumeMounts:
+                  - name: dshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                  - name: rdma-script
+                    mountPath: /scripts
+                  - name: dev-infiniband
+                    mountPath: /dev/infiniband

@@ -1,0 +1,133 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gaie-pd-values
+  namespace: llm-d
+  labels:
+    app: llm-d
+    component: pd-disaggregation-multinode
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+data:
+  gateway.yaml: |
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: infra-pd-inference-gateway
+      namespace: llm-d
+      labels:
+        app: llm-d
+        component: pd-disaggregation
+    data:
+      deployment: |
+        spec:
+          template:
+            spec:
+              containers:
+              - name: istio-proxy
+                resources:
+                  limits:
+                    cpu: "2"
+                    memory: 1Gi
+                  requests:
+                    cpu: 100m
+                    memory: 128Mi
+      service: |
+        spec:
+          type: "ClusterIP"
+    ---
+    apiVersion: gateway.networking.k8s.io/v1
+    kind: Gateway
+    metadata:
+      name: infra-pd-inference-gateway
+      namespace: llm-d
+      labels:
+        app: llm-d
+        component: pd-disaggregation
+        istio.io/enable-inference-extproc: "true"
+    spec:
+      gatewayClassName: "istio"
+      listeners:
+        - port: 80
+          protocol: HTTP
+          name: default
+          allowedRoutes:
+            namespaces:
+              from: All
+      infrastructure:
+        parametersRef:
+          name: infra-pd-inference-gateway
+          group: ""
+          kind: ConfigMap
+    ---
+    apiVersion: telemetry.istio.io/v1
+    kind: Telemetry
+    metadata:
+      name: infra-pd-inference-gateway-telemetry
+      namespace: llm-d
+    spec:
+      targetRefs:
+      - group: gateway.networking.k8s.io
+        kind: Gateway
+        name: infra-pd-inference-gateway
+      accessLogging:
+      - providers:
+        - name: envoy
+
+  values.yaml: |
+    inferenceExtension:
+      replicas: 1
+      flags:
+        # in vLLM 10.0+, the metric is renamed while upstream GAIE is still using the old name as default.
+        # See https://github.com/kubernetes-sigs/gateway-api-inference-extension/pull/1905.
+        kv-cache-usage-percentage-metric: "vllm:kv_cache_usage_perc"
+      image:
+        name: llm-d-inference-scheduler
+        hub: ghcr.io/llm-d
+        tag: v0.4.0
+        pullPolicy: Always
+      extProcPort: 9002
+      pluginsConfigFile: "pd-config.yaml"
+      pluginsCustomConfig:
+        pd-config.yaml: |
+          # ALWAYS DO PD IN THIS EXAMPLE (THRESHOLD 0)
+          apiVersion: inference.networking.x-k8s.io/v1alpha1
+          kind: EndpointPickerConfig
+          plugins:
+          - type: prefill-header-handler
+          - type: prefill-filter
+          - type: decode-filter
+          - type: queue-scorer
+          - type: pd-profile-handler
+            parameters:
+              threshold: 0
+              hashBlockSize: 5
+          schedulingProfiles:
+          - name: prefill
+            plugins:
+            - pluginRef: prefill-filter
+            - pluginRef: queue-scorer
+              weight: 1.0
+          - name: decode
+            plugins:
+            - pluginRef: decode-filter
+            - pluginRef: queue-scorer
+              weight: 1.0
+
+      # Monitoring configuration for EPP
+      monitoring:
+        interval: "10s"
+        secret:
+          name: inference-gateway-sa-metrics-reader-secret
+        prometheus:
+          enabled: true
+          auth:
+            enabled: true
+
+    inferencePool:
+      targetPorts:
+        - number: 8000
+      modelServerType: vllm
+      modelServers:
+        matchLabels:
+          llm-d.ai/inference-serving: "true"

@@ -1,0 +1,85 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wait-for-gateway-ready
+  namespace: llm-d
+  labels:
+    app: gateway-waiter
+    component: gateway-provider
+  annotations:
+    argocd.argoproj.io/sync-wave: "18"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 10
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: gateway-waiter
+    spec:
+      serviceAccountName: llm-d-client
+      restartPolicy: OnFailure
+      containers:
+        - name: wait-gateway
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "========================================="
+              echo "Waiting for Gateway Infrastructure"
+              echo "========================================="
+
+              # Install kubectl
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              # Wait for istiod
+              echo "⏳ Waiting for istiod pod..."
+              kubectl wait --for=condition=ready pod -l app=istiod -n istio-system --timeout=600s
+
+              # Wait for GatewayClass
+              echo "⏳ Waiting for GatewayClass 'istio'..."
+              until kubectl get gatewayclass istio &>/dev/null; do
+                echo "   Waiting for GatewayClass..."
+                sleep 5
+              done
+
+              # Check if GatewayClass is accepted
+              until [ "$(kubectl get gatewayclass istio -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}')" == "True" ]; do
+                echo "   Waiting for GatewayClass to be Accepted..."
+                sleep 5
+              done
+
+              echo "✅ GatewayClass 'istio' is Accepted"
+
+              # Verify InferencePool CRD
+              echo "⏳ Verifying InferencePool CRD..."
+              kubectl get crd inferencepools.inference.networking.k8s.io
+
+              echo "✅ InferencePool CRD is available"
+
+              # Summary
+              echo ""
+              echo "========================================="
+              echo "✅ Gateway is Ready!"
+              echo "========================================="
+              echo ""
+              echo "Summary:"
+              echo "  Provider: istio"
+              kubectl get gatewayclass
+              echo ""
+              kubectl get crd | grep inference.networking.k8s.io
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

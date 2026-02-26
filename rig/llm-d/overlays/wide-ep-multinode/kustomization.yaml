@@ -1,0 +1,42 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Note: namespace field removed from overlay level to avoid transforming istio-system
+# All resources explicitly set their namespace in metadata
+
+# Wide-EP Multi-Node Deployment
+# Deploy DeepSeek-R1-0528 with Expert Parallelism across multiple GPU nodes
+# Usage: oc apply -k rig/llm-d/overlays/wide-ep-multinode
+
+resources:
+  # Wave -1: Namespace + RBAC + Resource Discovery
+  - ../../prereq/client-tools
+  - ../../prereq/resource-discovery
+
+  # Wave 5: Istio namespace
+  # Wave 10: Install Istio gateway
+  # Wave 15: Install InferencePool controller
+  # Wave 18: Wait for gateway ready
+  - ../../prereq/istio-gateway
+  - ../../prereq/inferencepool-controller
+
+  # Wave 20: RDMA Configuration and Manifests
+  - rdma-script-configmap.yaml       # InfiniBand HCA discovery script
+  - gaie-values-configmap.yaml        # InferencePool configuration (Helm values)
+  - ms-manifests-configmap.yaml       # Model server LeaderWorkerSet manifests
+
+  # Wave 25: Deploy Wide-EP Multi-Node
+  - deploy-ep-job.yaml                # Deployment job
+
+  # Wave 30: HTTP Routing
+  - httproute.yaml                    # Routes inference requests to InferencePool
+
+# Labels - using 'labels' instead of 'commonLabels' to avoid adding to service selectors
+labels:
+  - pairs:
+      app.kubernetes.io/name: llm-d
+      app.kubernetes.io/component: wide-ep-multinode
+      deployment-type: wide-ep-multinode
+    includeSelectors: false
+
+# No patches needed - all configuration is in manifests

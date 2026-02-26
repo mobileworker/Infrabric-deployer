@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: llm-d
+
+resources:
+  - namespace.yaml
+  - gpu-scc.yaml
+  - serviceaccount.yaml
+  - modelserver-serviceaccount.yaml
+  - hf-token-secret.yaml  # HuggingFace token (empty by default, update for gated models)
+  - install-tools-configmap.yaml
+  - client-pod.yaml

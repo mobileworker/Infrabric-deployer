@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: istio-system
+  labels:
+    name: istio-system
+    app.kubernetes.io/name: istio
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"

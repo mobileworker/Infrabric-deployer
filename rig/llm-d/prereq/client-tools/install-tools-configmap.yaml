@@ -1,0 +1,85 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-d-install-tools
+  namespace: llm-d
+  labels:
+    app: llm-d-client
+data:
+  install-tools.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    # Component versions
+    HELM_VER="v3.19.0"
+    HELMDIFF_VERSION="v3.13.0"
+    HELMFILE_VERSION="1.2.1"
+
+    # Detect OS and ARCH
+    OS=$(uname | tr '[:upper:]' '[:lower:]')
+    ARCH=$(uname -m)
+    case "$ARCH" in
+      arm64|aarch64) ARCH="arm64" ;;
+      x86_64) ARCH="amd64" ;;
+      *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+    esac
+
+    INSTALL_DIR="/tools/bin"
+    mkdir -p "$INSTALL_DIR"
+
+    echo "Installing tools to $INSTALL_DIR..."
+
+    # Install yq
+    if [ ! -f "$INSTALL_DIR/yq" ]; then
+      echo "Installing yq..."
+      YQ_URL="https://github.com/mikefarah/yq/releases/latest/download/yq_${OS}_${ARCH}"
+      curl -sSL -o "$INSTALL_DIR/yq" "${YQ_URL}"
+      chmod +x "$INSTALL_DIR/yq"
+    fi
+
+    # Install kubectl (use oc as kubectl in OpenShift)
+    if [ ! -f "$INSTALL_DIR/kubectl" ] && [ ! -f "/usr/bin/oc" ]; then
+      echo "Installing kubectl..."
+      KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+      K8S_URL="https://dl.k8s.io/release/${KUBE_VERSION}/bin/${OS}/${ARCH}/kubectl"
+      curl -sSL -o "$INSTALL_DIR/kubectl" "${K8S_URL}"
+      chmod +x "$INSTALL_DIR/kubectl"
+    elif [ -f "/usr/bin/oc" ]; then
+      echo "Using oc as kubectl (OpenShift environment)"
+      ln -sf /usr/bin/oc "$INSTALL_DIR/kubectl"
+    fi
+
+    # Install helm
+    if [ ! -f "$INSTALL_DIR/helm" ]; then
+      echo "Installing helm..."
+      TARBALL="helm-${HELM_VER}-${OS}-${ARCH}.tar.gz"
+      HELM_URL="https://get.helm.sh/${TARBALL}"
+      TMP_DIR=$(mktemp -d)
+      curl -sSL "${HELM_URL}" | tar -xz -C "${TMP_DIR}"
+      mv "${TMP_DIR}/${OS}-${ARCH}/helm" "$INSTALL_DIR/helm"
+      chmod +x "$INSTALL_DIR/helm"
+      rm -rf "${TMP_DIR}"
+    fi
+
+    # Install helm diff plugin
+    export HELM_DATA_HOME="/tools/helm"
+    mkdir -p "$HELM_DATA_HOME"
+    if ! "$INSTALL_DIR/helm" plugin list | grep -q diff; then
+      echo "Installing helm-diff plugin..."
+      "$INSTALL_DIR/helm" plugin install --version "${HELMDIFF_VERSION}" https://github.com/databus23/helm-diff || true
+    fi
+
+    # Install helmfile
+    if [ ! -f "$INSTALL_DIR/helmfile" ]; then
+      echo "Installing helmfile..."
+      ARCHIVE="helmfile_${HELMFILE_VERSION}_${OS}_${ARCH}.tar.gz"
+      HELMFILE_URL="https://github.com/helmfile/helmfile/releases/download/v${HELMFILE_VERSION}/${ARCHIVE}"
+      TMP_DIR=$(mktemp -d)
+      curl -sSL "${HELMFILE_URL}" | tar -xz -C "${TMP_DIR}"
+      mv "${TMP_DIR}/helmfile" "$INSTALL_DIR/helmfile"
+      chmod +x "$INSTALL_DIR/helmfile"
+      rm -rf "${TMP_DIR}"
+    fi
+
+    echo "✅ All tools installed successfully to $INSTALL_DIR"
+    ls -lh "$INSTALL_DIR"

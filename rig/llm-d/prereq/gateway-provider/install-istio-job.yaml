@@ -1,0 +1,112 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: install-istio
+  namespace: llm-d
+  labels:
+    app: istio-installer
+    component: gateway-provider
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: istio-installer
+    spec:
+      serviceAccountName: llm-d-client
+      restartPolicy: OnFailure
+
+      containers:
+        - name: install-istio
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              # Install dependencies
+              echo "Installing dependencies..."
+              curl -sSL https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz | tar -xz
+              mv linux-amd64/helm /usr/local/bin/helm
+              chmod +x /usr/local/bin/helm
+
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
+              chmod +x /usr/local/bin/kubectl
+
+              echo "✅ Tools installed:"
+              helm version --short
+              kubectl version --client
+
+              # Istio version
+              ISTIO_VERSION="1.28.1"
+              ISTIO_HUB="docker.io/istio"
+
+              # Download Istio charts using IPv4
+              echo "📥 Downloading Istio charts v${ISTIO_VERSION}..."
+              mkdir -p /tmp/istio-charts
+              cd /tmp/istio-charts
+
+              curl -4 -sSLO "https://istio-release.storage.googleapis.com/charts/base-${ISTIO_VERSION}.tgz"
+              curl -4 -sSLO "https://istio-release.storage.googleapis.com/charts/istiod-${ISTIO_VERSION}.tgz"
+
+              echo "✅ Downloaded charts:"
+              ls -lh *.tgz
+
+              # Install Istio Base
+              echo ""
+              echo "📦 Installing Istio Base..."
+              helm upgrade --install istio-base ./base-${ISTIO_VERSION}.tgz \
+                --namespace istio-system \
+                --create-namespace \
+                --wait
+
+              # Install Istiod with Inference Extension support
+              echo ""
+              echo "📦 Installing Istiod with Gateway API Inference Extension support..."
+              helm upgrade --install istiod ./istiod-${ISTIO_VERSION}.tgz \
+                --namespace istio-system \
+                --set meshConfig.defaultConfig.proxyMetadata.ENABLE_GATEWAY_API_INFERENCE_EXTENSION=true \
+                --set pilot.env.ENABLE_GATEWAY_API_INFERENCE_EXTENSION=true \
+                --set tag=${ISTIO_VERSION} \
+                --set hub=${ISTIO_HUB} \
+                --wait \
+                --timeout 10m
+
+              # Verify installation
+              echo ""
+              echo "✅ Verifying Istio installation..."
+              echo "Helm releases:"
+              helm list -n istio-system
+
+              echo ""
+              echo "Istio pods:"
+              kubectl get pods -n istio-system
+
+              echo ""
+              echo "GatewayClasses:"
+              kubectl get gatewayclass
+
+              echo ""
+              echo "Verifying Inference Extension is enabled:"
+              kubectl get deployment istiod -n istio-system \
+                -o jsonpath='{.spec.template.spec.containers[0].env}' | \
+                grep -q "ENABLE_GATEWAY_API_INFERENCE_EXTENSION" && \
+                echo "✅ Inference Extension enabled" || \
+                echo "❌ Inference Extension not enabled"
+
+              echo ""
+              echo "✅ Istio installation complete!"
+
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi

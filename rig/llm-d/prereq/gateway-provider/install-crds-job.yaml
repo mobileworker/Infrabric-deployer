@@ -1,0 +1,73 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: install-gateway-crds
+  namespace: llm-d
+  labels:
+    app: gateway-crds-installer
+    component: prerequisites
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: gateway-crds-installer
+    spec:
+      serviceAccountName: llm-d-client
+      restartPolicy: OnFailure
+
+      containers:
+        - name: install-crds
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              # Install kubectl if not available
+              if ! command -v kubectl &> /dev/null; then
+                echo "Installing kubectl..."
+                KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+                curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/kubectl
+                chmod +x /tmp/kubectl
+                mv /tmp/kubectl /usr/local/bin/kubectl
+              fi
+
+              echo "✅ kubectl installed: $(kubectl version --client)"
+
+              # Gateway API CRDs
+              GATEWAY_API_VERSION="v1.4.0"
+              echo "📜 Installing Gateway API CRDs ${GATEWAY_API_VERSION}..."
+              kubectl apply -k "https://github.com/kubernetes-sigs/gateway-api/config/crd?ref=${GATEWAY_API_VERSION}" || {
+                echo "⚠️  Gateway API CRDs may already be managed by OpenShift (this is OK)"
+              }
+
+              # Gateway API Inference Extension CRDs
+              GATEWAY_INFERENCE_VERSION="v1.3.0"
+              echo "🚪 Installing Gateway API Inference Extension CRDs ${GATEWAY_INFERENCE_VERSION}..."
+              kubectl apply -k "https://github.com/kubernetes-sigs/gateway-api-inference-extension/config/crd?ref=${GATEWAY_INFERENCE_VERSION}"
+
+              # Verify installation
+              echo ""
+              echo "✅ Verifying CRD installation..."
+              echo "Gateway API CRDs:"
+              kubectl get crd | grep "gateway.networking.k8s.io" || echo "  (managed by OpenShift)"
+              echo ""
+              echo "Inference Extension CRDs:"
+              kubectl get crd | grep "inference.networking.k8s.io"
+
+              echo ""
+              echo "✅ Gateway CRDs installation complete!"
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

@@ -14,7 +14,7 @@ Automated deployment for baremetal OpenShift clusters with NVIDIA GPUs and RDMA/
 # Customize your environment
 vi rig/baremetal/infra-operators-values.yaml
 
-# Deploy
+# Deploy infrastructure
 oc apply -k rig/baremetal/bootstrap
 ```
 
@@ -26,6 +26,38 @@ oc apply -k rig/baremetal/bootstrap
 - Cluster cleanup utilities
 
 **Documentation:** See main [README.md](../README.md) and [rig/baremetal/bootstrap/README.md](baremetal/bootstrap/README.md)
+
+---
+
+### LLM-d (Distributed LLM Inference)
+**Status:** ✅ Production Ready
+
+Automated deployment of distributed LLM inference workloads on GPU clusters with RDMA support.
+
+**Quick Start:**
+```bash
+# Deploy P/D disaggregation (single-node)
+oc apply -k rig/llm-d/overlays/pd-disaggregation
+
+# Deploy P/D disaggregation (multi-node)
+oc apply -k rig/llm-d/overlays/pd-disaggregation-multinode
+
+# Deploy inference scheduling
+oc apply -k rig/llm-d/overlays/inference-scheduling
+
+# Deploy wide-EP for MoE models
+oc apply -k rig/llm-d/overlays/wide-ep-multinode
+```
+
+**Features:**
+- 4 deployment scenarios (inference scheduling, P/D disaggregation, wide-EP)
+- Configurable models - use any vLLM-compatible model
+- Gateway API integration with intelligent request routing
+- Dynamic GPU and RDMA resource discovery
+- Automated inference testing with guidellm
+- Single-command cleanup overlay
+
+**Documentation:** See [rig/llm-d/README.md](llm-d/README.md) and [rig/llm-d/QUICK-START.md](llm-d/QUICK-START.md)
 
 ---
 
@@ -57,7 +89,9 @@ To add a new deployment environment:
 
 ## Structure
 
-Each environment directory should contain:
+### Infrastructure Environments
+
+Each infrastructure environment directory contains:
 
 ```
 rig/<environment>/
@@ -68,6 +102,22 @@ rig/<environment>/
 ├── infra-operators-values.yaml # Operator configuration
 ├── kustomization.yaml        # Kustomize overlay
 └── namespace.yaml            # Namespace definition
+```
+
+### Workload Environments
+
+Workload deployments (like llm-d) contain:
+
+```
+rig/<workload>/
+├── prereq/                    # Prerequisites (client-tools, gateway-provider, etc.)
+├── overlays/                  # Deployment scenarios
+│   ├── <scenario-1>/          # Scenario-specific overlay
+│   ├── <scenario-2>/          # Another scenario
+│   ├── cleanup/               # Cleanup overlay
+│   └── inference-test/        # Testing overlay
+├── README.md                  # Main documentation
+└── QUICK-START.md            # Quick start guide
 ```
 
 ## Support

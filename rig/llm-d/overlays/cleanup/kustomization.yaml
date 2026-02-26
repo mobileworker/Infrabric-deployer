@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Cleanup overlay - removes all llm-d deployment resources
+# Usage: oc apply -k rig/llm-d/overlays/cleanup
+
+namespace: llm-d
+
+resources:
+  # Depends on llm-d namespace and RBAC (llm-d-client serviceaccount)
+  - ../../prereq/client-tools
+
+  # Cleanup job
+  - cleanup-job.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/name: llm-d
+      app.kubernetes.io/component: cleanup
+    includeSelectors: false

@@ -1,0 +1,167 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: llm-d-cleanup
+  namespace: llm-d
+  labels:
+    app: llm-d-cleanup
+  annotations:
+    argocd.argoproj.io/sync-wave: "100"
+    description: "Cleanup job to remove all llm-d deployment resources"
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: llm-d-cleanup
+    spec:
+      serviceAccountName: llm-d-client
+      restartPolicy: Never
+      containers:
+      - name: cleanup
+        image: registry.access.redhat.com/ubi9/ubi:latest
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            set -euo pipefail
+
+            echo "========================================="
+            echo "llm-d Cleanup Job"
+            echo "========================================="
+
+            # Install kubectl
+            echo "📦 Installing kubectl..."
+            mkdir -p /tmp/bin
+            export PATH="/tmp/bin:$PATH"
+
+            KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+            curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+            chmod +x /tmp/bin/kubectl
+
+            echo "✅ kubectl installed"
+            echo ""
+
+            # Function to safely delete resources
+            safe_delete() {
+              local resource_type=$1
+              local namespace=$2
+              local selector=${3:-}
+
+              if [ -n "$selector" ]; then
+                echo "🗑️  Deleting $resource_type with selector $selector in namespace $namespace..."
+                kubectl delete "$resource_type" -n "$namespace" --all $selector --ignore-not-found=true --timeout=60s || echo "⚠️  Some $resource_type may still be terminating"
+              else
+                echo "🗑️  Deleting all $resource_type in namespace $namespace..."
+                kubectl delete "$resource_type" -n "$namespace" --all --ignore-not-found=true --timeout=60s || echo "⚠️  Some $resource_type may still be terminating"
+              fi
+            }
+
+            echo "========================================="
+            echo "Step 1: Deleting HTTPRoutes"
+            echo "========================================="
+            safe_delete httproute llm-d
+
+            echo ""
+            echo "========================================="
+            echo "Step 2: Deleting InferencePools"
+            echo "========================================="
+            safe_delete inferencepool llm-d
+
+            echo ""
+            echo "========================================="
+            echo "Step 3: Deleting Gateways"
+            echo "========================================="
+            safe_delete gateway llm-d
+
+            echo ""
+            echo "========================================="
+            echo "Step 4: Deleting Deployments"
+            echo "========================================="
+            safe_delete deployment llm-d
+
+            echo ""
+            echo "========================================="
+            echo "Step 5: Deleting StatefulSets"
+            echo "========================================="
+            safe_delete statefulset llm-d
+
+            echo ""
+            echo "========================================="
+            echo "Step 6: Deleting LeaderWorkerSets"
+            echo "========================================="
+            safe_delete leaderworkerset llm-d
+
+            echo ""
+            echo "========================================="
+            echo "Step 7: Deleting Services"
+            echo "========================================="
+            safe_delete service llm-d
+
+            echo ""
+            echo "========================================="
+            echo "Step 8: Deleting ConfigMaps (excluding system)"
+            echo "========================================="
+            kubectl delete configmap -n llm-d --all --ignore-not-found=true || echo "⚠️  Some configmaps may be protected"
+
+            echo ""
+            echo "========================================="
+            echo "Step 9: Deleting Jobs (excluding this cleanup job)"
+            echo "========================================="
+            echo "🗑️  Deleting jobs (excluding llm-d-cleanup)..."
+            kubectl get jobs -n llm-d -o name | grep -v "llm-d-cleanup" | xargs -r kubectl delete -n llm-d --ignore-not-found=true || echo "⚠️  Some jobs may still be running"
+
+            echo ""
+            echo "========================================="
+            echo "Step 10: Deleting EnvoyFilters"
+            echo "========================================="
+            safe_delete envoyfilter llm-d
+
+            echo ""
+            echo "========================================="
+            echo "Step 11: Deleting DestinationRules"
+            echo "========================================="
+            safe_delete destinationrule llm-d
+
+            echo ""
+            echo "========================================="
+            echo "Step 12: Deleting llm-d-client pod"
+            echo "========================================="
+            echo "🗑️  Deleting llm-d-client pod (deployment role complete)..."
+            kubectl delete pod llm-d-client -n llm-d --ignore-not-found=true || echo "⚠️  llm-d-client pod may not exist"
+
+            echo ""
+            echo "========================================="
+            echo "Step 13: Force deleting remaining pods"
+            echo "========================================="
+            echo "🗑️  Force deleting any remaining pods (excluding cleanup job)..."
+            kubectl get pods -n llm-d -o name | grep -v "llm-d-cleanup" | xargs -r kubectl delete -n llm-d --force --grace-period=0 --ignore-not-found=true || echo "⚠️  Some pods may still be terminating"
+
+            echo ""
+            echo "========================================="
+            echo "Cleanup Summary"
+            echo "========================================="
+            echo "Remaining resources in llm-d namespace:"
+            kubectl get all -n llm-d || echo "No resources found"
+
+            echo ""
+            echo "Remaining custom resources:"
+            kubectl get gateway,httproute,inferencepool,envoyfilter,destinationrule -n llm-d 2>/dev/null || echo "No custom resources found"
+
+            echo ""
+            echo "✅ Cleanup completed!"
+            echo ""
+            echo "Note: This cleanup job will auto-delete after 10 minutes."
+            echo "To verify deployment, use the inference-test job:"
+            echo "  kubectl apply -k rig/llm-d/overlays/inference-test"
+            echo ""
+            echo "To remove everything including namespace, run:"
+            echo "  kubectl delete namespace llm-d"
+
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi

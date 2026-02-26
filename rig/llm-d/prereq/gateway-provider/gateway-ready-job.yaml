@@ -1,0 +1,156 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wait-for-gateway-ready
+  namespace: llm-d
+  labels:
+    app: gateway-readiness
+    component: gateway-provider
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 5
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: gateway-readiness
+    spec:
+      serviceAccountName: llm-d-client
+      restartPolicy: OnFailure
+
+      # Wait for gateway provider deployment to complete
+      initContainers:
+        - name: wait-for-gateway-deployment
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "Waiting for gateway provider deployment job to complete..."
+
+              # Install kubectl to local directory
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              # Wait for deploy-gateway-provider job to complete
+              kubectl wait --for=condition=complete job/deploy-gateway-provider -n llm-d --timeout=900s
+
+              echo "✅ Gateway provider deployment complete"
+
+      containers:
+        - name: wait-gateway-ready
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "========================================="
+              echo "Gateway Readiness Check"
+              echo "========================================="
+
+              # Install kubectl to local directory
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              echo "Gateway Provider: ${GATEWAY_PROVIDER}"
+
+              # Check based on gateway provider
+              case "${GATEWAY_PROVIDER}" in
+                "istio")
+                  echo "Waiting for Istio to be ready..."
+
+                  # Wait for istiod deployment
+                  echo "⏳ Waiting for istiod deployment..."
+                  kubectl wait --for=condition=available deployment/istiod \
+                    -n istio-system \
+                    --timeout=600s
+
+                  echo "⏳ Waiting for istiod pod..."
+                  kubectl wait --for=condition=ready pod \
+                    -l app=istiod \
+                    -n istio-system \
+                    --timeout=300s
+
+                  # Check GatewayClass
+                  echo "⏳ Waiting for GatewayClass 'istio'..."
+                  TIMEOUT=60
+                  ELAPSED=0
+                  while [ $ELAPSED -lt $TIMEOUT ]; do
+                    if kubectl get gatewayclass istio &>/dev/null; then
+                      if kubectl get gatewayclass istio -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}' | grep -q "True"; then
+                        echo "✅ GatewayClass 'istio' is Accepted"
+                        break
+                      fi
+                    fi
+                    echo "  Waiting for GatewayClass... ($ELAPSED/$TIMEOUT seconds)"
+                    sleep 5
+                    ELAPSED=$((ELAPSED + 5))
+                  done
+
+                  if [ $ELAPSED -ge $TIMEOUT ]; then
+                    echo "❌ Timeout waiting for GatewayClass"
+                    exit 1
+                  fi
+                  ;;
+
+                "kgateway")
+                  echo "⏳ Waiting for Kgateway..."
+                  # TODO: Add kgateway readiness checks
+                  echo "⚠️  Kgateway readiness check not yet implemented"
+                  ;;
+
+                "gke")
+                  echo "⏳ Checking GKE Gateway..."
+                  # Wait for GKE gateway class
+                  kubectl wait --for=condition=Accepted gatewayclass/gke-l7-global-external-managed --timeout=300s || \
+                  kubectl wait --for=condition=Accepted gatewayclass/gke-l7-rilb --timeout=300s
+                  ;;
+
+                *)
+                  echo "❌ Unknown gateway provider: ${GATEWAY_PROVIDER}"
+                  exit 1
+                  ;;
+              esac
+
+              # Verify InferencePool CRD exists
+              echo ""
+              echo "⏳ Verifying InferencePool CRD..."
+              if kubectl get crd inferencepools.inference.networking.k8s.io &>/dev/null; then
+                echo "✅ InferencePool CRD is available"
+              else
+                echo "❌ InferencePool CRD not found"
+                exit 1
+              fi
+
+              echo ""
+              echo "========================================="
+              echo "✅ Gateway is Ready!"
+              echo "========================================="
+              echo ""
+              echo "Summary:"
+              echo "  Provider: ${GATEWAY_PROVIDER}"
+              kubectl get gatewayclass
+              echo ""
+              kubectl api-resources --api-group=inference.networking.k8s.io
+
+          env:
+            - name: GATEWAY_PROVIDER
+              value: "istio"  # Must match deploy-gateway-job
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

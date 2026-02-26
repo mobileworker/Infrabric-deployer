@@ -1,0 +1,184 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: deploy-gateway-provider
+  namespace: llm-d
+  labels:
+    app: gateway-deployer
+    component: gateway-provider
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 10
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: gateway-deployer
+    spec:
+      serviceAccountName: llm-d-client
+      restartPolicy: OnFailure
+
+      # Wait for client-tools pod to be ready
+      initContainers:
+        - name: wait-for-client-tools
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "Waiting for llm-d-client pod to be ready..."
+
+              # Install kubectl to local directory
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              # Wait for client pod
+              kubectl wait --for=condition=ready pod/llm-d-client -n llm-d --timeout=600s
+
+              echo "✅ Client tools pod is ready"
+
+      containers:
+        - name: deploy-gateway
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "========================================="
+              echo "Gateway Provider Deployment"
+              echo "========================================="
+
+              # Install dependencies to local directory
+              echo "📦 Installing helm, kubectl, and helmfile..."
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+
+              curl -sSL https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz | tar -xz -C /tmp
+              mv /tmp/linux-amd64/helm /tmp/bin/helm
+              chmod +x /tmp/bin/helm
+
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              HELMFILE_VERSION="0.170.0"
+              curl -sSL "https://github.com/helmfile/helmfile/releases/download/v${HELMFILE_VERSION}/helmfile_${HELMFILE_VERSION}_linux_amd64.tar.gz" | tar -xz -C /tmp/bin helmfile
+              chmod +x /tmp/bin/helmfile
+
+              echo "✅ Tools installed"
+              helm version --short
+              kubectl version --client
+              helmfile --version
+
+              # Step 1: Install Gateway API CRDs
+              echo ""
+              echo "========================================="
+              echo "Step 1: Installing Gateway API CRDs"
+              echo "========================================="
+
+              GATEWAY_API_VERSION="v1.4.0"
+              echo "📜 Gateway API CRDs ${GATEWAY_API_VERSION}..."
+              kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml" || {
+                echo "⚠️  Gateway API CRDs may already be managed by OpenShift (OK)"
+              }
+
+              GATEWAY_INFERENCE_VERSION="v1.3.1"
+              echo "🚪 Gateway API Inference Extension CRDs ${GATEWAY_INFERENCE_VERSION}..."
+              kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/download/${GATEWAY_INFERENCE_VERSION}/manifests.yaml"
+
+              echo "✅ CRDs installed"
+
+              # Step 2: Deploy Gateway Provider based on GATEWAY_PROVIDER env var
+              echo ""
+              echo "========================================="
+              echo "Step 2: Installing Gateway Provider: ${GATEWAY_PROVIDER}"
+              echo "========================================="
+
+              case "${GATEWAY_PROVIDER}" in
+                "istio")
+                  echo "📦 Deploying Istio via Helmfile..."
+
+                  # Create namespace
+                  kubectl create namespace istio-system --dry-run=client -o yaml | kubectl apply -f -
+
+                  # Deploy using helmfile
+                  cd /config
+                  helmfile sync
+
+                  echo "✅ Istio deployed"
+                  ;;
+
+                "kgateway")
+                  echo "📦 Deploying Kgateway..."
+                  echo "⚠️  Kgateway deployment not yet implemented"
+                  exit 1
+                  ;;
+
+                "gke")
+                  echo "📦 Using GKE Gateway..."
+                  echo "✅ GKE provides gateway automatically"
+                  ;;
+
+                *)
+                  echo "❌ Unknown gateway provider: ${GATEWAY_PROVIDER}"
+                  exit 1
+                  ;;
+              esac
+
+              # Step 3: Verification
+              echo ""
+              echo "========================================="
+              echo "Step 3: Verification"
+              echo "========================================="
+
+              echo "Gateway CRDs:"
+              kubectl get crd | grep "gateway.networking.k8s.io" || echo "  (managed by platform)"
+
+              echo ""
+              echo "Inference Extension CRDs:"
+              kubectl get crd | grep "inference.networking.k8s.io"
+
+              echo ""
+              echo "GatewayClasses:"
+              kubectl get gatewayclass
+
+              if [ "${GATEWAY_PROVIDER}" = "istio" ]; then
+                echo ""
+                echo "Istio Pods:"
+                kubectl get pods -n istio-system
+
+                echo ""
+                echo "Helm Releases:"
+                helm list -n istio-system
+              fi
+
+              echo ""
+              echo "✅ Gateway Provider deployment complete!"
+
+          env:
+            - name: GATEWAY_PROVIDER
+              value: "istio"  # Default: istio (can be overridden per deployment)
+
+          volumeMounts:
+            - name: helmfile-config
+              mountPath: /config
+
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+
+      volumes:
+        - name: helmfile-config
+          configMap:
+            name: istio-helmfile

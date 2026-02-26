@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: llm-d-client
+  namespace: llm-d
+  labels:
+    app: llm-d-client
+    component: client-tools
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  serviceAccountName: llm-d-client
+  restartPolicy: Always
+
+  # Init container to install tools
+  initContainers:
+    - name: install-tools
+      image: registry.access.redhat.com/ubi9/ubi:latest
+      command: ["/bin/bash", "/scripts/install-tools.sh"]
+      volumeMounts:
+        - name: tools
+          mountPath: /tools
+        - name: install-script
+          mountPath: /scripts
+
+  containers:
+    - name: client
+      image: registry.access.redhat.com/ubi9/ubi:latest
+      command: ["/bin/bash"]
+      args:
+        - -c
+        - |
+          # Add tools to PATH
+          export PATH=/tools/bin:$PATH
+          export HELM_DATA_HOME=/tools/helm
+
+          echo "=================================="
+          echo "llm-d Client Tools Pod"
+          echo "=================================="
+          echo ""
+          echo "Available tools:"
+          echo "  - kubectl (OpenShift oc)"
+          echo "  - helm $(helm version --short 2>/dev/null || echo '')"
+          echo "  - helmfile $(helmfile version 2>/dev/null || echo '')"
+          echo "  - yq $(yq --version 2>/dev/null || echo '')"
+          echo ""
+          echo "To use this pod:"
+          echo "  oc exec -it llm-d-client -n llm-d -- /bin/bash"
+          echo ""
+
+          # Check if pod should keep running or exit
+          if [ "${KEEP_RUNNING}" = "false" ]; then
+            echo "KEEP_RUNNING=false - Pod will exit after initialization"
+            echo "=================================="
+            exit 0
+          else
+            echo "KEEP_RUNNING=true - Pod will sleep indefinitely for interactive use"
+            echo "=================================="
+            # Keep container running for interactive debugging
+            sleep infinity
+          fi
+
+      env:
+        - name: PATH
+          value: "/tools/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        - name: HELM_DATA_HOME
+          value: "/tools/helm"
+        - name: KUBECONFIG
+          value: "/var/run/secrets/kubernetes.io/serviceaccount/..data/ca.crt"
+        - name: KEEP_RUNNING
+          value: "true"  # Set to "false" to make pod complete after tools installation
+
+      volumeMounts:
+        - name: tools
+          mountPath: /tools
+        - name: workspace
+          mountPath: /workspace
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+  volumes:
+    - name: tools
+      emptyDir: {}
+    - name: workspace
+      emptyDir: {}
+    - name: install-script
+      configMap:
+        name: llm-d-install-tools
+        defaultMode: 0755

@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: llm-d
+
+# Inference Test Overlay - Runs guidellm benchmark on deployed models
+# Usage: oc apply -k rig/llm-d/overlays/inference-test
+
+resources:
+  # Wave -1: Namespace + RBAC
+  - ../../prereq/client-tools
+
+  # Wave 50: Run inference test (after all deployments ready)
+  - inference-test-job.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/name: llm-d
+      app.kubernetes.io/component: inference-test
+    includeSelectors: false

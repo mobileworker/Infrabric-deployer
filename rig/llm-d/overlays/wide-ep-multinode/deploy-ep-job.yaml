@@ -1,0 +1,368 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: deploy-ep-multinode
+  namespace: llm-d
+  labels:
+    app: llm-d
+    component: wide-ep-multinode
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: pd-deploy-multinode
+    spec:
+      serviceAccountName: llm-d-client
+      restartPolicy: OnFailure
+
+      # Init containers
+      initContainers:
+        # 1. Discover GPU and RDMA resources
+        - name: discover-resources
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "🔍 Discovering GPU and RDMA resources for multi-node deployment..."
+
+              # Install dependencies
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+
+              echo "Installing kubectl..."
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              echo "Installing jq..."
+              JQ_VERSION="1.7.1"
+              curl -sSL "https://github.com/jqlang/jq/releases/download/jq-${JQ_VERSION}/jq-linux-amd64" -o /tmp/bin/jq
+              chmod +x /tmp/bin/jq
+
+              # Run discovery script
+              export OUTPUT_FILE=/data/discovered-resources.yaml
+              bash /scripts/discover-gpu-rdma.sh
+
+              echo "✅ Resource discovery complete"
+          volumeMounts:
+            - name: discovery-script
+              mountPath: /scripts
+            - name: shared-data
+              mountPath: /data
+
+        # 2. Wait for gateway ready
+        - name: wait-for-gateway
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "Waiting for gateway-ready job to complete..."
+
+              # Install kubectl to local directory
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              # Wait for gateway ready job
+              kubectl wait --for=condition=complete job/wait-for-gateway-ready -n llm-d --timeout=600s
+
+              echo "✅ Gateway is ready"
+
+      containers:
+        - name: deploy-pd
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "========================================="
+              echo "Wide-EP Multi-Node Deployment"
+              echo "========================================="
+
+              # Install dependencies to local directory
+              echo "📦 Installing kubectl and yq..."
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              YQ_VERSION="v4.44.1"
+              curl -sSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o /tmp/bin/yq
+              chmod +x /tmp/bin/yq
+
+              echo "✅ Tools installed"
+              kubectl version --client
+              yq --version
+
+              # Step 1: Create Gateway Resource
+              echo ""
+              echo "========================================="
+              echo "Step 1: Creating Gateway Resource"
+              echo "========================================="
+
+              echo "📦 Creating Gateway..."
+              kubectl apply -f /config/gaie/gateway.yaml
+
+              echo "✅ Gateway created"
+
+              # Step 2: Deploy Model Server with Wide-EP Multi-Node
+              echo ""
+              echo "========================================="
+              echo "Step 2: Deploying Model Server (Multi-Node Wide-EP)"
+              echo "========================================="
+
+              echo "📦 Preparing dynamic configuration for multi-node EP..."
+
+              # Load discovered resources
+              if [ ! -f /data/discovered-resources.yaml ]; then
+                echo "❌ Discovery data not found!"
+                exit 1
+              fi
+
+              echo "📊 Discovered resources:"
+              cat /data/discovered-resources.yaml
+
+              # Extract discovered values for multi-node deployment
+              GPU_COUNT=$(yq '.discovered.gpuCount' /data/discovered-resources.yaml)
+              RDMA_COUNT=$(yq '.discovered.rdmaCount' /data/discovered-resources.yaml)
+              NODE_COUNT=$(yq '.discovered.nodeCount' /data/discovered-resources.yaml)
+
+              # For multi-node EP: Use ALL GPUs per node for tensor parallelism
+              # Must be power of 2 (1, 2, 4, 8, 16, etc)
+              # Find largest power of 2 <= GPU_COUNT
+              TENSOR_PARALLEL_SIZE=1
+              while [ $((TENSOR_PARALLEL_SIZE * 2)) -le $GPU_COUNT ]; do
+                TENSOR_PARALLEL_SIZE=$((TENSOR_PARALLEL_SIZE * 2))
+              done
+
+              UNUSED_GPUS=$((GPU_COUNT - TENSOR_PARALLEL_SIZE))
+
+              # LeaderWorkerSet configuration for multi-node EP
+              # Calculate LWS size based on available nodes
+              # Strategy: 1 prefill pod + remaining nodes for decode
+              # LWS size = number of pods per LWS
+              PREFILL_LWS_REPLICAS=1
+              DECODE_LWS_REPLICAS=1
+
+              # For EP: prefill uses 1 node, decode uses remaining nodes
+              PREFILL_LWS_SIZE=1  # 1 pod for prefill
+              DECODE_LWS_SIZE=$((NODE_COUNT - 1))  # Remaining nodes for decode
+
+              # Ensure at least 1 decode worker
+              if [ "$DECODE_LWS_SIZE" -lt 1 ]; then
+                DECODE_LWS_SIZE=1
+              fi
+
+              # Data Parallel configuration
+              # DP_SIZE_LOCAL is fixed at 8 for EP deployments
+              DP_SIZE_LOCAL=8
+
+              echo ""
+              echo "Multi-Node Wide-EP Configuration:"
+              echo "  - Total GPU nodes: $NODE_COUNT"
+              echo "  - GPUs per node: $GPU_COUNT"
+              echo "  - Tensor Parallel Size: $TENSOR_PARALLEL_SIZE"
+              echo "  - Unused GPUs per node: $UNUSED_GPUS"
+              echo "  - RDMA resources: $RDMA_COUNT"
+              echo "  - Prefill LWS replicas: $PREFILL_LWS_REPLICAS (size=$PREFILL_LWS_SIZE pods)"
+              echo "  - Decode LWS replicas: $DECODE_LWS_REPLICAS (size=$DECODE_LWS_SIZE pods)"
+              echo "  - Data Parallel Size (local): $DP_SIZE_LOCAL"
+              echo "  - Expected total pods: $((PREFILL_LWS_REPLICAS * PREFILL_LWS_SIZE + DECODE_LWS_REPLICAS * DECODE_LWS_SIZE))"
+              echo ""
+
+              if [ "$UNUSED_GPUS" -gt 0 ]; then
+                echo "⚠️  WARNING: $UNUSED_GPUS GPU(s) per node will remain unused due to power-of-2 constraint"
+              fi
+
+              # Copy manifests to tmp for patching
+              echo "📦 Patching LeaderWorkerSet manifests with dynamic resources..."
+              cp /config/ms/ep-lws.yaml /tmp/ep-lws.yaml
+
+              # Patch PREFILL LeaderWorkerSet (first document in the YAML)
+              # Set replicas
+              yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.replicas) = $PREFILL_LWS_REPLICAS" /tmp/ep-lws.yaml
+
+              # Set LeaderWorkerSet size (number of pods)
+              yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.size) = $PREFILL_LWS_SIZE" /tmp/ep-lws.yaml
+
+              # Update GPU count (in workerTemplate)
+              yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/ep-lws.yaml
+              yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/ep-lws.yaml
+
+              # Update TP_SIZE environment variable
+              yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$TENSOR_PARALLEL_SIZE\"" /tmp/ep-lws.yaml
+
+              # Update DP_SIZE_LOCAL environment variable
+              yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].env[] | select(.name == \"DP_SIZE_LOCAL\") | .value) = \"$DP_SIZE_LOCAL\"" /tmp/ep-lws.yaml
+
+              # Add RDMA resources from discovery (multi-node EP requires RDMA for all-to-all)
+              if [ "$RDMA_COUNT" -gt 0 ]; then
+                echo "🌐 Injecting RDMA resource requests for multi-node EP deployment..."
+
+                # Extract RDMA resources from discovery
+                RDMA_RESOURCES=$(yq '.resources.limits | to_entries | .[] | select(.key | test("^rdma/")) | .key + "=\"" + .value + "\""' /data/discovered-resources.yaml)
+
+                if [ -n "$RDMA_RESOURCES" ]; then
+                  echo "$RDMA_RESOURCES" | while IFS='=' read -r key value; do
+                    value=$(echo "$value" | tr -d '"')
+                    # Inject into both prefill and decode
+                    yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.limits.\"$key\") = \"$value\"" /tmp/ep-lws.yaml
+                    yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.requests.\"$key\") = \"$value\"" /tmp/ep-lws.yaml
+                    yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.limits.\"$key\") = \"$value\"" /tmp/ep-lws.yaml
+                    yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.requests.\"$key\") = \"$value\"" /tmp/ep-lws.yaml
+                  done
+                  echo "   ✓ RDMA resources injected for EP all-to-all communication"
+                fi
+              else
+                echo "   ⚠️  No RDMA resources found - EP performance will be severely degraded"
+              fi
+
+              # Patch DECODE LeaderWorkerSet (second document in the YAML)
+              # Set replicas
+              yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.replicas) = $DECODE_LWS_REPLICAS" /tmp/ep-lws.yaml
+
+              # Set LeaderWorkerSet size (number of pods)
+              yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.size) = $DECODE_LWS_SIZE" /tmp/ep-lws.yaml
+
+              # Update GPU count
+              yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/ep-lws.yaml
+              yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/ep-lws.yaml
+
+              # Update TP_SIZE environment variable
+              yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$TENSOR_PARALLEL_SIZE\"" /tmp/ep-lws.yaml
+
+              # Update DP_SIZE_LOCAL environment variable
+              yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].env[] | select(.name == \"DP_SIZE_LOCAL\") | .value) = \"$DP_SIZE_LOCAL\"" /tmp/ep-lws.yaml
+
+              echo "✅ Dynamic configuration prepared"
+              echo ""
+              echo "📦 Deploying Model Server with LeaderWorkerSets..."
+
+              # Apply consolidated manifest (contains both prefill and decode)
+              kubectl apply -f /tmp/ep-lws.yaml
+
+              # Wait for LeaderWorkerSets to be ready
+              echo "⏳ Waiting for LeaderWorkerSets to create pods..."
+              sleep 10
+
+              # Check LWS status
+              echo "📊 LeaderWorkerSet status:"
+              kubectl get leaderworkerset -n llm-d
+
+              # Wait for pods to be running
+              echo "⏳ Waiting for EP pods to be ready..."
+              kubectl wait --for=condition=ready --timeout=20m pod -l llm-d.ai/guide=wide-ep-multinode -n llm-d || true
+
+              echo "✅ Model server deployed"
+
+              # Verification
+              echo ""
+              echo "========================================="
+              echo "Step 3: Verification"
+              echo "========================================="
+
+              echo "LeaderWorkerSets:"
+              kubectl get leaderworkerset -n llm-d
+
+              echo ""
+              echo "Pods:"
+              kubectl get pods -n llm-d -l llm-d.ai/guide=wide-ep-multinode -o wide
+
+              echo ""
+              echo "InferencePool:"
+              kubectl get inferencepool -n llm-d
+
+              echo ""
+              echo "Gateway:"
+              kubectl get gateway -n llm-d
+
+              echo ""
+              echo "========================================="
+              echo "✅ Multi-Node Wide-EP deployment complete!"
+              echo "========================================="
+
+              # Remove llm-d-client pod (deployment role complete)
+              echo ""
+              echo "========================================="
+              echo "Step 4: Cleanup"
+              echo "========================================="
+              echo "🗑️  Removing llm-d-client pod (deployment complete)..."
+              kubectl delete pod llm-d-client -n llm-d --ignore-not-found=true || echo "⚠️  llm-d-client pod not found"
+              echo "✅ Client pod removed"
+
+              echo ""
+              echo "========================================="
+              echo "Deployment Summary"
+              echo "========================================="
+              echo "Configuration Summary:"
+              echo "  - Total GPU nodes: $NODE_COUNT"
+              echo "  - Model: DeepSeek-R1-0528 (Mixture of Experts)"
+              echo "  - Prefill LWS: $PREFILL_LWS_REPLICAS replicas x $PREFILL_LWS_SIZE pods = $((PREFILL_LWS_REPLICAS * PREFILL_LWS_SIZE)) pod(s)"
+              echo "  - Decode LWS: $DECODE_LWS_REPLICAS replicas x $DECODE_LWS_SIZE pods = $((DECODE_LWS_REPLICAS * DECODE_LWS_SIZE)) pod(s)"
+              echo "  - Tensor Parallel: $TENSOR_PARALLEL_SIZE GPUs per pod"
+              echo "  - Data Parallel (local): $DP_SIZE_LOCAL"
+              echo "  - Total expected pods: $((PREFILL_LWS_REPLICAS * PREFILL_LWS_SIZE + DECODE_LWS_REPLICAS * DECODE_LWS_SIZE))"
+              if [ "$UNUSED_GPUS" -gt 0 ]; then
+                echo "  - Unused GPUs per node: $UNUSED_GPUS (power-of-2 constraint)"
+              fi
+              echo "  - RDMA resources: $RDMA_COUNT per node (required for EP all-to-all)"
+              echo ""
+              echo "Next steps:"
+              echo "  1. Verify LeaderWorkerSets are ready:"
+              echo "     kubectl get leaderworkerset -n llm-d"
+              echo ""
+              echo "  2. Check pod distribution across nodes:"
+              echo "     kubectl get pods -n llm-d -o wide"
+              echo ""
+              echo "  3. Check InferencePool status:"
+              echo "     kubectl describe inferencepool -n llm-d"
+              echo ""
+              echo "  4. Monitor LWS coordination:"
+              echo "     kubectl logs -n llm-d -l llm-d.ai/role=prefill -c vllm --tail=50"
+              echo ""
+              echo "  5. Test inference:"
+              echo "     kubectl get httproute -n llm-d"
+              echo ""
+
+          volumeMounts:
+            - name: gaie-values
+              mountPath: /config/gaie
+            - name: ms-manifests
+              mountPath: /config/ms
+            - name: shared-data
+              mountPath: /data
+
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+
+      volumes:
+        - name: gaie-values
+          configMap:
+            name: gaie-ep-values
+        - name: ms-manifests
+          configMap:
+            name: ms-ep-manifests
+        - name: discovery-script
+          configMap:
+            name: gpu-rdma-discovery-script
+            defaultMode: 0755
+        - name: shared-data
+          emptyDir: {}

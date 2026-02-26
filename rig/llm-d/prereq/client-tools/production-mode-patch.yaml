@@ -1,0 +1,20 @@
+# Patch to make client pod complete after initialization (production mode)
+#
+# Usage in overlay kustomization.yaml:
+#   patches:
+#     - path: ../../prereq/client-tools/production-mode-patch.yaml
+#
+# Or apply directly:
+#   oc patch pod llm-d-client -n llm-d --type=json -p "$(cat production-mode-patch.yaml)"
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: llm-d-client
+  namespace: llm-d
+spec:
+  containers:
+  - name: client
+    env:
+    - name: KEEP_RUNNING
+      value: "false"

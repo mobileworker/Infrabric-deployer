@@ -1,0 +1,276 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: llm-d-inference-test
+  namespace: llm-d
+  labels:
+    app: llm-d-inference-test
+    component: validation
+  annotations:
+    argocd.argoproj.io/sync-wave: "50"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    description: "Runs inference test on deployed model"
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: llm-d-inference-test
+    spec:
+      serviceAccountName: llm-d-client
+      restartPolicy: Never
+      containers:
+      - name: inference-test
+        image: registry.access.redhat.com/ubi9/ubi:latest
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            set -euo pipefail
+
+            echo "========================================="
+            echo "llm-d Inference Test"
+            echo "========================================="
+            echo "Start time: $(date -u)"
+            echo ""
+
+            # Install dependencies
+            echo "📦 Installing dependencies..."
+            dnf install -y --allowerasing python3.11 python3.11-pip curl jq procps-ng 2>&1 | tee /tmp/dnf-install.log
+            echo "✅ Dependencies installed (dnf)"
+
+            # Install kubectl
+            mkdir -p /tmp/bin
+            export PATH="/tmp/bin:$PATH"
+
+            KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+            curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+            chmod +x /tmp/bin/kubectl
+
+            echo "✅ Dependencies installed"
+            echo ""
+
+            # Discover Gateway Service
+            echo "========================================="
+            echo "Step 1: Discovering Gateway Service"
+            echo "========================================="
+
+            # Look for common gateway service patterns
+            GATEWAY_SVC=""
+
+            # Try to find gateway service by label or name pattern
+            for pattern in "gateway-istio" "inference-gateway" "gateway"; do
+              SVC=$(kubectl get svc -n llm-d -o name 2>/dev/null | grep -i "$pattern" | head -1 || true)
+              if [ -n "$SVC" ]; then
+                GATEWAY_SVC=$(echo "$SVC" | sed 's|service/||')
+                break
+              fi
+            done
+
+            # If not found by pattern, look for services with Gateway resources
+            if [ -z "$GATEWAY_SVC" ]; then
+              GATEWAY_NAME=$(kubectl get gateway -n llm-d -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+              if [ -n "$GATEWAY_NAME" ]; then
+                # Find service associated with this gateway
+                GATEWAY_SVC=$(kubectl get svc -n llm-d -o name 2>/dev/null | grep -i "$(echo $GATEWAY_NAME | cut -d'-' -f1-3)" | head -1 | sed 's|service/||' || true)
+              fi
+            fi
+
+            # Fallback: use llm-d-inference service if it exists
+            if [ -z "$GATEWAY_SVC" ]; then
+              if kubectl get svc llm-d-inference -n llm-d >/dev/null 2>&1; then
+                GATEWAY_SVC="llm-d-inference"
+                echo "ℹ️  Using direct service: llm-d-inference"
+              fi
+            fi
+
+            if [ -z "$GATEWAY_SVC" ]; then
+              echo "❌ ERROR: Could not find gateway service!"
+              echo ""
+              echo "Available services in llm-d namespace:"
+              kubectl get svc -n llm-d
+              exit 1
+            fi
+
+            echo "✅ Found gateway service: $GATEWAY_SVC"
+
+            # Get service details - try multiple port names
+            SVC_PORT=$(kubectl get svc "$GATEWAY_SVC" -n llm-d -o jsonpath='{.spec.ports[?(@.name=="http")].port}' 2>/dev/null || echo "")
+            if [ -z "$SVC_PORT" ]; then
+              SVC_PORT=$(kubectl get svc "$GATEWAY_SVC" -n llm-d -o jsonpath='{.spec.ports[?(@.name=="default")].port}' 2>/dev/null || echo "")
+            fi
+            if [ -z "$SVC_PORT" ]; then
+              SVC_PORT=$(kubectl get svc "$GATEWAY_SVC" -n llm-d -o jsonpath='{.spec.ports[?(@.name=="http2")].port}' 2>/dev/null || echo "")
+            fi
+            if [ -z "$SVC_PORT" ]; then
+              # Try to find port 80 or 8080
+              SVC_PORT=$(kubectl get svc "$GATEWAY_SVC" -n llm-d -o jsonpath='{.spec.ports[?(@.port==80)].port}' 2>/dev/null || echo "")
+            fi
+            if [ -z "$SVC_PORT" ]; then
+              SVC_PORT=$(kubectl get svc "$GATEWAY_SVC" -n llm-d -o jsonpath='{.spec.ports[?(@.port==8080)].port}' 2>/dev/null || echo "")
+            fi
+            if [ -z "$SVC_PORT" ]; then
+              # Final fallback: use port 80
+              SVC_PORT="80"
+            fi
+
+            GATEWAY_URL="http://${GATEWAY_SVC}.llm-d.svc.cluster.local:${SVC_PORT}"
+            echo "   Gateway URL: $GATEWAY_URL"
+            echo ""
+
+            # Discover Model Name
+            echo "========================================="
+            echo "Step 2: Discovering Model Name"
+            echo "========================================="
+
+            # Try to get model name from InferencePool or pod labels
+            MODEL_NAME=""
+
+            # Method 1: Check pod annotations
+            MODEL_NAME=$(kubectl get pods -n llm-d -l llm-d.ai/inference-serving=true -o jsonpath='{.items[0].metadata.annotations.inference\.lanl\.gov/model-name}' 2>/dev/null || true)
+
+            # Method 2: Query the /v1/models endpoint
+            if [ -z "$MODEL_NAME" ]; then
+              echo "   Querying ${GATEWAY_URL}/v1/models..."
+              MODEL_RESPONSE=$(curl -s -m 10 "${GATEWAY_URL}/v1/models" || echo '{}')
+              MODEL_NAME=$(echo "$MODEL_RESPONSE" | jq -r '.data[0].id // empty' 2>/dev/null || true)
+            fi
+
+            # Fallback: use common model name
+            if [ -z "$MODEL_NAME" ]; then
+              MODEL_NAME="RedHatAI/Meta-Llama-3.1-8B-FP8"
+              echo "   ⚠️  Using default model name: $MODEL_NAME"
+            else
+              echo "   ✅ Detected model: $MODEL_NAME"
+            fi
+            echo ""
+
+            # Install OpenAI client
+            echo "========================================="
+            echo "Step 3: Installing OpenAI client"
+            echo "========================================="
+            echo "📦 Installing openai package..."
+            echo ""
+
+            pip3.11 install openai 2>&1 | grep -E "(Collecting|Downloading|Installing collected|Successfully installed)" || pip3.11 install openai
+
+            echo ""
+            echo "✅ OpenAI client installation completed"
+            echo ""
+
+            # Run Inference Test
+            echo "========================================="
+            echo "Step 4: Running Inference Benchmark"
+            echo "========================================="
+            echo "🚀 Running inference test..."
+            echo ""
+            echo "Configuration:"
+            echo "  - Gateway: $GATEWAY_URL"
+            echo "  - Model: $MODEL_NAME"
+            echo "  - Test type: Short benchmark (10 requests)"
+            echo "  - Max tokens: 50"
+            echo ""
+
+            # Create a simple test prompt file
+            cat > /tmp/prompts.txt << 'PROMPTS'
+            Explain the theory of relativity in simple terms.
+            What is the capital of France?
+            Write a haiku about clouds.
+            Describe the water cycle.
+            What are the benefits of exercise?
+            PROMPTS
+
+            # Run inference test
+            echo "Starting inference test..."
+            echo ""
+
+            # Use OpenAI-compatible API
+            python3.11 << PYEOF
+            import os
+            from openai import OpenAI
+
+            client = OpenAI(
+                base_url="${GATEWAY_URL}/v1",
+                api_key="dummy-key"
+            )
+
+            print("Running 10 inference requests...")
+            print("=" * 60)
+
+            prompts = [
+                "Explain the theory of relativity in simple terms.",
+                "What is the capital of France?",
+                "Write a haiku about clouds.",
+                "Describe the water cycle.",
+                "What are the benefits of exercise?",
+                "What is machine learning?",
+                "Explain photosynthesis.",
+                "What causes the seasons?",
+                "Describe the solar system.",
+                "What is DNA?"
+            ]
+
+            success_count = 0
+            fail_count = 0
+            total_tokens = 0
+            total_time = 0
+
+            import time
+
+            for i, prompt in enumerate(prompts, 1):
+                try:
+                    start = time.time()
+                    response = client.completions.create(
+                        model="${MODEL_NAME}",
+                        prompt=prompt,
+                        max_tokens=50,
+                        temperature=0.7
+                    )
+                    end = time.time()
+
+                    duration = end - start
+                    tokens = response.usage.total_tokens
+                    total_tokens += tokens
+                    total_time += duration
+
+                    print(f"✓ Request {i}/10: {duration:.2f}s, {tokens} tokens, {tokens/duration:.1f} tok/s")
+                    success_count += 1
+                except Exception as e:
+                    print(f"✗ Request {i}/10: Failed - {str(e)}")
+                    fail_count += 1
+
+            print("=" * 60)
+            print(f"\nBenchmark Results:")
+            print(f"  Successful requests: {success_count}/10")
+            print(f"  Failed requests: {fail_count}/10")
+            if success_count > 0:
+                print(f"  Total tokens: {total_tokens}")
+                print(f"  Total time: {total_time:.2f}s")
+                print(f"  Average latency: {total_time/success_count:.2f}s/request")
+                print(f"  Average throughput: {total_tokens/total_time:.1f} tokens/s")
+
+            exit(0 if success_count >= 8 else 1)
+            PYEOF
+
+            EXIT_CODE=$?
+
+            echo ""
+            echo "========================================="
+            if [ $EXIT_CODE -eq 0 ]; then
+              echo "✅ Inference Test PASSED"
+            else
+              echo "❌ Inference Test FAILED"
+            fi
+            echo "========================================="
+            echo "End time: $(date -u)"
+
+            exit $EXIT_CODE
+
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi

@@ -1,0 +1,340 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: deploy-inference-scheduling
+  namespace: llm-d
+  labels:
+    app: llm-d
+    component: inference-scheduling
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: inference-scheduling-deploy
+    spec:
+      serviceAccountName: llm-d-client
+      restartPolicy: OnFailure
+
+      # Init containers
+      initContainers:
+        # 1. Discover GPU and RDMA resources
+        - name: discover-resources
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "🔍 Discovering GPU and RDMA resources for inference scheduling..."
+
+              # Install dependencies
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+
+              echo "Installing kubectl..."
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              echo "Installing jq..."
+              JQ_VERSION="1.7.1"
+              curl -sSL "https://github.com/jqlang/jq/releases/download/jq-${JQ_VERSION}/jq-linux-amd64" -o /tmp/bin/jq
+              chmod +x /tmp/bin/jq
+
+              # Run discovery script
+              export OUTPUT_FILE=/data/discovered-resources.yaml
+              bash /scripts/discover-gpu-rdma.sh
+
+              echo "✅ Resource discovery complete"
+          volumeMounts:
+            - name: discovery-script
+              mountPath: /scripts
+            - name: shared-data
+              mountPath: /data
+
+        # 2. Wait for gateway ready
+        - name: wait-for-gateway
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "Waiting for gateway-ready job to complete..."
+
+              # Install kubectl to local directory
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              # Wait for gateway ready job
+              kubectl wait --for=condition=complete job/wait-for-gateway-ready -n llm-d --timeout=600s
+
+              echo "✅ Gateway is ready"
+
+      containers:
+        - name: deploy-inference-scheduling
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "========================================="
+              echo "Inference Scheduling Deployment"
+              echo "========================================="
+
+              # Install dependencies to local directory
+              echo "📦 Installing kubectl and yq..."
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              YQ_VERSION="v4.44.1"
+              curl -sSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o /tmp/bin/yq
+              chmod +x /tmp/bin/yq
+
+              echo "✅ Tools installed"
+              kubectl version --client
+              yq --version
+
+              # Step 1: Create Gateway Resource
+              echo ""
+              echo "========================================="
+              echo "Step 1: Creating Gateway Resource"
+              echo "========================================="
+
+              echo "📦 Creating Gateway..."
+              kubectl apply -f /config/gaie/gateway.yaml
+
+              echo "✅ Gateway created"
+
+              # Step 2: Deploy Model Server
+              echo ""
+              echo "========================================="
+              echo "Step 2: Deploying Model Server (Inference Scheduling)"
+              echo "========================================="
+
+              echo "📦 Preparing dynamic configuration..."
+
+              # Load discovered resources
+              if [ ! -f /data/discovered-resources.yaml ]; then
+                echo "❌ Discovery data not found!"
+                exit 1
+              fi
+
+              echo "📊 Discovered resources:"
+              cat /data/discovered-resources.yaml
+
+              # Extract discovered values
+              GPU_COUNT=$(yq '.discovered.gpuCount' /data/discovered-resources.yaml)
+              NODE_COUNT=$(yq '.discovered.nodeCount' /data/discovered-resources.yaml)
+              RDMA_COUNT=$(yq '.discovered.rdmaCount' /data/discovered-resources.yaml)
+
+              # Calculate tensor parallel size (default 2, but ensure power of 2)
+              # For inference scheduling: aim for TP=2 GPUs per pod
+              TP_SIZE=2
+              if [ "$GPU_COUNT" -lt 2 ]; then
+                TP_SIZE=1
+              fi
+
+              # Calculate number of replicas
+              # Total replicas = total GPUs across all nodes / TP_SIZE
+              TOTAL_GPUS=$((GPU_COUNT * NODE_COUNT))
+              REPLICAS=$((TOTAL_GPUS / TP_SIZE))
+
+              # Ensure at least 1 replica
+              if [ "$REPLICAS" -lt 1 ]; then
+                REPLICAS=1
+              fi
+
+              # Extract CPU and Memory allocation
+              CPU_PER_POD=$(yq '.singleNodeResources.cpuPerPod' /data/discovered-resources.yaml)
+              MEMORY_PER_POD=$(yq '.singleNodeResources.memoryPerPodGi' /data/discovered-resources.yaml)
+
+              # Calculate resources per pod (divide by replicas per node)
+              REPLICAS_PER_NODE=$((REPLICAS / NODE_COUNT))
+              if [ "$REPLICAS_PER_NODE" -lt 1 ]; then
+                REPLICAS_PER_NODE=1
+              fi
+
+              CPU_PER_REPLICA=$((CPU_PER_POD / REPLICAS_PER_NODE))
+              MEMORY_PER_REPLICA=$((MEMORY_PER_POD / REPLICAS_PER_NODE))
+
+              # Ensure minimum resources
+              if [ "$CPU_PER_REPLICA" -lt 16 ]; then
+                CPU_PER_REPLICA=16
+              fi
+              if [ "$MEMORY_PER_REPLICA" -lt 50 ]; then
+                MEMORY_PER_REPLICA=50
+              fi
+
+              echo ""
+              echo "Inference Scheduling Configuration:"
+              echo "  - Total GPU nodes: $NODE_COUNT"
+              echo "  - GPUs per node: $GPU_COUNT"
+              echo "  - Total GPUs: $TOTAL_GPUS"
+              echo "  - Tensor Parallel Size: $TP_SIZE"
+              echo "  - Total replicas: $REPLICAS"
+              echo "  - CPU per replica: $CPU_PER_REPLICA cores"
+              echo "  - Memory per replica: ${MEMORY_PER_REPLICA}Gi"
+              echo "  - RDMA resources: $RDMA_COUNT per node"
+              echo ""
+
+              # Copy manifests to tmp for patching
+              cp /config/ms/vllm-lws.yaml /tmp/vllm-lws.yaml
+
+              # Patch deployment
+              # Set replicas
+              yq -i ".spec.replicas = $REPLICAS" /tmp/vllm-lws.yaml
+
+              # Update GPU count
+              yq -i ".spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\" = \"$TP_SIZE\"" /tmp/vllm-lws.yaml
+              yq -i ".spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\" = \"$TP_SIZE\"" /tmp/vllm-lws.yaml
+
+              # Update CPU
+              yq -i ".spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.cpu = \"$CPU_PER_REPLICA\"" /tmp/vllm-lws.yaml
+              yq -i ".spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.cpu = \"$CPU_PER_REPLICA\"" /tmp/vllm-lws.yaml
+
+              # Update Memory
+              yq -i ".spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.memory = \"${MEMORY_PER_REPLICA}Gi\"" /tmp/vllm-lws.yaml
+              yq -i ".spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.memory = \"${MEMORY_PER_REPLICA}Gi\"" /tmp/vllm-lws.yaml
+
+              # Update TP_SIZE environment variable
+              yq -i "(.spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$TP_SIZE\"" /tmp/vllm-lws.yaml
+
+              # Add RDMA resources from discovery if available
+              if [ "$RDMA_COUNT" -gt 0 ]; then
+                echo "🌐 Injecting RDMA resource requests..."
+
+                # Extract RDMA resources from discovery
+                RDMA_RESOURCES=$(yq '.resources.limits | to_entries | .[] | select(.key | test("^rdma/")) | .key + "=\"" + .value + "\""' /data/discovered-resources.yaml)
+
+                if [ -n "$RDMA_RESOURCES" ]; then
+                  echo "$RDMA_RESOURCES" | while IFS='=' read -r key value; do
+                    value=$(echo "$value" | tr -d '"')
+                    yq -i ".spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"$key\" = \"$value\"" /tmp/vllm-lws.yaml
+                    yq -i ".spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"$key\" = \"$value\"" /tmp/vllm-lws.yaml
+                  done
+                  echo "   ✓ RDMA resources injected"
+                fi
+              else
+                echo "   ℹ️  No RDMA resources found - deploying without RDMA"
+              fi
+
+              echo "✅ Dynamic configuration prepared"
+              echo ""
+              echo "📦 Deploying Model Server..."
+
+              # Apply service first
+              kubectl apply -f /config/service/service.yaml
+
+              # Apply deployment
+              kubectl apply -f /tmp/vllm-lws.yaml
+
+              # Wait for deployment to be ready
+              echo "⏳ Waiting for deployment to be ready..."
+              kubectl wait --for=condition=available --timeout=30m leaderworkerset/inference-scheduling -n llm-d || true
+
+              echo "✅ Model server deployed"
+
+              # Verification
+              echo ""
+              echo "========================================="
+              echo "Step 3: Verification"
+              echo "========================================="
+
+              echo "Pods:"
+              kubectl get pods -n llm-d -l llm-d.ai/guide=inference-scheduling -o wide
+
+              echo ""
+              echo "Deployment:"
+              kubectl get deployment inference-scheduling -n llm-d
+
+              echo ""
+              echo "InferencePool:"
+              kubectl get inferencepool -n llm-d
+
+              echo ""
+              echo "Gateway:"
+              kubectl get gateway -n llm-d
+
+              echo ""
+              echo "========================================="
+              echo "✅ Inference Scheduling deployment complete!"
+              echo "========================================="
+
+              # Remove llm-d-client pod (deployment role complete)
+              echo ""
+              echo "========================================="
+              echo "Step 4: Cleanup"
+              echo "========================================="
+              echo "🗑️  Removing llm-d-client pod (deployment complete)..."
+              kubectl delete pod llm-d-client -n llm-d --ignore-not-found=true || echo "⚠️  llm-d-client pod not found"
+              echo "✅ Client pod removed"
+
+              echo ""
+              echo "========================================="
+              echo "Deployment Summary"
+              echo "========================================="
+              echo "Configuration Summary:"
+              echo "  - Model: Qwen/Qwen3-32B"
+              echo "  - Total replicas: $REPLICAS"
+              echo "  - Tensor Parallel: $TP_SIZE GPUs per pod"
+              echo "  - Total GPUs used: $TOTAL_GPUS"
+              echo "  - RDMA resources: $RDMA_COUNT per node"
+              echo ""
+              echo "Next steps:"
+              echo "  1. Verify pods are running:"
+              echo "     kubectl get pods -n llm-d -l llm-d.ai/guide=inference-scheduling"
+              echo ""
+              echo "  2. Check InferencePool status:"
+              echo "     kubectl describe inferencepool -n llm-d"
+              echo ""
+              echo "  3. Test inference:"
+              echo "     kubectl get httproute -n llm-d"
+              echo ""
+
+          volumeMounts:
+            - name: gaie-values
+              mountPath: /config/gaie
+            - name: ms-manifests
+              mountPath: /config/ms
+            - name: service-manifest
+              mountPath: /config/service
+            - name: shared-data
+              mountPath: /data
+
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+
+      volumes:
+        - name: gaie-values
+          configMap:
+            name: gaie-inference-scheduling-values
+        - name: ms-manifests
+          configMap:
+            name: ms-inference-scheduling-manifests
+        - name: service-manifest
+          configMap:
+            name: inference-scheduling-service
+        - name: discovery-script
+          configMap:
+            name: gpu-rdma-discovery-script
+            defaultMode: 0755
+        - name: shared-data
+          emptyDir: {}

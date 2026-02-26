@@ -1,0 +1,296 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: deploy-pd-singlenode
+  namespace: llm-d
+  labels:
+    app: llm-d
+    component: pd-disaggregation
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: pd-deploy-singlenode
+    spec:
+      serviceAccountName: llm-d-client
+      restartPolicy: OnFailure
+
+      # Init containers
+      initContainers:
+        # 1. Discover GPU and RDMA resources
+        - name: discover-resources
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "🔍 Discovering GPU and RDMA resources for single-node deployment..."
+
+              # Install dependencies
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+
+              echo "Installing kubectl..."
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              echo "Installing jq..."
+              JQ_VERSION="1.7.1"
+              curl -sSL "https://github.com/jqlang/jq/releases/download/jq-${JQ_VERSION}/jq-linux-amd64" -o /tmp/bin/jq
+              chmod +x /tmp/bin/jq
+
+              # Run discovery script
+              export OUTPUT_FILE=/data/discovered-resources.yaml
+              bash /scripts/discover-gpu-rdma.sh
+
+              echo "✅ Resource discovery complete"
+          volumeMounts:
+            - name: discovery-script
+              mountPath: /scripts
+            - name: shared-data
+              mountPath: /data
+
+        # 2. Wait for gateway ready
+        - name: wait-for-gateway
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "Waiting for gateway-ready job to complete..."
+
+              # Install kubectl to local directory
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              # Wait for gateway ready job
+              kubectl wait --for=condition=complete job/wait-for-gateway-ready -n llm-d --timeout=600s
+
+              echo "✅ Gateway is ready"
+
+      containers:
+        - name: deploy-pd
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "========================================="
+              echo "P/D Disaggregation Single-Node Deployment"
+              echo "========================================="
+
+              # Install dependencies to local directory
+              echo "📦 Installing kubectl and yq..."
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              YQ_VERSION="v4.44.1"
+              curl -sSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o /tmp/bin/yq
+              chmod +x /tmp/bin/yq
+
+              echo "✅ Tools installed"
+              kubectl version --client
+              yq --version
+
+              # Step 1: Create Gateway Resource
+              echo ""
+              echo "========================================="
+              echo "Step 1: Creating Gateway Resource"
+              echo "========================================="
+
+              echo "📦 Creating Gateway..."
+              kubectl apply -f /config/gaie/gateway.yaml
+
+              echo "✅ Gateway created"
+
+              # Step 2: Deploy Model Server with P/D Split
+              echo ""
+              echo "========================================="
+              echo "Step 2: Deploying Model Server (Single-Node P/D)"
+              echo "========================================="
+
+              echo "📦 Preparing dynamic configuration with P/D GPU split..."
+
+              # Load discovered resources
+              if [ ! -f /data/discovered-resources.yaml ]; then
+                echo "❌ Discovery data not found!"
+                exit 1
+              fi
+
+              echo "📊 Discovered resources:"
+              cat /data/discovered-resources.yaml
+
+              # Extract discovered values for single-node P/D split
+              PREFILL_GPU_COUNT=$(yq '.vllm.singlenode.prefillTensorParallelSize' /data/discovered-resources.yaml)
+              DECODE_GPU_COUNT=$(yq '.vllm.singlenode.decodeTensorParallelSize' /data/discovered-resources.yaml)
+              TOTAL_USED_GPUS=$(yq '.vllm.singlenode.totalUsedGpus' /data/discovered-resources.yaml)
+              UNUSED_GPUS=$(yq '.vllm.singlenode.unusedGpus' /data/discovered-resources.yaml)
+
+              # Extract CPU and Memory allocation
+              CPU_PER_POD=$(yq '.singleNodeResources.cpuPerPod' /data/discovered-resources.yaml)
+              MEMORY_PER_POD=$(yq '.singleNodeResources.memoryPerPodGi' /data/discovered-resources.yaml)
+
+              echo ""
+              echo "Single-Node P/D Configuration:"
+              echo "  - Prefill GPUs: $PREFILL_GPU_COUNT"
+              echo "  - Decode GPUs: $DECODE_GPU_COUNT"
+              echo "  - Total GPUs used: $TOTAL_USED_GPUS"
+              echo "  - Unused GPUs: $UNUSED_GPUS"
+              echo "  - CPU per pod: $CPU_PER_POD cores"
+              echo "  - Memory per pod: ${MEMORY_PER_POD}Gi"
+              echo ""
+
+              if [ "$UNUSED_GPUS" -gt 0 ]; then
+                echo "⚠️  WARNING: $UNUSED_GPUS GPU(s) will remain unused due to power-of-2 constraint"
+              fi
+
+              # Patch Kubernetes manifests with discovered resources
+              echo "📦 Patching manifests with dynamic resources..."
+
+              # Copy consolidated manifest to tmp for patching
+              cp /config/ms/pd-lws.yaml /tmp/pd-lws.yaml
+
+              # Patch PREFILL LeaderWorkerSet (first document in the YAML)
+              # Update GPU count
+              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$PREFILL_GPU_COUNT\"" /tmp/pd-lws.yaml
+              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$PREFILL_GPU_COUNT\"" /tmp/pd-lws.yaml
+
+              # Update CPU
+              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.cpu) = \"$CPU_PER_POD\"" /tmp/pd-lws.yaml
+              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.cpu) = \"$CPU_PER_POD\"" /tmp/pd-lws.yaml
+
+              # Update Memory
+              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.memory) = \"${MEMORY_PER_POD}Gi\"" /tmp/pd-lws.yaml
+              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.memory) = \"${MEMORY_PER_POD}Gi\"" /tmp/pd-lws.yaml
+
+              # Update TP_SIZE environment variable
+              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$PREFILL_GPU_COUNT\"" /tmp/pd-lws.yaml
+
+              # Patch DECODE LeaderWorkerSet (second document in the YAML)
+              # Update GPU count
+              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$DECODE_GPU_COUNT\"" /tmp/pd-lws.yaml
+              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$DECODE_GPU_COUNT\"" /tmp/pd-lws.yaml
+
+              # Update CPU
+              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.cpu) = \"$CPU_PER_POD\"" /tmp/pd-lws.yaml
+              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.cpu) = \"$CPU_PER_POD\"" /tmp/pd-lws.yaml
+
+              # Update Memory
+              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.memory) = \"${MEMORY_PER_POD}Gi\"" /tmp/pd-lws.yaml
+              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.memory) = \"${MEMORY_PER_POD}Gi\"" /tmp/pd-lws.yaml
+
+              # Update TP_SIZE environment variable
+              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$DECODE_GPU_COUNT\"" /tmp/pd-lws.yaml
+
+              echo "✅ Dynamic configuration prepared"
+              echo ""
+              echo "📦 Deploying Model Server with native Kubernetes manifests..."
+
+              # Apply consolidated manifest (contains both prefill and decode)
+              kubectl apply -f /tmp/pd-lws.yaml
+
+              # Wait for deployments to be ready
+              echo "⏳ Waiting for deployments to be ready..."
+              kubectl wait --for=condition=available --timeout=20m leaderworkerset/pd-prefill -n llm-d
+              kubectl wait --for=condition=available --timeout=20m leaderworkerset/pd-decode -n llm-d
+
+              echo "✅ Model server deployed"
+
+              # Verification
+              echo ""
+              echo "========================================="
+              echo "Step 3: Verification"
+              echo "========================================="
+
+              echo "Pods:"
+              kubectl get pods -n llm-d -l llm-d.ai/guide=pd-disaggregation
+
+              echo ""
+              echo "InferencePool:"
+              kubectl get inferencepool -n llm-d
+
+              echo ""
+              echo "Gateway:"
+              kubectl get gateway -n llm-d
+
+              echo ""
+              echo "========================================="
+              echo "✅ Single-Node P/D Disaggregation deployment complete!"
+              echo "========================================="
+
+              # Remove llm-d-client pod (deployment role complete)
+              echo ""
+              echo "========================================="
+              echo "Step 4: Cleanup"
+              echo "========================================="
+              echo "🗑️  Removing llm-d-client pod (deployment complete)..."
+              kubectl delete pod llm-d-client -n llm-d --ignore-not-found=true || echo "⚠️  llm-d-client pod not found"
+              echo "✅ Client pod removed"
+
+              echo ""
+              echo "========================================="
+              echo "Deployment Summary"
+              echo "========================================="
+              echo "Configuration Summary:"
+              echo "  - Prefill: $PREFILL_GPU_COUNT GPUs (tensor-parallel-size: $PREFILL_GPU_COUNT)"
+              echo "  - Decode: $DECODE_GPU_COUNT GPUs (tensor-parallel-size: $DECODE_GPU_COUNT)"
+              echo "  - Total GPUs used: $TOTAL_USED_GPUS"
+              if [ "$UNUSED_GPUS" -gt 0 ]; then
+                echo "  - Unused GPUs: $UNUSED_GPUS (power-of-2 constraint)"
+              fi
+              echo ""
+              echo "Next steps:"
+              echo "  1. Verify pods are running:"
+              echo "     kubectl get pods -n llm-d"
+              echo ""
+              echo "  2. Check InferencePool status:"
+              echo "     kubectl describe inferencepool -n llm-d"
+              echo ""
+              echo "  3. Test inference:"
+              echo "     kubectl get httproute -n llm-d"
+              echo ""
+
+          volumeMounts:
+            - name: gaie-values
+              mountPath: /config/gaie
+            - name: ms-manifests
+              mountPath: /config/ms
+            - name: shared-data
+              mountPath: /data
+
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+
+      volumes:
+        - name: gaie-values
+          configMap:
+            name: gaie-pd-values
+        - name: ms-manifests
+          configMap:
+            name: ms-pd-manifests
+        - name: discovery-script
+          configMap:
+            name: gpu-rdma-discovery-script
+            defaultMode: 0755
+        - name: shared-data
+          emptyDir: {}

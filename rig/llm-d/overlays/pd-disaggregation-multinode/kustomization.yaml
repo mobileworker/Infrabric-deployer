@@ -1,0 +1,44 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Note: namespace field removed from overlay level to avoid transforming istio-system
+# All resources explicitly set their namespace in metadata
+
+# Prerequisites (deployed in order via sync waves)
+resources:
+  # Wave -1: Namespace + RBAC + Resource Discovery
+  - ../../prereq/client-tools
+  - ../../prereq/resource-discovery
+
+  # Wave 5: Istio namespace
+  # Wave 10: Install Istio gateway
+  # Wave 15: Install InferencePool controller
+  # Wave 18: Wait for gateway ready
+  - ../../prereq/istio-gateway
+  - ../../prereq/inferencepool-controller
+
+  # Wave 20: RDMA Configuration and Manifests
+  - rdma-script-configmap.yaml       # InfiniBand HCA discovery script
+  - gaie-values-configmap.yaml        # InferencePool configuration (Helm values)
+  - ms-manifests-configmap.yaml       # Model server Kubernetes manifests
+
+  # Wave 24: Services
+  - prefill-service.yaml              # Prefill service
+  - decode-service.yaml               # Decode service
+  - inference-service.yaml            # Aggregator service for InferencePool
+
+  # Wave 25: Deploy P/D Multi-Node
+  - deploy-pd-job.yaml                # Deployment job
+
+  # Wave 30: HTTP Routing
+  - httproute.yaml                    # Routes inference requests to InferencePool
+
+# Labels - using 'labels' instead of 'commonLabels' to avoid adding to service selectors
+labels:
+  - pairs:
+      app.kubernetes.io/name: llm-d
+      app.kubernetes.io/component: pd-disaggregation-multinode
+      deployment-type: pd-disaggregation-multinode
+    includeSelectors: false
+
+# No patches needed - all configuration is in manifests

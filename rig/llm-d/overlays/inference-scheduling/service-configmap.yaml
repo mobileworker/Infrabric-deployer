@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inference-scheduling-service
+  namespace: llm-d
+  labels:
+    app: llm-d
+    component: inference-scheduling
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+data:
+  service.yaml: |
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: inference-scheduling
+      namespace: llm-d
+      labels:
+        app: llm-d
+        component: inference-scheduling
+      annotations:
+        argocd.argoproj.io/sync-wave: "25"
+    spec:
+      selector:
+        llm-d.ai/inference-serving: "true"
+        llm-d.ai/guide: inference-scheduling
+      ports:
+        - port: 8000
+          targetPort: 8000
+          protocol: TCP
+          name: vllm
+      type: ClusterIP

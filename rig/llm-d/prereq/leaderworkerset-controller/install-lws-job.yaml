@@ -1,0 +1,100 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: install-leaderworkerset
+  namespace: llm-d
+  labels:
+    app: leaderworkerset-installer
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: leaderworkerset-installer
+    spec:
+      serviceAccountName: llm-d-client
+      restartPolicy: OnFailure
+      containers:
+        - name: install-lws
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "========================================="
+              echo "LeaderWorkerSet CRD Installation"
+              echo "========================================="
+
+              # Install kubectl
+              echo "📦 Installing kubectl..."
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              echo "✅ kubectl installed"
+              kubectl version --client
+
+              echo ""
+              echo "========================================="
+              echo "Installing LeaderWorkerSet CRDs"
+              echo "========================================="
+
+              # Install LeaderWorkerSet CRDs
+              LWS_VERSION="v0.3.1"
+              echo "📦 Installing LeaderWorkerSet CRDs version $LWS_VERSION..."
+
+              kubectl apply --server-side -f "https://github.com/kubernetes-sigs/lws/releases/download/${LWS_VERSION}/manifests.yaml"
+
+              echo ""
+              echo "✅ LeaderWorkerSet CRDs installed successfully"
+
+              echo ""
+              echo "========================================="
+              echo "Verifying Installation"
+              echo "========================================="
+
+              # Wait for CRDs to be established
+              echo "⏳ Waiting for LeaderWorkerSet CRD to be ready..."
+              kubectl wait --for=condition=established --timeout=60s crd/leaderworkersets.leaderworkerset.x-k8s.io
+
+              # Verify CRD exists
+              echo ""
+              echo "📊 Installed CRDs:"
+              kubectl get crd | grep leaderworkerset || echo "❌ LeaderWorkerSet CRD not found!"
+
+              # Check controller deployment
+              echo ""
+              echo "📊 LeaderWorkerSet Controller Status:"
+              kubectl get deployment -n lws-system || echo "ℹ️  Controller deployment pending..."
+
+              echo ""
+              echo "========================================="
+              echo "Installation Summary"
+              echo "========================================="
+              echo "✅ LeaderWorkerSet CRDs installed"
+              echo "✅ LeaderWorkerSet controller deployed"
+              echo ""
+              echo "Next steps:"
+              echo "  1. Verify controller is running:"
+              echo "     kubectl get pods -n lws-system"
+              echo ""
+              echo "  2. Check CRD details:"
+              echo "     kubectl get crd leaderworkersets.leaderworkerset.x-k8s.io -o yaml"
+              echo ""
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Note: namespace field removed to avoid conflict when included as resource
+# Jobs explicitly set namespace: llm-d in their metadata
+
+resources:
+  - istio-namespace.yaml
+  - istio-helmfile-configmap.yaml
+  - deploy-gateway-job.yaml
+  - gateway-ready-job.yaml

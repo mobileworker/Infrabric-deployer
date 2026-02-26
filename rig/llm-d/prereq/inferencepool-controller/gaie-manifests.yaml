@@ -1,0 +1,319 @@
+---
+# Source: inferencepool/templates/rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gaie-pd-epp
+  namespace: llm-d
+  labels:
+    app.kubernetes.io/name: gaie-pd-epp
+    app.kubernetes.io/version: "v1.3.0"
+---
+# Source: inferencepool/templates/epp-sa-token-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: inference-gateway-sa-metrics-reader-secret
+  namespace: llm-d
+  labels:
+    app.kubernetes.io/name: gaie-pd-epp
+    app.kubernetes.io/version: "v1.3.0"
+  annotations:
+    kubernetes.io/service-account.name: gaie-pd-epp
+type: kubernetes.io/service-account-token
+---
+# Source: inferencepool/templates/epp-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gaie-pd-epp
+  namespace: llm-d
+data:
+  default-plugins.yaml: |
+    apiVersion: inference.networking.x-k8s.io/v1alpha1
+    kind: EndpointPickerConfig
+    plugins:
+    - type: queue-scorer
+    - type: kv-cache-utilization-scorer
+    - type: prefix-cache-scorer
+    schedulingProfiles:
+    - name: default
+      plugins:
+      - pluginRef: queue-scorer
+        weight: 2
+      - pluginRef: kv-cache-utilization-scorer
+        weight: 2
+      - pluginRef: prefix-cache-scorer
+        weight: 3
+  pd-config.yaml: |
+    apiVersion: inference.networking.x-k8s.io/v1alpha1
+    kind: EndpointPickerConfig
+    plugins:
+    - type: prefill-header-handler
+    - type: prefill-filter
+    - type: decode-filter
+    - type: queue-scorer
+    - type: pd-profile-handler
+      parameters:
+        threshold: 0
+        hashBlockSize: 5
+    schedulingProfiles:
+    - name: prefill
+      plugins:
+      - pluginRef: prefill-filter
+      - pluginRef: queue-scorer
+        weight: 1.0
+    - name: decode
+      plugins:
+      - pluginRef: decode-filter
+      - pluginRef: queue-scorer
+        weight: 1.0
+---
+# Source: inferencepool/templates/rbac.yaml
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: "gaie-pd-llm-d-epp"
+  labels:
+    app.kubernetes.io/name: gaie-pd-epp
+    app.kubernetes.io/version: "v1.3.0"
+rules:
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+- nonResourceURLs:
+  - "/metrics"
+  verbs:
+  - get
+---
+# Source: inferencepool/templates/rbac.yaml
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: "gaie-pd-llm-d-epp"
+subjects:
+- kind: ServiceAccount
+  name: gaie-pd-epp
+  namespace: llm-d
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: "gaie-pd-llm-d-epp"
+---
+# Source: inferencepool/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gaie-pd-epp
+  namespace: llm-d
+  labels:
+    app.kubernetes.io/name: gaie-pd-epp
+    app.kubernetes.io/version: "v1.3.0"
+rules:
+- apiGroups: ["inference.networking.x-k8s.io"]
+  resources: ["inferenceobjectives", "inferencemodelrewrites"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["inference.networking.k8s.io"]
+  resources: ["inferencepools"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "watch", "list"]
+---
+# Source: inferencepool/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gaie-pd-epp
+  namespace: llm-d
+subjects:
+- kind: ServiceAccount
+  name: gaie-pd-epp
+  namespace: llm-d
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gaie-pd-epp
+---
+# Source: inferencepool/templates/epp-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: gaie-pd-epp
+  namespace: llm-d
+  labels:
+    app.kubernetes.io/name: gaie-pd-epp
+    app.kubernetes.io/version: "v1.3.0"
+spec:
+  selector:
+    inferencepool: gaie-pd-epp
+  ports:
+    - name: grpc-ext-proc
+      protocol: TCP
+      port: 9002
+    - name: http-metrics
+      protocol: TCP
+      port: 9090
+  type: ClusterIP
+---
+# Source: inferencepool/templates/epp-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gaie-pd-epp
+  namespace: llm-d
+  labels:
+    app.kubernetes.io/name: gaie-pd-epp
+    app.kubernetes.io/version: "v1.3.0"
+spec:
+  replicas: 1
+  strategy:
+    # The current recommended EPP deployment pattern is to have a single active replica. This ensures 
+    # optimal performance of the stateful operations such prefix cache aware scorer.
+    # The Recreate strategy the old replica is killed immediately, and allow the new replica(s) to 
+    # quickly take over. This is particularly important in the high availability set up with leader
+    # election, as the rolling update strategy would prevent the old leader being killed because 
+    # otherwise the maxUnavailable would be 100%.
+    type: Recreate
+  selector:
+    matchLabels:
+      inferencepool: gaie-pd-epp
+  template:
+    metadata:
+      labels:
+        inferencepool: gaie-pd-epp
+    spec:
+      serviceAccountName: gaie-pd-epp
+      # Conservatively, this timeout should mirror the longest grace period of the pods within the pool
+      terminationGracePeriodSeconds: 130
+      containers:
+      - name: epp
+        image: ghcr.io/llm-d/llm-d-inference-scheduler:v0.4.0
+        imagePullPolicy: Always
+        args:
+        - --pool-name
+        - gaie-pd
+        # The pool namespace is optional because EPP can default to the NAMESPACE env var.
+        # We still keep this here so that the template works with older versions of EPP, or other
+        # distros of EPP which may not have implemented the NAMESPACE env var defaulting behavior.
+        - --pool-namespace
+        - llm-d
+        - --pool-group
+        - "inference.networking.k8s.io"
+        - --zap-encoder
+        - "json"
+        - --config-file
+        - "/config/pd-config.yaml"
+        # Pass additional flags via the inferenceExtension.flags field in values.yaml.
+        - --kv-cache-usage-percentage-metric
+        - "vllm:kv_cache_usage_perc"
+        - --v
+        - "1"
+        - --tracing=false
+        ports:
+        - name: grpc
+          containerPort: 9002
+        - name: grpc-health
+          containerPort: 9003
+        - name: metrics
+          containerPort: 9090
+        livenessProbe:
+          grpc:
+            port: 9003
+            service: inference-extension
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          grpc:
+            port: 9003
+            service: inference-extension
+          periodSeconds: 2
+        env:
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        
+        volumeMounts:
+        - name: plugins-config-volume
+          mountPath: "/config"
+      
+      volumes:
+      - name: plugins-config-volume
+        configMap:
+          name: gaie-pd-epp
+---
+# Source: inferencepool/templates/epp-config.yaml
+---
+---
+# Source: inferencepool/templates/istio.yaml
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: gaie-pd-epp
+spec:
+  host: gaie-pd-epp.llm-d.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: SIMPLE
+      insecureSkipVerify: true
+---
+# Source: inferencepool/templates/inferencepool.yaml
+apiVersion: "inference.networking.k8s.io/v1"
+kind: InferencePool
+metadata:
+  name: gaie-pd
+  namespace: llm-d
+  labels:
+    app.kubernetes.io/name: gaie-pd-epp
+    app.kubernetes.io/version: "v1.3.0"
+spec:
+  targetPorts:
+      - number: 8000
+  selector:
+    matchLabels:
+      llm-d.ai/inference-serving: "true"
+  endpointPickerRef:
+    name: gaie-pd-epp
+    port:
+      number: 9002
+---
+# Source: inferencepool/templates/epp-servicemonitor.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: gaie-pd-epp-monitor
+  namespace: llm-d
+  labels:
+    app.kubernetes.io/name: gaie-pd-epp
+    app.kubernetes.io/version: "v1.3.0"
+spec:
+  endpoints:
+  - interval: 10s
+    port: "http-metrics"
+    path: "/metrics"
+    authorization:
+      credentials:
+        key: token
+        name: inference-gateway-sa-metrics-reader-secret
+  jobLabel: gaie-pd-epp
+  namespaceSelector:
+    matchNames:
+    - llm-d
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gaie-pd-epp
+      app.kubernetes.io/version: "v1.3.0"

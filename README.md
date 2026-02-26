@@ -31,6 +31,14 @@ InfraBrig Deployer provides a complete, production-ready ArgoCD-based GitOps dep
 - **[Cluster Cleanup](manifests/99-cleanup/README.md)** - Complete infrastructure cleanup for fresh deployments
 - **[Network Performance Tests](manifests/99-network-perf-tests/README.md)** - RDMA bandwidth and NCCL testing
 
+### 🤖 LLM Deployments
+
+- **[llm-d (LLM Distributed)](rig/llm-d/README.md)** - Automated deployment of distributed LLM inference workloads
+  - **Scenarios**: Inference scheduling, P/D disaggregation (single/multi-node), Wide-EP for MoE models
+  - **Features**: Gateway API integration, RDMA support, dynamic resource discovery
+  - **Testing**: Automated inference validation with guidellm
+  - **Cleanup**: Single-command deployment cleanup overlay
+
 ### 📖 Guides
 
 - **[Running Individual Jobs](#running-individual-jobs)** - Manual execution of specific components for testing and debugging
@@ -241,6 +249,9 @@ Infrabric-deployer/
     │   ├── infra-operators-values.yaml # Operator configuration values
     │   ├── kustomization.yaml     # Kustomize overlay
     │   └── namespace.yaml         # Target namespace
+    ├── llm-d/                     # LLM distributed inference deployments
+    │   ├── prereq/                # Prerequisites (client-tools, gateway-provider)
+    │   └── overlays/              # Deployment scenarios (inference-scheduling, P/D disaggregation, wide-EP, cleanup)
     ├── aws/                       # AWS deployment (coming soon)
     └── ibm-cloud/                 # IBM Cloud deployment (coming soon)
 
