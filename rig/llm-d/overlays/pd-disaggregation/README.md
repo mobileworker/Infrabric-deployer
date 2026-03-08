@@ -123,7 +123,7 @@ Use the automated inference test overlay:
 
 ```bash
 # Deploy inference test job
-oc apply -k rig/llm-d/overlays/inference-test
+oc apply -k rig/llm-d/overlays/guidellm-inference-test
 
 # Watch test progress
 oc logs -n llm-d job/llm-d-inference-test -f

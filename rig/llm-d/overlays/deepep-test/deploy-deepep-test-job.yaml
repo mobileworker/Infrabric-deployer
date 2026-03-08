@@ -1,0 +1,194 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: deploy-deepep-test
+  namespace: llm-d
+  labels:
+    app: llm-d
+    component: deepep-test
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: deepep-test-deploy
+    spec:
+      serviceAccountName: llm-d-client
+      restartPolicy: OnFailure
+
+      # Init containers
+      initContainers:
+        # 1. Discover GPU and RDMA resources
+        - name: discover-resources
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "🔍 Discovering GPU and RDMA resources for DeepEP test..."
+
+              # Install dependencies
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+
+              echo "Installing kubectl..."
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              echo "Installing jq..."
+              JQ_VERSION="1.7.1"
+              curl -sSL "https://github.com/jqlang/jq/releases/download/jq-${JQ_VERSION}/jq-linux-amd64" -o /tmp/bin/jq
+              chmod +x /tmp/bin/jq
+
+              # Run discovery script
+              export OUTPUT_FILE=/data/discovered-resources.yaml
+              bash /scripts/discover-gpu-rdma.sh
+
+              echo "✅ Resource discovery complete"
+          volumeMounts:
+            - name: discovery-script
+              mountPath: /scripts
+            - name: shared-data
+              mountPath: /data
+
+      containers:
+        - name: deploy-test
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "========================================="
+              echo "DeepEP Multi-Node Test Deployment"
+              echo "========================================="
+
+              # Install dependencies to local directory
+              echo "📦 Installing kubectl and yq..."
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              YQ_VERSION="v4.44.1"
+              curl -sSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o /tmp/bin/yq
+              chmod +x /tmp/bin/yq
+
+              echo "✅ Tools installed"
+              kubectl version --client
+              yq --version
+
+              # Load discovered resources
+              if [ ! -f /data/discovered-resources.yaml ]; then
+                echo "❌ Discovery data not found!"
+                exit 1
+              fi
+
+              echo "📊 Discovered resources:"
+              cat /data/discovered-resources.yaml
+
+              # Extract discovered values
+              GPU_COUNT=$(yq '.discovered.gpuCount' /data/discovered-resources.yaml)
+              RDMA_COUNT=$(yq '.discovered.rdmaCount' /data/discovered-resources.yaml)
+              NODE_COUNT=$(yq '.discovered.nodeCount' /data/discovered-resources.yaml)
+
+              echo ""
+              echo "DeepEP Test Configuration:"
+              echo "  - Total GPU nodes: $NODE_COUNT"
+              echo "  - GPUs per node: $GPU_COUNT"
+              echo "  - RDMA resources: $RDMA_COUNT"
+              echo "  - WORLD_SIZE: $NODE_COUNT"
+              echo "  - Total GPUs: $((NODE_COUNT * GPU_COUNT))"
+              echo "  - Experts: 288 (default)"
+              echo ""
+
+              # Copy manifests to tmp for patching
+              echo "📦 Patching DeepEP test manifest with discovered resources..."
+              cp /config/deepep-test-lws.yaml /tmp/deepep-test-lws.yaml
+
+              # Patch replicas to match node count (WORLD_SIZE)
+              echo "Setting replicas to $NODE_COUNT (auto-detected node count)..."
+              yq -i ".spec.replicas = $NODE_COUNT" /tmp/deepep-test-lws.yaml
+
+              # Patch GPU count
+              echo "Setting GPU count to $GPU_COUNT per pod..."
+              yq -i ".spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\" = \"$GPU_COUNT\"" /tmp/deepep-test-lws.yaml
+              yq -i ".spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\" = \"$GPU_COUNT\"" /tmp/deepep-test-lws.yaml
+
+              # Patch CUDA_VISIBLE_DEVICES to match GPU count
+              GPU_LIST=$(seq -s ',' 0 $((GPU_COUNT - 1)))
+              echo "Setting CUDA_VISIBLE_DEVICES to $GPU_LIST..."
+              yq -i "(.spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].env[] | select(.name == \"CUDA_VISIBLE_DEVICES\") | .value) = \"$GPU_LIST\"" /tmp/deepep-test-lws.yaml
+
+              # Patch WORLD_SIZE to match node count
+              echo "Setting WORLD_SIZE to $NODE_COUNT..."
+              yq -i ".spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].env += [{\"name\": \"WORLD_SIZE\", \"value\": \"$NODE_COUNT\"}]" /tmp/deepep-test-lws.yaml
+
+              # Add RDMA resources from discovery
+              if [ "$RDMA_COUNT" -gt 0 ]; then
+                echo "🌐 Injecting RDMA resource requests..."
+
+                # Extract RDMA resources from discovery
+                RDMA_RESOURCES=$(yq '.resources.limits | to_entries | .[] | select(.key | test("^rdma/")) | .key + "=\"" + .value + "\""' /data/discovered-resources.yaml)
+
+                if [ -n "$RDMA_RESOURCES" ]; then
+                  echo "$RDMA_RESOURCES" | while IFS='=' read -r key value; do
+                    value=$(echo "$value" | tr -d '"')
+                    echo "   Adding $key=$value"
+                    yq -i ".spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.limits.\"$key\" = \"$value\"" /tmp/deepep-test-lws.yaml
+                    yq -i ".spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.requests.\"$key\" = \"$value\"" /tmp/deepep-test-lws.yaml
+                  done
+                  echo "   ✓ RDMA resources injected"
+                fi
+              else
+                echo "⚠️  No RDMA resources found - test may fail!"
+              fi
+
+              # Show patched manifest
+              echo ""
+              echo "📄 Final patched manifest:"
+              echo "---"
+              cat /tmp/deepep-test-lws.yaml
+
+              # Deploy the test
+              echo ""
+              echo "🚀 Deploying DeepEP multi-node test..."
+              kubectl apply -f /tmp/deepep-test-lws.yaml
+
+              echo ""
+              echo "✅ DeepEP test deployment complete!"
+              echo ""
+              echo "To check test results:"
+              echo "  oc get pods -n llm-d -l app=deepep-test-multinode"
+              echo "  oc logs -n llm-d deepep-test-0 -c test | grep bandwidth"
+              echo "  oc logs -n llm-d deepep-test-1 -c test | grep bandwidth"
+              echo ""
+              echo "Expected results:"
+              echo "  - Dispatch + Combine: ~17-18 GB/s per rank"
+              echo "  - Test should complete in ~2-3 minutes"
+              echo ""
+
+          volumeMounts:
+            - name: test-config
+              mountPath: /config
+            - name: shared-data
+              mountPath: /data
+
+      volumes:
+        - name: discovery-script
+          configMap:
+            name: gpu-rdma-discovery-script
+            defaultMode: 0755
+        - name: test-config
+          configMap:
+            name: deepep-test-config
+        - name: shared-data
+          emptyDir: {}

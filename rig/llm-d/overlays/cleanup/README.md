@@ -9,7 +9,7 @@ Removes all resources created by llm-d deployments while preserving:
 - The `llm-d-client` serviceaccount and RBAC
 - Prerequisites like `llm-d-hf-token` secret
 
-**Note:** The `llm-d-client` pod is now removed during cleanup as it has fulfilled its deployment role. Use the `inference-test` overlay to verify deployments instead.
+**Note:** The `llm-d-client` pod is now removed during cleanup as it has fulfilled its deployment role. Use the `guidellm-inference-test` overlay to verify deployments instead.
 
 ## What Gets Deleted
 
@@ -20,7 +20,7 @@ The cleanup job removes the following resources in order:
 3. **Gateways** - Gateway API gateway instances
 4. **Deployments** - All application deployments
 5. **StatefulSets** - Any stateful workloads
-6. **LeaderWorkerSets** - LeaderWorkerSet CRs (for wide-EP)
+6. **LeaderWorkerSets** - LeaderWorkerSet CRs (for ep-multinode, deepep-test, etc.)
 7. **Services** - All services
 8. **ConfigMaps** - Configuration data
 9. **Jobs** - Deployment and installation jobs (except this cleanup job)
@@ -94,17 +94,17 @@ oc apply -k rig/llm-d/overlays/pd-disaggregation-multinode
 
 ### Verify Deployment
 
-Use the `inference-test` job to verify your deployment is working:
+Use the `guidellm-inference-test` job to verify your deployment is working:
 
 ```bash
 # Deploy inference test job
-oc apply -k rig/llm-d/overlays/inference-test
+oc apply -k rig/llm-d/overlays/guidellm-inference-test
 
 # Watch test progress
-oc logs -n llm-d job/llm-d-inference-test -f
+oc logs -n llm-d job/llm-d-guidellm-inference-test -f
 ```
 
-See **[overlays/inference-test/README.md](../inference-test/README.md)** for details.
+See **[overlays/guidellm-inference-test/README.md](../guidellm-inference-test/README.md)** for details.
 
 ## Troubleshooting
 

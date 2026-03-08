@@ -4,7 +4,7 @@ kind: Kustomization
 namespace: llm-d
 
 # Inference Test Overlay - Runs guidellm benchmark on deployed models
-# Usage: oc apply -k rig/llm-d/overlays/inference-test
+# Usage: oc apply -k rig/llm-d/overlays/guidellm-inference-test
 
 resources:
   # Wave -1: Namespace + RBAC

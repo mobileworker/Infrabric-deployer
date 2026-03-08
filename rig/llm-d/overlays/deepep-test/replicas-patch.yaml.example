@@ -1,0 +1,16 @@
+# Example: Configure for different number of nodes
+# Copy this file to replicas-patch.yaml and adjust replicas value
+# Then add to kustomization.yaml patches section
+
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: deepep-test
+  namespace: llm-d
+spec:
+  # Change this to match your number of GPU nodes
+  # Examples:
+  #   2 nodes (16 GPUs) = replicas: 2
+  #   3 nodes (24 GPUs) = replicas: 3
+  #   4 nodes (32 GPUs) = replicas: 4
+  replicas: 3

@@ -16,6 +16,6 @@ spec:
     - backendRefs:
         - group: inference.networking.k8s.io
           kind: InferencePool
-          name: gaie-ep
+          name: gaie-pd
           port: 8000
           weight: 1

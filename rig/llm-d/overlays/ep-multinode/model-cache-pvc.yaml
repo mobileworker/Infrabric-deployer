@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wide-ep-model-cache
+  namespace: llm-d
+  labels:
+    app: llm-d
+    component: wide-ep-multinode
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+    description: "Shared model cache for Wide-EP deployment"
+spec:
+  accessModes:
+    - ReadWriteMany  # Required for NFS to allow multiple pods to mount
+  storageClassName: nfs-disk-1-sc  # REPLACE with your NFS storage class
+  resources:
+    requests:
+      storage: 1Ti  # 1TB for model cache and headroom

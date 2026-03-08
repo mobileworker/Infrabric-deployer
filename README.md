@@ -36,7 +36,7 @@ InfraBrig Deployer provides a complete, production-ready ArgoCD-based GitOps dep
 - **[llm-d (LLM Distributed)](rig/llm-d/README.md)** - Automated deployment of distributed LLM inference workloads
   - **Scenarios**: Inference scheduling, P/D disaggregation (single/multi-node), Wide-EP for MoE models
   - **Features**: Gateway API integration, RDMA support, dynamic resource discovery
-  - **Testing**: Automated inference validation with guidellm
+  - **Testing**: Automated inference validation with guidellm, RDMA/NVSHMEM validation with DeepEP test
   - **Cleanup**: Single-command deployment cleanup overlay
 
 ### 📖 Guides
@@ -251,7 +251,7 @@ Infrabric-deployer/
     │   └── namespace.yaml         # Target namespace
     ├── llm-d/                     # LLM distributed inference deployments
     │   ├── prereq/                # Prerequisites (client-tools, gateway-provider)
-    │   └── overlays/              # Deployment scenarios (inference-scheduling, P/D disaggregation, wide-EP, cleanup)
+    │   └── overlays/              # Deployment scenarios (inference-scheduling, P/D disaggregation, ep-multinode, deepep-test, cleanup)
     ├── aws/                       # AWS deployment (coming soon)
     └── ibm-cloud/                 # IBM Cloud deployment (coming soon)
 
@@ -447,6 +447,51 @@ oc delete daemonset network-perf-test-worker -n default
 ```
 
 **Note:** The test coordinator Job dynamically creates a DaemonSet at runtime (not managed by kustomize). You must manually delete the DaemonSet after testing, as `oc delete -k` only removes the Job and ConfigMap template.
+
+### DeepEP Multi-Node RDMA/NVSHMEM Validation
+
+The DeepEP test validates RDMA/NVSHMEM functionality for multi-node Expert Parallelism deployments. This test should be run **before** deploying production Wide-EP workloads to ensure the infrastructure is properly configured.
+
+**Purpose:**
+- Validates NVSHMEM IBGDA works correctly across Kubernetes pods
+- Confirms InfiniBand RDMA devices are properly exposed and configured
+- Tests GPU-to-GPU communication across nodes
+- Verifies Expert Parallelism communication primitives
+
+See **[DeepEP Test README](rig/llm-d/overlays/deepep-test/README.md)** for full documentation.
+
+```bash
+# Deploy the test (default: 3 nodes, 8 GPUs per node)
+oc apply -k rig/llm-d/overlays/deepep-test
+
+# Watch pods start
+oc get pods -n llm-d -l app=deepep-test-multinode -w
+
+# Check test results (wait ~2-3 minutes for test to complete)
+oc logs -n llm-d deepep-test-0 -c test | grep "bandwidth"
+oc logs -n llm-d deepep-test-1 -c test | grep "bandwidth"
+oc logs -n llm-d deepep-test-2 -c test | grep "bandwidth"
+
+# Expected results:
+# - Dispatch + Combine bandwidth: ~17-18 GB/s per rank
+# - All ranks successfully complete communication test
+# - No NVSHMEM or RDMA errors
+
+# Cleanup
+oc apply -k rig/llm-d/overlays/cleanup
+```
+
+**Expected Results:**
+- All nodes (e.g., 3 nodes with 24 GPUs total) successfully communicate
+- Dispatch + Combine bandwidth: ~17-18 GB/s per rank
+- Dispatch bandwidth: ~15-20 GB/s
+- Combine bandwidth: ~17-19 GB/s
+- Test completes successfully on all ranks
+
+**Prerequisites:**
+- RDMA shared device resources available on GPU nodes
+- InfiniBand or RoCE network properly configured
+- GPUDirect RDMA enabled (BIOS IOMMU settings)
 
 ---
 

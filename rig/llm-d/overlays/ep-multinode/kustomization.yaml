@@ -6,7 +6,7 @@ kind: Kustomization
 
 # Wide-EP Multi-Node Deployment
 # Deploy DeepSeek-R1-0528 with Expert Parallelism across multiple GPU nodes
-# Usage: oc apply -k rig/llm-d/overlays/wide-ep-multinode
+# Usage: oc apply -k rig/llm-d/overlays/ep-multinode
 
 resources:
   # Wave -1: Namespace + RBAC + Resource Discovery
@@ -14,9 +14,12 @@ resources:
   - ../../prereq/resource-discovery
 
   # Wave 5: Istio namespace
+  # Wave 10: Create model cache PVC
+  - model-cache-pvc.yaml              # Shared NFS PVC for model cache
+
   # Wave 10: Install Istio gateway
-  # Wave 15: Install InferencePool controller
-  # Wave 18: Wait for gateway ready
+  # Wave 15: Download model to PVC, Install InferencePool controller
+  - model-download-job.yaml           # Pre-download model to shared PVC
   - ../../prereq/istio-gateway
   - ../../prereq/inferencepool-controller
 
@@ -25,7 +28,7 @@ resources:
   - gaie-values-configmap.yaml        # InferencePool configuration (Helm values)
   - ms-manifests-configmap.yaml       # Model server LeaderWorkerSet manifests
 
-  # Wave 25: Deploy Wide-EP Multi-Node
+  # Wave 25: Deploy Wide-EP Multi-Node (waits for model download)
   - deploy-ep-job.yaml                # Deployment job
 
   # Wave 30: HTTP Routing
@@ -35,8 +38,8 @@ resources:
 labels:
   - pairs:
       app.kubernetes.io/name: llm-d
-      app.kubernetes.io/component: wide-ep-multinode
-      deployment-type: wide-ep-multinode
+      app.kubernetes.io/component: ep-multinode
+      deployment-type: ep-multinode
     includeSelectors: false
 
 # No patches needed - all configuration is in manifests

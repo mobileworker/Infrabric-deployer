@@ -12,7 +12,7 @@ The client tools pod is a temporary deployment pod that provides tools needed fo
 - **helmfile** v1.2.1 - Declarative Helm chart deployment tool
 - **yq** v4+ - YAML processor
 
-**Note:** This pod is automatically removed after deployment completes. Use the `inference-test` overlay to verify deployments.
+**Note:** This pod is automatically removed after deployment completes. Use the `guidellm-inference-test` overlay to verify deployments.
 
 ## Quick Start
 
@@ -157,10 +157,10 @@ The `llm-d-client` pod is automatically removed after deployment jobs complete. 
 1. **After successful deployment**: Each deployment job (Step 4: Cleanup) deletes the client pod once model servers are ready
 2. **During cleanup overlay**: The cleanup job removes the client pod along with other resources
 
-To verify deployments, use the inference-test overlay instead:
+To verify deployments, use the guidellm-inference-test overlay instead:
 ```bash
-oc apply -k rig/llm-d/overlays/inference-test
-oc logs -n llm-d job/llm-d-inference-test -f
+oc apply -k rig/llm-d/overlays/guidellm-inference-test
+oc logs -n llm-d job/llm-d-guidellm-inference-test -f
 ```
 
 ## Notes

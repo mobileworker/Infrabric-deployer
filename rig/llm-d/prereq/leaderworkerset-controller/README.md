@@ -46,7 +46,8 @@ All llm-d deployment scenarios use LeaderWorkerSet:
 - `inference-scheduling` - Single-pod LeaderWorkerSets for replica management
 - `pd-disaggregation` - Coordinated prefill and decode pods
 - `pd-disaggregation-multinode` - Multi-node P/D with RDMA communication
-- `wide-ep-multinode` - Expert Parallelism with leader-worker coordination
+- `ep-multinode` - Expert Parallelism with leader-worker coordination
+- `deepep-test` - DeepEP RDMA/NVSHMEM validation
 
 ## Cleanup
 

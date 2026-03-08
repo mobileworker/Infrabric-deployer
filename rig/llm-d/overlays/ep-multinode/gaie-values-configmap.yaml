@@ -78,6 +78,8 @@ data:
     inferenceExtension:
       replicas: 1
       flags:
+        # in vLLM 10.0+, the metric is renamed while upstream GAIE is still using the old name as default.
+        # See https://github.com/kubernetes-sigs/gateway-api-inference-extension/pull/1905.
         kv-cache-usage-percentage-metric: "vllm:kv_cache_usage_perc"
         v: 1
       image:
@@ -87,15 +89,18 @@ data:
       extProcPort: 9002
       monitoring:
         interval: "10s"
+        # Service account token secret for authentication
         secret:
           name: wide-ep-gateway-sa-metrics-reader-secret
+        # Prometheus ServiceMonitor will be created when enabled for EPP metrics collection
         prometheus:
           enabled: true
       pluginsConfigFile: "custom-plugins.yaml"
       pluginsCustomConfig:
         custom-plugins.yaml: |
           # ALWAYS DO PD IN THIS EXAMPLE (THRESHOLD 0)
-          # Random routing for EP since routing to individual DP ranks not yet supported
+          # This example uses random routing
+          # since it's not yet possible to route to individual DP ranks
           apiVersion: inference.networking.x-k8s.io/v1alpha1
           kind: EndpointPickerConfig
           plugins:
@@ -120,11 +125,14 @@ data:
             - pluginRef: random-picker
 
     inferencePool:
+      targetPorts:
+        - number: 8000
+      modelServerType: vllm
       modelServers:
         matchLabels:
           llm-d.ai/inference-serving: "true"
           llm-d.ai/guide: "wide-ep-multinode"
-          llm-d.ai/model: DeepSeek-R1-0528
+          llm-d.ai/model: Qwen3-235B-A22B-FP8
 
     provider:
       name: istio

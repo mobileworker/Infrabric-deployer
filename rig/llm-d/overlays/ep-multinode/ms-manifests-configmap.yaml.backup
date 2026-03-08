@@ -1,0 +1,362 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ms-ep-manifests
+  namespace: llm-d
+  labels:
+    app: llm-d
+    component: wide-ep-multinode
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+    description: "Model server Kubernetes manifests - Multi-node Wide-EP"
+data:
+  ep-lws.yaml: |
+    ---
+    apiVersion: leaderworkerset.x-k8s.io/v1
+    kind: LeaderWorkerSet
+    metadata:
+      name: wide-ep-prefill
+      namespace: llm-d
+      labels:
+        llm-d.ai/inference-serving: "true"
+        llm-d.ai/guide: "wide-ep-multinode"
+        llm-d.ai/accelerator-variant: "gpu"
+        llm-d.ai/accelerator-vendor: "nvidia"
+        llm-d.ai/model: Qwen3-235B-A22B-FP8
+        llm-d.ai/role: prefill
+    spec:
+      replicas: 1
+      leaderWorkerTemplate:
+        size: 1
+        workerTemplate:
+          metadata:
+            labels:
+              llm-d.ai/inference-serving: "true"
+              llm-d.ai/guide: "wide-ep-multinode"
+              llm-d.ai/accelerator-variant: "gpu"
+              llm-d.ai/accelerator-vendor: "nvidia"
+              llm-d.ai/model: Qwen3-235B-A22B-FP8
+              llm-d.ai/role: prefill
+          spec:
+            serviceAccountName: llm-d-modelserver
+            volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 160Gi
+              - name: hf-cache
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 200Gi
+              - name: jit-cache
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 20Gi
+            containers:
+              - name: vllm
+                image: ghcr.io/llm-d/llm-d-cuda:v0.5.0
+                securityContext:
+                  capabilities:
+                    add:
+                      - IPC_LOCK
+                      - SYS_RAWIO
+                  runAsGroup: 0
+                  runAsUser: 0
+                imagePullPolicy: Always
+                command:
+                  - /bin/bash
+                  - -c
+                args:
+                  - |-
+                    # Clear /dev/shm on start to prevent running out of space when crashes occur
+                    # https://github.com/llm-d/llm-d/issues/352
+                    find /dev/shm -type f -delete
+
+                    #################
+                    # RUN vLLM prefill worker (TP+PP architecture)
+                    #################
+                    exec vllm serve \
+                      RedHatAI/Qwen3-235B-A22B-FP8-dynamic \
+                      --port 8000 \
+                      --disable-log-requests \
+                      --disable-uvicorn-access-log \
+                      --tensor-parallel-size 8 \
+                      --distributed-executor-backend ray \
+                      --gpu-memory-utilization 0.95 \
+                      --max-model-len 8192 \
+                      --trust-remote-code \
+                      --kv_transfer_config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+
+                env:
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: llm-d-hf-token
+                        key: HF_TOKEN
+                        optional: false
+                  # Force V0 engine (V1 is experimental and unstable for large MoE)
+                  - name: VLLM_USE_V1
+                    value: "0"
+                  # CUDA driver compatibility
+                  - name: CUDA_MODULE_LOADING
+                    value: "LAZY"
+                  - name: NCCL_DEBUG
+                    value: "INFO"
+                  # Networking
+                  - name: TRITON_LIBCUDA_PATH
+                    value: /usr/lib64
+                  - name: GLOO_SOCKET_IFNAME
+                    value: eth0
+                  - name: NCCL_SOCKET_IFNAME
+                    value: eth0
+                  - name: VLLM_LOGGING_LEVEL
+                    value: INFO
+                  - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: status.podIP
+                  # Ray distributed backend
+                  - name: RAY_DEDUP_LOGS
+                    value: "0"
+                  # Use cache directories from the mounted volume
+                  - name: CUDA_CACHE_PATH
+                    value: /var/cache/vllm/cuda
+                  - name: CCACHE_DIR
+                    value: /var/cache/vllm/ccache
+                  - name: VLLM_CACHE_ROOT
+                    value: /var/cache/vllm/vllm
+                  - name: FLASHINFER_WORKSPACE_BASE
+                    value: /var/cache/vllm/flashinfer
+                  - name: HF_HUB_CACHE
+                    value: /var/cache/huggingface
+
+                ports:
+                  - containerPort: 8000
+                    name: vllm
+                    protocol: TCP
+                  - containerPort: 5600
+                    name: nixl
+                    protocol: TCP
+                startupProbe:
+                  httpGet:
+                    path: /health
+                    port: vllm
+                  initialDelaySeconds: 0
+                  periodSeconds: 1
+                  timeoutSeconds: 5
+                  failureThreshold: 2700
+                livenessProbe:
+                  httpGet:
+                    path: /health
+                    port: vllm
+                  periodSeconds: 30
+                  timeoutSeconds: 5
+                  failureThreshold: 3
+                readinessProbe:
+                  httpGet:
+                    path: /v1/models
+                    port: vllm
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+                  failureThreshold: 3
+                resources:
+                  limits:
+                    ephemeral-storage: 50Gi
+                    memory: 512Gi
+                    nvidia.com/gpu: "8"
+                  requests:
+                    cpu: 32
+                    ephemeral-storage: 50Gi
+                    memory: 512Gi
+                    nvidia.com/gpu: "8"
+                volumeMounts:
+                  - name: dshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /var/cache/huggingface
+                  - name: jit-cache
+                    mountPath: /var/cache/vllm
+    ---
+    apiVersion: leaderworkerset.x-k8s.io/v1
+    kind: LeaderWorkerSet
+    metadata:
+      name: wide-ep-decode
+      namespace: llm-d
+      labels:
+        llm-d.ai/inference-serving: "true"
+        llm-d.ai/guide: "wide-ep-multinode"
+        llm-d.ai/accelerator-variant: "gpu"
+        llm-d.ai/accelerator-vendor: "nvidia"
+        llm-d.ai/model: Qwen3-235B-A22B-FP8
+        llm-d.ai/role: decode
+    spec:
+      replicas: 1
+      leaderWorkerTemplate:
+        size: 2
+        workerTemplate:
+          metadata:
+            labels:
+              llm-d.ai/inference-serving: "true"
+              llm-d.ai/guide: "wide-ep-multinode"
+              llm-d.ai/accelerator-variant: "gpu"
+              llm-d.ai/accelerator-vendor: "nvidia"
+              llm-d.ai/model: Qwen3-235B-A22B-FP8
+              llm-d.ai/role: decode
+          spec:
+            serviceAccountName: llm-d-modelserver
+            initContainers:
+              - name: routing-proxy
+                args:
+                  - --port=8000
+                  - --vllm-port=8200
+                  - --connector=nixlv2
+                  - --zap-log-level=1
+                  - --secure-proxy=false
+                  - --enable-prefiller-sampling
+                image: ghcr.io/llm-d/llm-d-routing-sidecar:v0.5.0
+                imagePullPolicy: Always
+                ports:
+                  - containerPort: 8000
+                    name: sidecar
+                    protocol: TCP
+                resources: {}
+                restartPolicy: Always
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  runAsNonRoot: true
+            volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 160Gi
+              - name: hf-cache
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 200Gi
+              - name: jit-cache
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 20Gi
+            containers:
+              - name: vllm
+                image: ghcr.io/llm-d/llm-d-cuda:v0.5.0
+                securityContext:
+                  capabilities:
+                    add:
+                      - IPC_LOCK
+                      - SYS_RAWIO
+                  runAsGroup: 0
+                  runAsUser: 0
+                imagePullPolicy: Always
+                command:
+                  - /bin/bash
+                  - -c
+                args:
+                  - |-
+                    # Clear /dev/shm on start to prevent running out of space when crashes occur
+                    # https://github.com/llm-d/llm-d/issues/352
+                    find /dev/shm -type f -delete
+
+                    #################
+                    # RUN vLLM decode worker (TP+PP architecture)
+                    #################
+                    exec vllm serve \
+                      RedHatAI/Qwen3-235B-A22B-FP8-dynamic \
+                      --port 8200 \
+                      --disable-log-requests \
+                      --disable-uvicorn-access-log \
+                      --tensor-parallel-size 8 \
+                      --distributed-executor-backend ray \
+                      --gpu-memory-utilization 0.95 \
+                      --max-model-len 8192 \
+                      --trust-remote-code \
+                      --kv_transfer_config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+                env:
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: llm-d-hf-token
+                        key: HF_TOKEN
+                        optional: false
+                  # Force V0 engine (V1 is experimental and unstable for large MoE)
+                  - name: VLLM_USE_V1
+                    value: "0"
+                  # CUDA driver compatibility
+                  - name: CUDA_MODULE_LOADING
+                    value: "LAZY"
+                  - name: NCCL_DEBUG
+                    value: "INFO"
+                  # Networking
+                  - name: TRITON_LIBCUDA_PATH
+                    value: /usr/lib64
+                  - name: GLOO_SOCKET_IFNAME
+                    value: eth0
+                  - name: NCCL_SOCKET_IFNAME
+                    value: eth0
+                  - name: VLLM_LOGGING_LEVEL
+                    value: INFO
+                  - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: status.podIP
+                  # Ray distributed backend
+                  - name: RAY_DEDUP_LOGS
+                    value: "0"
+                  # Use cache directories from the mounted volume
+                  - name: CUDA_CACHE_PATH
+                    value: /var/cache/vllm/cuda
+                  - name: CCACHE_DIR
+                    value: /var/cache/vllm/ccache
+                  - name: VLLM_CACHE_ROOT
+                    value: /var/cache/vllm/vllm
+                  - name: FLASHINFER_WORKSPACE_BASE
+                    value: /var/cache/vllm/flashinfer
+                  - name: HF_HUB_CACHE
+                    value: /var/cache/huggingface
+
+                ports:
+                  - containerPort: 8200
+                    name: vllm
+                    protocol: TCP
+                  - containerPort: 5600
+                    name: nixl
+                    protocol: TCP
+                startupProbe:
+                  httpGet:
+                    path: /health
+                    port: vllm
+                  initialDelaySeconds: 0
+                  periodSeconds: 1
+                  timeoutSeconds: 5
+                  failureThreshold: 2700
+                livenessProbe:
+                  httpGet:
+                    path: /health
+                    port: vllm
+                  periodSeconds: 30
+                  timeoutSeconds: 5
+                  failureThreshold: 3
+                readinessProbe:
+                  httpGet:
+                    path: /v1/models
+                    port: vllm
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+                  failureThreshold: 3
+                resources:
+                  limits:
+                    ephemeral-storage: 50Gi
+                    memory: 512Gi
+                    nvidia.com/gpu: "8"
+                  requests:
+                    cpu: 32
+                    ephemeral-storage: 50Gi
+                    memory: 512Gi
+                    nvidia.com/gpu: "8"
+                volumeMounts:
+                  - name: dshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /var/cache/huggingface
+                  - name: jit-cache
+                    mountPath: /var/cache/vllm

@@ -4,7 +4,7 @@
 
 Wide Expert Parallelism (EP/DP) deployment for DeepSeek-R1-0528 across multiple nodes. Leverages vLLM's P/D disaggregation with NIXL for distributed expert parallelism.
 
-**Model**: DeepSeek-R1-0528 (Mixture of Experts)
+**Model**: Qwen3-235B-A22B-FP8 (Mixture of Experts with FP8 quantization)
 
 **Configuration**:
 - Dynamically discovers available GPU nodes and GPUs per node
@@ -28,9 +28,15 @@ All prerequisites are automatically deployed:
 
 - ✅ Client tools pod (automatically removed after deployment completes)
 - ✅ Gateway provider (Istio)
-- ✅ HuggingFace token secret (empty by default, update for gated models like DeepSeek-R1)
+- ✅ HuggingFace token secret (empty by default, update for gated models)
 - ⏳ LeaderWorkerSet controller (required for multi-host inference - manual installation)
 - ⏳ Full mesh RDMA connectivity (verify with network-perf-tests)
+- ⏳ **Shared model cache PVC** (required - see Model Cache Setup below)
+
+**Storage Requirements**:
+- ReadWriteMany (RWX) storage class (NFS or similar)
+- 1TB available storage for model cache
+- The model (~200GB) is downloaded once and shared across all pods
 
 **CRITICAL**: This deployment requires All-to-All RDMA connectivity. Every NIC on a host must communicate with every NIC on all other hosts. Rail-only connectivity will fail.
 
@@ -45,7 +51,27 @@ kubectl apply -f https://github.com/kubernetes-sigs/lws/releases/latest/download
 
 ## Quick Start
 
-### 1. Verify Infrastructure
+### 1. Configure Storage Class (if needed)
+
+**IMPORTANT**: If your cluster doesn't have `nfs-disk-1-sc` storage class, update it **before deploying**:
+
+```bash
+# 1. Find your RWX storage class
+kubectl get storageclass | grep -i nfs
+
+# 2. Edit the PVC to use your storage class
+vi rig/llm-d/overlays/ep-multinode/model-cache-pvc.yaml
+# Update: storageClassName: your-nfs-sc  # REPLACE with your RWX storage class
+```
+
+See **[SETUP-MODEL-CACHE.md](SETUP-MODEL-CACHE.md)** for details.
+
+**Note**: The deployment will automatically:
+- Create a 1TB PVC for model cache (Wave 10)
+- Download the model to the PVC (Wave 15, ~20-30 min)
+- Wait for download to complete before deploying pods (Wave 25)
+
+### 2. Verify Infrastructure
 
 ```bash
 # Check RDMA connectivity
@@ -58,48 +84,98 @@ oc get crd leaderworkersets.leaderworkerset.x-k8s.io
 oc apply -k manifests/99-network-perf-tests
 ```
 
-### 2. Deploy
+### 3. Deploy
 
-**Single command deployment**:
+**Single command deployment** - everything is automatic:
 
 ```bash
-oc apply -k rig/llm-d/overlays/wide-ep-multinode
+oc apply -k rig/llm-d/overlays/ep-multinode
 ```
 
-This automatically creates namespace, RBAC, and prerequisites.
+This automatically:
+- Creates namespace, RBAC, and prerequisites
+- **Wave 10**: Creates 1TB PVC for model cache
+- **Wave 15**: Downloads Qwen3-235B-A22B-FP8 model (~200GB, 20-30 min)
+- **Wave 25**: Deploys prefill/decode pods (waits for model download)
 
-**For gated models** (DeepSeek-R1 requires HuggingFace token):
+**Monitor deployment**:
+```bash
+# Watch model download
+kubectl logs -n llm-d -l job=model-download --follow
+
+# Watch pod startup (after model download completes)
+kubectl get pods -n llm-d -l llm-d.ai/guide=ep-multinode -w
+```
+
+**For gated models** (e.g., DeepSeek-R1, Llama models):
 
 ```bash
+# Some models require a HuggingFace token
 # The HF_TOKEN secret is automatically created (empty by default)
-# Update it with your token for DeepSeek-R1:
+# Update it with your token if using gated models:
 export HF_TOKEN=hf_your_token_here
 oc create secret generic llm-d-hf-token \
   --from-literal="HF_TOKEN=${HF_TOKEN}" \
   --namespace llm-d \
   --dry-run=client -o yaml | oc apply -f -
 
-# Restart pods to pick up the token
-oc delete pods -n llm-d -l llm-d.ai/guide=wide-ep-multinode
+# Re-run model download job with the token
+kubectl delete job wide-ep-model-download -n llm-d
+kubectl apply -f rig/llm-d/overlays/ep-multinode/model-download-job.yaml
 ```
+
+**Note**: The current model (Qwen3-235B-A22B-FP8) does not require a HuggingFace token.
 
 ## Customization
 
 ### Change the Model
 
-You can use any MoE (Mixture of Experts) model compatible with vLLM by editing `ms-manifests-configmap.yaml`:
+You can use any MoE (Mixture of Experts) model compatible with vLLM:
 
+**Step 1**: Update the model in the download job:
+```bash
+# Edit the download job
+vi rig/llm-d/overlays/ep-multinode/model-download-job.yaml
+
+# Update the model_id
+model_id = 'mistralai/Mixtral-8x22B-Instruct-v0.1'  # Your custom MoE model
+```
+
+**Step 2**: Update the model in the ConfigMap:
 ```bash
 # Edit the ConfigMap
-vi rig/llm-d/overlays/wide-ep-multinode/ms-manifests-configmap.yaml
+vi rig/llm-d/overlays/ep-multinode/ms-manifests-configmap.yaml
 
-# Update the MODEL environment variable
-env:
-  - name: MODEL
-    value: "mistralai/Mixtral-8x22B-Instruct-v0.1"  # Your custom MoE model
+# Update the vllm serve command (appears in both prefill and decode sections)
+exec vllm serve \
+  mistralai/Mixtral-8x22B-Instruct-v0.1 \  # Your custom MoE model
+  --port 8000 \
+  ...
+```
+
+**Step 3**: Update the model cache PVC size if needed:
+```bash
+# Larger models may require more storage (default is 1TB)
+vi rig/llm-d/overlays/ep-multinode/model-cache-pvc.yaml
+
+# Adjust storage size
+storage: 2Ti  # For very large models
+```
+
+**Step 4**: Redeploy:
+```bash
+# Delete existing deployment (keeps PVC by default)
+oc delete -k rig/llm-d/overlays/ep-multinode
+
+# If changing models, also delete the PVC to clear old cache
+kubectl delete pvc wide-ep-model-cache -n llm-d
+
+# Redeploy (automatically downloads new model)
+oc apply -k rig/llm-d/overlays/ep-multinode
 ```
 
 **Supported MoE Models**:
+- Qwen3-235B-A22B-FP8 (235B, 128 experts, FP8 quantized) - **Default**
 - DeepSeek-R1-0528 (671B, 256 experts)
 - DeepSeek-V2/V3 (MoE)
 - Mixtral-8x7B, Mixtral-8x22B
@@ -110,8 +186,9 @@ See [vLLM supported models](https://docs.vllm.ai/en/latest/models/supported_mode
 
 **Note**:
 - Expert Parallelism requires MoE models (models with multiple experts)
-- For gated models, update the HuggingFace token secret before deploying
+- For gated models, update the HuggingFace token secret before downloading
 - Adjust GPU count and parallelism settings based on model size
+- Model size directly impacts PVC storage requirements
 
 ## Architecture
 
@@ -179,8 +256,30 @@ oc describe leaderworkerset <name> -n ${NAMESPACE}
 oc get pods -n ${NAMESPACE} -o wide
 ```
 
+## Cleanup
+
+To remove the Wide-EP deployment:
+
+```bash
+# Remove the deployment (keeps the model cache PVC)
+oc delete -k rig/llm-d/overlays/ep-multinode
+```
+
+**Important**: The model cache PVC (`wide-ep-model-cache`) is **NOT** deleted during cleanup. This is intentional - the cached model (~200GB) is preserved to avoid re-downloading on future deployments.
+
+To completely remove everything including the cached model:
+```bash
+# First remove the deployment
+oc delete -k rig/llm-d/overlays/ep-multinode
+
+# Then manually delete the PVC (WARNING: deletes cached model)
+kubectl delete pvc wide-ep-model-cache -n llm-d
+```
+
+See [SETUP-MODEL-CACHE.md](SETUP-MODEL-CACHE.md#cleanup) for more details.
+
 ## References
 
 - [llm-d Wide-EP Guide](https://github.com/llm-d/llm-d/tree/main/guides/wide-ep-lws)
 - [LeaderWorkerSet Documentation](https://github.com/kubernetes-sigs/lws)
-- [DeepSeek-R1 Model](https://huggingface.co/deepseek-ai/DeepSeek-R1-0528)
+- [Model Cache Setup Guide](SETUP-MODEL-CACHE.md)

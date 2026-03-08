@@ -18,48 +18,66 @@ data:
       name: wide-ep-prefill
       namespace: llm-d
       labels:
-        app: llm-d
-        component: wide-ep-multinode
         llm-d.ai/inference-serving: "true"
-        llm-d.ai/guide: wide-ep-multinode
+        llm-d.ai/guide: "wide-ep-multinode"
+        llm-d.ai/accelerator-variant: "gpu"
+        llm-d.ai/accelerator-vendor: "nvidia"
+        llm-d.ai/model: Qwen3-235B-A22B-FP8
         llm-d.ai/role: prefill
-        llm-d.ai/model: DeepSeek-R1-0528
     spec:
       replicas: 1
       leaderWorkerTemplate:
-        size: 2
+        size: 1
         workerTemplate:
           metadata:
             labels:
               llm-d.ai/inference-serving: "true"
-              llm-d.ai/guide: wide-ep-multinode
+              llm-d.ai/guide: "wide-ep-multinode"
               llm-d.ai/accelerator-variant: "gpu"
               llm-d.ai/accelerator-vendor: "nvidia"
-              llm-d.ai/model: DeepSeek-R1-0528
+              llm-d.ai/model: Qwen3-235B-A22B-FP8
               llm-d.ai/role: prefill
-            annotations:
-              inference.lanl.gov/model-name: DeepSeek-R1-0528
           spec:
             serviceAccountName: llm-d-modelserver
+            initContainers:
+              - name: rdma-discovery
+                image: ghcr.io/llm-d/llm-d-cuda:v0.5.1
+                command: ["/bin/bash", "-c"]
+                args:
+                  - |
+                    /scripts/discover.sh
+                    echo "--- RDMA Discovery Complete ---"
+                    cat /data/vllm_env.sh
+                volumeMounts:
+                  - name: discovery-script
+                    mountPath: /scripts
+                  - name: discovery-data
+                    mountPath: /data
+                securityContext:
+                  capabilities:
+                    add:
+                      - IPC_LOCK
+                  runAsGroup: 0
+                  runAsUser: 0
             volumes:
               - name: dshm
                 emptyDir:
                   medium: Memory
-                  sizeLimit: 256Gi
+                  sizeLimit: 2Gi
               - name: hf-cache
-                emptyDir: {}
+                persistentVolumeClaim:
+                  claimName: wide-ep-model-cache
               - name: jit-cache
                 emptyDir: {}
-              - name: rdma-script
+              - name: discovery-script
                 configMap:
                   name: ib-hca-discovery-script
                   defaultMode: 0755
-              - name: dev-infiniband
-                hostPath:
-                  path: /dev/infiniband
+              - name: discovery-data
+                emptyDir: {}
             containers:
               - name: vllm
-                image: ghcr.io/llm-d/llm-d-cuda:v0.5.0
+                image: ghcr.io/llm-d/llm-d-cuda:v0.5.1
                 securityContext:
                   capabilities:
                     add:
@@ -73,31 +91,35 @@ data:
                   - /bin/bash
                   - -c
                 args:
-                  - |
-                    ulimit -l unlimited || true
-
-                    # Source RDMA discovery script if available
-                    if [ -f /scripts/discover_ib_hca.sh ]; then
-                      source /scripts/discover_ib_hca.sh
-                      echo "--- Loaded RDMA environment ---"
-                    fi
-
-                    # Clear /dev/shm on start
+                  - |-
+                    # Clear /dev/shm on start to prevent running out of space when crashes occur
+                    # https://github.com/llm-d/llm-d/issues/352
                     find /dev/shm -type f -delete
 
-                    echo "--- Launching vLLM Prefill (Wide-EP Multi-Node) ---"
-                    echo "Model: DeepSeek-R1-0528"
-                    echo "TP Size: ${TP_SIZE}"
-                    echo "DP Size Local: ${DP_SIZE_LOCAL}"
-                    echo "LWS Worker Index: ${LWS_WORKER_INDEX:-0}"
-                    echo "LWS Group Size: ${LWS_GROUP_SIZE}"
-                    echo "NCCL_IB_HCA: ${NCCL_IB_HCA}"
-                    echo "NVSHMEM Transport: ${NVSHMEM_REMOTE_TRANSPORT}"
+                    # Source RDMA discovery environment variables
+                    if [ -f /data/vllm_env.sh ]; then
+                      echo "Loading RDMA configuration..."
+                      source /data/vllm_env.sh
+                      env | grep -E "NCCL_|NVSHMEM_|UCX_|MGMT_|DATA_" | sort
+                    fi
 
+                    #################
+                    # RUN vLLM prefill worker (Wide-EP)
+                    #################
                     START_RANK=$(( ${LWS_WORKER_INDEX:-0} * DP_SIZE_LOCAL ))
 
+                    # Set unlimited locked memory for RDMA/NVSHMEM
+                    echo "Setting ulimit -l unlimited..."
+                    if ulimit -l unlimited; then
+                      echo "SUCCESS: ulimit -l set to unlimited (was: $(ulimit -H -l))"
+                      echo "Current soft limit: $(ulimit -l)"
+                    else
+                      echo "ERROR: Failed to set ulimit -l unlimited"
+                      exit 1
+                    fi
+
                     exec vllm serve \
-                      deepseek-ai/DeepSeek-R1-0528 \
+                      Qwen/Qwen3-235B-A22B-Thinking-2507-FP8 \
                       --port 8000 \
                       --trust-remote-code \
                       --disable-uvicorn-access-log \
@@ -109,21 +131,35 @@ data:
                       --data-parallel-address ${LWS_LEADER_ADDRESS} \
                       --data-parallel-rpc-port 5555 \
                       --data-parallel-start-rank $START_RANK \
-                      --kv_transfer_config '{"kv_connector":"NixlConnector",
-                                              "kv_role":"kv_both",
-                                              "kv_load_failure_policy":"fail"}' \
+                      --kv_transfer_config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail"}' \
                       --async-scheduling \
-                      --enable-dbo \
-                      --dbo-prefill-token-threshold 32 \
                       --enable-eplb \
-                      --eplb-config '{"window_size":"1000",
-                                      "step_interval":"3000",
-                                      "num_redundant_experts":"32",
-                                      "log_balancedness":"False"}' \
-                      --gpu-memory-utilization 0.75 \
-                      --max-model-len 8192 || sleep infinity
+                      --eplb-config '{"window_size":"1000","step_interval":"3000","num_redundant_experts":"32","log_balancedness":"False"}' \
+                      --all2all-backend deepep_high_throughput \
+                      --gpu-memory-utilization 0.75
 
                 env:
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: llm-d-hf-token
+                        key: HF_TOKEN
+                        optional: false
+                  # Limit rayon thread pool to prevent ThreadPoolBuildError
+                  - name: RAYON_NUM_THREADS
+                    value: "1"
+                  # LeaderWorkerSet worker index (injected from pod label)
+                  - name: LWS_WORKER_INDEX
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']
+                  # CUDA Forward Compatibility for driver 580 (CUDA 13) with CUDA 12.x binaries
+                  - name: CUDA_COMPAT_MAX_THREADS
+                    value: "256"
+                  - name: __CUDA_COMPAT_TIMEOUT
+                    value: "120"
+                  - name: NVIDIA_DISABLE_REQUIRE
+                    value: "true"
                   - name: DP_SIZE_LOCAL
                     value: "8"
                   - name: TP_SIZE
@@ -133,8 +169,6 @@ data:
                   - name: VLLM_SKIP_P2P_CHECK
                     value: "1"
                   - name: VLLM_RANDOMIZE_DP_DUMMY_INPUTS
-                    value: "1"
-                  - name: VLLM_USE_DEEP_GEMM
                     value: "1"
                   - name: VLLM_ALL2ALL_BACKEND
                     value: deepep_high_throughput
@@ -152,6 +186,12 @@ data:
                     value: eth0
                   - name: VLLM_LOGGING_LEVEL
                     value: INFO
+                  - name: VLLM_ENGINE_READY_TIMEOUT_S
+                    value: "10000"
+                  - name: NCCL_DEBUG
+                    value: INFO
+                  - name: NVSHMEM_DEBUG
+                    value: INFO
                   - name: VLLM_NIXL_SIDE_CHANNEL_HOST
                     valueFrom:
                       fieldRef:
@@ -166,12 +206,6 @@ data:
                     value: /var/cache/vllm/flashinfer
                   - name: HF_HUB_CACHE
                     value: /var/cache/huggingface
-                  - name: HF_TOKEN
-                    valueFrom:
-                      secretKeyRef:
-                        name: llm-d-hf-token
-                        key: HF_TOKEN
-                        optional: true
 
                 ports:
                   - containerPort: 8000
@@ -180,10 +214,6 @@ data:
                   - containerPort: 5600
                     name: nixl
                     protocol: TCP
-                  - containerPort: 5555
-                    name: dp-rpc
-                    protocol: TCP
-
                 startupProbe:
                   httpGet:
                     path: /health
@@ -192,7 +222,6 @@ data:
                   periodSeconds: 1
                   timeoutSeconds: 5
                   failureThreshold: 2700
-
                 livenessProbe:
                   httpGet:
                     path: /health
@@ -200,7 +229,6 @@ data:
                   periodSeconds: 30
                   timeoutSeconds: 5
                   failureThreshold: 3
-
                 readinessProbe:
                   httpGet:
                     path: /v1/models
@@ -208,7 +236,6 @@ data:
                   periodSeconds: 10
                   timeoutSeconds: 5
                   failureThreshold: 3
-
                 resources:
                   limits:
                     ephemeral-storage: 1Ti
@@ -219,7 +246,6 @@ data:
                     ephemeral-storage: 1Ti
                     memory: 512Gi
                     nvidia.com/gpu: "8"
-
                 volumeMounts:
                   - name: dshm
                     mountPath: /dev/shm
@@ -227,10 +253,8 @@ data:
                     mountPath: /var/cache/huggingface
                   - name: jit-cache
                     mountPath: /var/cache/vllm
-                  - name: rdma-script
-                    mountPath: /scripts
-                  - name: dev-infiniband
-                    mountPath: /dev/infiniband
+                  - name: discovery-data
+                    mountPath: /data
     ---
     apiVersion: leaderworkerset.x-k8s.io/v1
     kind: LeaderWorkerSet
@@ -238,30 +262,47 @@ data:
       name: wide-ep-decode
       namespace: llm-d
       labels:
-        app: llm-d
-        component: wide-ep-multinode
         llm-d.ai/inference-serving: "true"
-        llm-d.ai/guide: wide-ep-multinode
+        llm-d.ai/guide: "wide-ep-multinode"
+        llm-d.ai/accelerator-variant: "gpu"
+        llm-d.ai/accelerator-vendor: "nvidia"
+        llm-d.ai/model: Qwen3-235B-A22B-FP8
         llm-d.ai/role: decode
-        llm-d.ai/model: DeepSeek-R1-0528
     spec:
       replicas: 1
       leaderWorkerTemplate:
-        size: 2
+        size: 1
         workerTemplate:
           metadata:
             labels:
               llm-d.ai/inference-serving: "true"
-              llm-d.ai/guide: wide-ep-multinode
+              llm-d.ai/guide: "wide-ep-multinode"
               llm-d.ai/accelerator-variant: "gpu"
               llm-d.ai/accelerator-vendor: "nvidia"
-              llm-d.ai/model: DeepSeek-R1-0528
+              llm-d.ai/model: Qwen3-235B-A22B-FP8
               llm-d.ai/role: decode
-            annotations:
-              inference.lanl.gov/model-name: DeepSeek-R1-0528
           spec:
             serviceAccountName: llm-d-modelserver
             initContainers:
+              - name: rdma-discovery
+                image: ghcr.io/llm-d/llm-d-cuda:v0.5.1
+                command: ["/bin/bash", "-c"]
+                args:
+                  - |
+                    /scripts/discover.sh
+                    echo "--- RDMA Discovery Complete ---"
+                    cat /data/vllm_env.sh
+                volumeMounts:
+                  - name: discovery-script
+                    mountPath: /scripts
+                  - name: discovery-data
+                    mountPath: /data
+                securityContext:
+                  capabilities:
+                    add:
+                      - IPC_LOCK
+                  runAsGroup: 0
+                  runAsUser: 0
               - name: routing-proxy
                 args:
                   - --port=8000
@@ -270,7 +311,7 @@ data:
                   - --zap-log-level=1
                   - --secure-proxy=false
                   - --enable-prefiller-sampling
-                image: ghcr.io/llm-d/llm-d-routing-sidecar:v0.5.0
+                image: ghcr.io/llm-d/llm-d-routing-sidecar:v0.6.0
                 imagePullPolicy: Always
                 ports:
                   - containerPort: 8000
@@ -285,21 +326,21 @@ data:
               - name: dshm
                 emptyDir:
                   medium: Memory
-                  sizeLimit: 256Gi
+                  sizeLimit: 2Gi
               - name: hf-cache
-                emptyDir: {}
+                persistentVolumeClaim:
+                  claimName: wide-ep-model-cache
               - name: jit-cache
                 emptyDir: {}
-              - name: rdma-script
+              - name: discovery-script
                 configMap:
                   name: ib-hca-discovery-script
                   defaultMode: 0755
-              - name: dev-infiniband
-                hostPath:
-                  path: /dev/infiniband
+              - name: discovery-data
+                emptyDir: {}
             containers:
               - name: vllm
-                image: ghcr.io/llm-d/llm-d-cuda:v0.5.0
+                image: ghcr.io/llm-d/llm-d-cuda:v0.5.1
                 securityContext:
                   capabilities:
                     add:
@@ -313,31 +354,35 @@ data:
                   - /bin/bash
                   - -c
                 args:
-                  - |
-                    ulimit -l unlimited || true
-
-                    # Source RDMA discovery script if available
-                    if [ -f /scripts/discover_ib_hca.sh ]; then
-                      source /scripts/discover_ib_hca.sh
-                      echo "--- Loaded RDMA environment ---"
-                    fi
-
-                    # Clear /dev/shm on start
+                  - |-
+                    # Clear /dev/shm on start to prevent running out of space when crashes occur
+                    # https://github.com/llm-d/llm-d/issues/352
                     find /dev/shm -type f -delete
 
-                    echo "--- Launching vLLM Decode (Wide-EP Multi-Node) ---"
-                    echo "Model: DeepSeek-R1-0528"
-                    echo "TP Size: ${TP_SIZE}"
-                    echo "DP Size Local: ${DP_SIZE_LOCAL}"
-                    echo "LWS Worker Index: ${LWS_WORKER_INDEX:-0}"
-                    echo "LWS Group Size: ${LWS_GROUP_SIZE}"
-                    echo "NCCL_IB_HCA: ${NCCL_IB_HCA}"
-                    echo "NVSHMEM Transport: ${NVSHMEM_REMOTE_TRANSPORT}"
+                    # Source RDMA discovery environment variables
+                    if [ -f /data/vllm_env.sh ]; then
+                      echo "Loading RDMA configuration..."
+                      source /data/vllm_env.sh
+                      env | grep -E "NCCL_|NVSHMEM_|UCX_|MGMT_|DATA_" | sort
+                    fi
 
+                    #################
+                    # RUN vLLM decode worker (Wide-EP)
+                    #################
                     START_RANK=$(( ${LWS_WORKER_INDEX:-0} * DP_SIZE_LOCAL ))
 
+                    # Set unlimited locked memory for RDMA/NVSHMEM
+                    echo "Setting ulimit -l unlimited..."
+                    if ulimit -l unlimited; then
+                      echo "SUCCESS: ulimit -l set to unlimited (was: $(ulimit -H -l))"
+                      echo "Current soft limit: $(ulimit -l)"
+                    else
+                      echo "ERROR: Failed to set ulimit -l unlimited"
+                      exit 1
+                    fi
+
                     exec vllm serve \
-                      deepseek-ai/DeepSeek-R1-0528 \
+                      Qwen/Qwen3-235B-A22B-Thinking-2507-FP8 \
                       --port 8200 \
                       --trust-remote-code \
                       --disable-uvicorn-access-log \
@@ -349,22 +394,35 @@ data:
                       --data-parallel-address ${LWS_LEADER_ADDRESS} \
                       --data-parallel-rpc-port 5555 \
                       --data-parallel-start-rank $START_RANK \
-                      --kv_transfer_config '{"kv_connector":"NixlConnector",
-                                              "kv_role":"kv_both",
-                                              "kv_load_failure_policy":"fail"}' \
+                      --kv_transfer_config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail"}' \
                       --async-scheduling \
-                      --enable-dbo \
-                      --dbo-decode-token-threshold 32 \
                       --enable-eplb \
-                      --eplb-config '{"window_size":"1000",
-                                      "step_interval":"3000",
-                                      "num_redundant_experts":"32",
-                                      "log_balancedness":"False"}' \
+                      --eplb-config '{"window_size":"1000","step_interval":"3000","num_redundant_experts":"32","log_balancedness":"False"}' \
                       --compilation_config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
-                      --kv-cache-memory-bytes=${KV_CACHE_MEMORY_BYTES-} \
-                      --max-model-len 8192 || sleep infinity
-
+                      --all2all-backend deepep_low_latency \
+                      --kv-cache-memory-bytes=${KV_CACHE_MEMORY_BYTES-}
                 env:
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: llm-d-hf-token
+                        key: HF_TOKEN
+                        optional: false
+                  # Limit rayon thread pool to prevent ThreadPoolBuildError
+                  - name: RAYON_NUM_THREADS
+                    value: "1"
+                  # LeaderWorkerSet worker index (injected from pod label)
+                  - name: LWS_WORKER_INDEX
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']
+                  # CUDA Forward Compatibility for driver 580 (CUDA 13) with CUDA 12.x binaries
+                  - name: CUDA_COMPAT_MAX_THREADS
+                    value: "256"
+                  - name: __CUDA_COMPAT_TIMEOUT
+                    value: "120"
+                  - name: NVIDIA_DISABLE_REQUIRE
+                    value: "true"
                   - name: VLLM_MOE_DP_CHUNK_SIZE
                     value: "384"
                   - name: DP_SIZE_LOCAL
@@ -376,8 +434,6 @@ data:
                   - name: VLLM_SKIP_P2P_CHECK
                     value: "1"
                   - name: VLLM_RANDOMIZE_DP_DUMMY_INPUTS
-                    value: "1"
-                  - name: VLLM_USE_DEEP_GEMM
                     value: "1"
                   - name: VLLM_ALL2ALL_BACKEND
                     value: deepep_low_latency
@@ -395,6 +451,12 @@ data:
                     value: eth0
                   - name: VLLM_LOGGING_LEVEL
                     value: INFO
+                  - name: VLLM_ENGINE_READY_TIMEOUT_S
+                    value: "10000"
+                  - name: NCCL_DEBUG
+                    value: INFO
+                  - name: NVSHMEM_DEBUG
+                    value: INFO
                   - name: VLLM_NIXL_SIDE_CHANNEL_HOST
                     valueFrom:
                       fieldRef:
@@ -409,12 +471,6 @@ data:
                     value: /var/cache/vllm/flashinfer
                   - name: HF_HUB_CACHE
                     value: /var/cache/huggingface
-                  - name: HF_TOKEN
-                    valueFrom:
-                      secretKeyRef:
-                        name: llm-d-hf-token
-                        key: HF_TOKEN
-                        optional: true
 
                 ports:
                   - containerPort: 8200
@@ -423,10 +479,6 @@ data:
                   - containerPort: 5600
                     name: nixl
                     protocol: TCP
-                  - containerPort: 5555
-                    name: dp-rpc
-                    protocol: TCP
-
                 startupProbe:
                   httpGet:
                     path: /health
@@ -435,7 +487,6 @@ data:
                   periodSeconds: 1
                   timeoutSeconds: 5
                   failureThreshold: 2700
-
                 livenessProbe:
                   httpGet:
                     path: /health
@@ -443,7 +494,6 @@ data:
                   periodSeconds: 30
                   timeoutSeconds: 5
                   failureThreshold: 3
-
                 readinessProbe:
                   httpGet:
                     path: /v1/models
@@ -451,7 +501,6 @@ data:
                   periodSeconds: 10
                   timeoutSeconds: 5
                   failureThreshold: 3
-
                 resources:
                   limits:
                     ephemeral-storage: 1Ti
@@ -462,7 +511,6 @@ data:
                     ephemeral-storage: 1Ti
                     memory: 512Gi
                     nvidia.com/gpu: "8"
-
                 volumeMounts:
                   - name: dshm
                     mountPath: /dev/shm
@@ -470,7 +518,5 @@ data:
                     mountPath: /var/cache/huggingface
                   - name: jit-cache
                     mountPath: /var/cache/vllm
-                  - name: rdma-script
-                    mountPath: /scripts
-                  - name: dev-infiniband
-                    mountPath: /dev/infiniband
+                  - name: discovery-data
+                    mountPath: /data

@@ -30,8 +30,9 @@ rig/llm-d/
     ├── inference-scheduling/      # Intelligent inference scheduling
     ├── pd-disaggregation/         # P/D disaggregation single-node
     ├── pd-disaggregation-multinode/ # P/D disaggregation multi-node
-    ├── wide-ep-multinode/         # Wide Expert Parallelism (MoE models)
-    ├── inference-test/            # Automated inference testing with guidellm
+    ├── ep-multinode/              # Expert Parallelism (MoE models)
+    ├── deepep-test/               # DeepEP RDMA/NVSHMEM validation
+    ├── guidellm-inference-test/   # Automated inference testing with guidellm
     └── cleanup/                   # Cleanup overlay (removes deployments)
 ```
 
@@ -48,8 +49,8 @@ oc apply -k rig/llm-d/overlays/pd-disaggregation
 # P/D Disaggregation Multi-Node
 oc apply -k rig/llm-d/overlays/pd-disaggregation-multinode
 
-# Wide Expert Parallelism (MoE models)
-oc apply -k rig/llm-d/overlays/wide-ep-multinode
+# Expert Parallelism (MoE models)
+oc apply -k rig/llm-d/overlays/ep-multinode
 
 # Inference Scheduling
 oc apply -k rig/llm-d/overlays/inference-scheduling
@@ -103,18 +104,18 @@ Run automated inference tests to validate the deployment:
 
 ```bash
 # Deploy inference test job
-oc apply -k rig/llm-d/overlays/inference-test
+oc apply -k rig/llm-d/overlays/guidellm-inference-test
 
 # Watch test progress
-oc logs -n llm-d job/llm-d-inference-test -f
+oc logs -n llm-d job/llm-d-guidellm-inference-test -f
 
 # Check test results
-oc get job llm-d-inference-test -n llm-d
+oc get job llm-d-guidellm-inference-test -n llm-d
 ```
 
 The test automatically discovers the gateway, detects the model, and runs guidellm benchmarks. It passes if 80%+ of requests succeed.
 
-See **[overlays/inference-test/README.md](overlays/inference-test/README.md)** for detailed testing documentation.
+See **[overlays/guidellm-inference-test/README.md](overlays/guidellm-inference-test/README.md)** for detailed testing documentation.
 
 ### 4. Cleanup Deployment
 
@@ -139,7 +140,7 @@ The cleanup overlay removes all deployments (including the `llm-d-client` pod) w
 - RBAC and service accounts
 - Prerequisites like `llm-d-hf-token` secret
 
-**Note:** Use the `inference-test` overlay to verify deployments instead of the client pod.
+**Note:** Use the `guidellm-inference-test` overlay to verify deployments instead of the client pod.
 
 See **[overlays/cleanup/README.md](overlays/cleanup/README.md)** for detailed cleanup documentation.
 
@@ -226,11 +227,18 @@ Multi-node P/D disaggregation for large-scale deployments.
 - **Networking**: Full mesh RDMA connectivity required
 - **Status**: ✅ Implemented
 
-#### 4. **Wide Expert Parallelism** (`wide-ep-multinode/`)
-Wide EP multi-node deployment for Mixture of Experts models.
+#### 4. **Expert Parallelism** (`ep-multinode/`)
+Multi-node EP deployment for Mixture of Experts models.
 - **Default Model**: DeepSeek-R1-0528 (671B MoE, configurable)
 - **GPUs**: 8+ H100/H200/B200 (dynamically discovered)
 - **Networking**: Full mesh RDMA required
+- **Status**: ✅ Implemented
+
+#### 5. **DeepEP Testing** (`deepep-test/`)
+RDMA/NVSHMEM validation using DeepEP low-latency microbenchmark.
+- **Test**: DeepEP all-to-all communication patterns
+- **GPUs**: Fully dynamic (adapts to cluster size)
+- **Networking**: RDMA required
 - **Status**: ✅ Implemented
 
 **Note**: To change the model, edit the `ms-manifests-configmap.yaml` in each overlay and update the `MODEL` environment variable.
@@ -296,7 +304,7 @@ An empty HuggingFace token secret is created automatically by the deployment. Th
 
 For **gated or private models**, you must update the secret with your token:
 - Qwen/Qwen3-32B (used in inference-scheduling)
-- DeepSeek-R1-0528 (used in wide-ep-multinode)
+- DeepSeek-R1-0528 (used in ep-multinode)
 - Other gated models on HuggingFace
 
 **To add your HuggingFace token:**
@@ -372,7 +380,7 @@ oc apply -k rig/llm-d/prereq/client-tools
 - **[prereq/istio-gateway/README.md](prereq/istio-gateway/)** - Istio installation
 - **[prereq/inferencepool-controller/README.md](prereq/inferencepool-controller/)** - GAIE controller
 - **[overlays/*/README.md](overlays/)** - Scenario-specific guides (9 scenarios)
-- **[overlays/inference-test/README.md](overlays/inference-test/README.md)** - Automated inference testing
+- **[overlays/guidellm-inference-test/README.md](overlays/guidellm-inference-test/README.md)** - Automated inference testing
 - **[overlays/cleanup/README.md](overlays/cleanup/README.md)** - Cleanup overlay
 
 ## License

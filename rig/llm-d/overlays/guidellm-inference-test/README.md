@@ -34,7 +34,7 @@ Run this overlay to:
 
 ```bash
 # Deploy the inference test job
-oc apply -k rig/llm-d/overlays/inference-test
+oc apply -k rig/llm-d/overlays/guidellm-inference-test
 
 # Watch test progress
 oc logs -n llm-d job/llm-d-inference-test -f
@@ -170,7 +170,7 @@ oc apply -k rig/llm-d/overlays/pd-disaggregation
 oc wait --for=condition=available deployment/pd-prefill -n llm-d --timeout=5m
 
 # Run inference test
-oc apply -k rig/llm-d/overlays/inference-test
+oc apply -k rig/llm-d/overlays/guidellm-inference-test
 
 # Monitor results
 oc logs -n llm-d job/llm-d-inference-test -f
@@ -264,7 +264,7 @@ test-inference:
   script:
     - oc apply -k rig/llm-d/overlays/pd-disaggregation
     - oc wait --for=condition=available deployment/pd-prefill -n llm-d --timeout=10m
-    - oc apply -k rig/llm-d/overlays/inference-test
+    - oc apply -k rig/llm-d/overlays/guidellm-inference-test
     - oc wait --for=condition=complete job/llm-d-inference-test -n llm-d --timeout=5m
     - oc logs job/llm-d-inference-test -n llm-d
 ```

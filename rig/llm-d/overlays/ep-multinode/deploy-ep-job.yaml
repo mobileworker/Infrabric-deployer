@@ -23,6 +23,28 @@ spec:
 
       # Init containers
       initContainers:
+        # 0. Wait for model download to complete
+        - name: wait-for-model-cache
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "⏳ Waiting for model download to complete..."
+
+              # Install kubectl
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              # Wait for model download job to complete (timeout 1 hour)
+              echo "Waiting for wide-ep-model-download job to complete..."
+              kubectl wait --for=condition=complete job/wide-ep-model-download -n llm-d --timeout=3600s
+
+              echo "✅ Model cache is ready"
+
         # 1. Discover GPU and RDMA resources
         - name: discover-resources
           image: registry.access.redhat.com/ubi9/ubi:latest
@@ -64,7 +86,7 @@ spec:
           args:
             - |
               set -euo pipefail
-              echo "Waiting for gateway-ready job to complete..."
+              echo "Waiting for gateway to be ready..."
 
               # Install kubectl to local directory
               mkdir -p /tmp/bin
@@ -73,8 +95,28 @@ spec:
               curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
               chmod +x /tmp/bin/kubectl
 
-              # Wait for gateway ready job
-              kubectl wait --for=condition=complete job/wait-for-gateway-ready -n llm-d --timeout=600s
+              # Wait for istiod to be ready
+              echo "⏳ Waiting for istiod deployment..."
+              kubectl wait --for=condition=available deployment/istiod -n istio-system --timeout=600s
+
+              # Verify InferencePool CRD exists
+              echo "⏳ Verifying InferencePool CRD..."
+              TIMEOUT=60
+              ELAPSED=0
+              while [ $ELAPSED -lt $TIMEOUT ]; do
+                if kubectl get crd inferencepools.inference.networking.k8s.io &>/dev/null; then
+                  echo "✅ InferencePool CRD is available"
+                  break
+                fi
+                echo "  Waiting for InferencePool CRD... ($ELAPSED/$TIMEOUT seconds)"
+                sleep 5
+                ELAPSED=$((ELAPSED + 5))
+              done
+
+              if [ $ELAPSED -ge $TIMEOUT ]; then
+                echo "❌ Timeout waiting for InferencePool CRD"
+                exit 1
+              fi
 
               echo "✅ Gateway is ready"
 
@@ -140,35 +182,24 @@ spec:
               RDMA_COUNT=$(yq '.discovered.rdmaCount' /data/discovered-resources.yaml)
               NODE_COUNT=$(yq '.discovered.nodeCount' /data/discovered-resources.yaml)
 
-              # For multi-node EP: Use ALL GPUs per node for tensor parallelism
-              # Must be power of 2 (1, 2, 4, 8, 16, etc)
-              # Find largest power of 2 <= GPU_COUNT
-              TENSOR_PARALLEL_SIZE=1
-              while [ $((TENSOR_PARALLEL_SIZE * 2)) -le $GPU_COUNT ]; do
-                TENSOR_PARALLEL_SIZE=$((TENSOR_PARALLEL_SIZE * 2))
-              done
+              # Data Parallel configuration
+              # DP_SIZE_LOCAL: Number of GPUs per pod used for data parallelism
+              # Use all available GPUs on each node for DP/EP
+              DP_SIZE_LOCAL=$GPU_COUNT
 
-              UNUSED_GPUS=$((GPU_COUNT - TENSOR_PARALLEL_SIZE))
+              # For multi-node Wide-EP: Use TP=1, all GPUs for Expert Parallelism + Data Parallelism
+              # Wide-EP distributes experts across GPUs, not model layers
+              TENSOR_PARALLEL_SIZE=1
+
+              UNUSED_GPUS=$((GPU_COUNT - DP_SIZE_LOCAL))
 
               # LeaderWorkerSet configuration for multi-node EP
-              # Calculate LWS size based on available nodes
-              # Strategy: 1 prefill pod + remaining nodes for decode
-              # LWS size = number of pods per LWS
+              # Testing configuration: 1 prefill pod + 2 decode pods
+              # This tests P/D disaggregation scaling with multiple decode pods
               PREFILL_LWS_REPLICAS=1
-              DECODE_LWS_REPLICAS=1
-
-              # For EP: prefill uses 1 node, decode uses remaining nodes
-              PREFILL_LWS_SIZE=1  # 1 pod for prefill
-              DECODE_LWS_SIZE=$((NODE_COUNT - 1))  # Remaining nodes for decode
-
-              # Ensure at least 1 decode worker
-              if [ "$DECODE_LWS_SIZE" -lt 1 ]; then
-                DECODE_LWS_SIZE=1
-              fi
-
-              # Data Parallel configuration
-              # DP_SIZE_LOCAL is fixed at 8 for EP deployments
-              DP_SIZE_LOCAL=8
+              DECODE_LWS_REPLICAS=2
+              PREFILL_LWS_SIZE=1  # 1 pod for prefill (fixed)
+              DECODE_LWS_SIZE=1   # 1 pod for decode (fixed)
 
               echo ""
               echo "Multi-Node Wide-EP Configuration:"
@@ -198,9 +229,9 @@ spec:
               # Set LeaderWorkerSet size (number of pods)
               yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.size) = $PREFILL_LWS_SIZE" /tmp/ep-lws.yaml
 
-              # Update GPU count (in workerTemplate)
-              yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/ep-lws.yaml
-              yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/ep-lws.yaml
+              # Update GPU count (in workerTemplate) - use DP_SIZE_LOCAL GPUs per pod
+              yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$DP_SIZE_LOCAL\"" /tmp/ep-lws.yaml
+              yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$DP_SIZE_LOCAL\"" /tmp/ep-lws.yaml
 
               # Update TP_SIZE environment variable
               yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$TENSOR_PARALLEL_SIZE\"" /tmp/ep-lws.yaml
@@ -237,9 +268,9 @@ spec:
               # Set LeaderWorkerSet size (number of pods)
               yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.size) = $DECODE_LWS_SIZE" /tmp/ep-lws.yaml
 
-              # Update GPU count
-              yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/ep-lws.yaml
-              yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/ep-lws.yaml
+              # Update GPU count - use DP_SIZE_LOCAL GPUs per pod
+              yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$DP_SIZE_LOCAL\"" /tmp/ep-lws.yaml
+              yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$DP_SIZE_LOCAL\"" /tmp/ep-lws.yaml
 
               # Update TP_SIZE environment variable
               yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$TENSOR_PARALLEL_SIZE\"" /tmp/ep-lws.yaml

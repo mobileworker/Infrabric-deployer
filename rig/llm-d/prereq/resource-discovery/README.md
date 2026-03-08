@@ -146,7 +146,8 @@ cat /tmp/discovered.yaml
 This is used by llm-d overlays that need dynamic resource allocation:
 - pd-disaggregation (single-node)
 - pd-disaggregation-multinode
-- wide-ep-multinode
+- ep-multinode
+- deepep-test
 - inference-scheduling (TODO)
 
 Each overlay's deployment job runs this script to generate cluster-specific resource configurations.

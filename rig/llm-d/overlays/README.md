@@ -23,13 +23,14 @@ No manual prerequisite steps required!
 | `inference-scheduling/` | Inference Scheduling | Model dependent | Load-aware and prefix cache routing | ✅ Implemented |
 | `pd-disaggregation/` | P/D Disaggregation | Model dependent | Separate prefill/decode on single node | ✅ Implemented |
 | `pd-disaggregation-multinode/` | P/D Multi-Node | Model dependent | Multi-node prefill/decode disaggregation | ✅ Implemented |
-| `wide-ep-multinode/` | Wide Expert Parallelism | Model dependent | MoE models, Expert parallelism | ✅ Implemented |
+| `ep-multinode/` | Wide Expert Parallelism | Model dependent | MoE models, Expert parallelism | ✅ Implemented |
 
 ### Utility Overlays
 
 | Directory | Purpose | Description | Status |
 |-----------|---------|-------------|--------|
-| `inference-test/` | Testing | Automated inference tests with guidellm | ✅ Implemented |
+| `deepep-test/` | RDMA/NVSHMEM Validation | DeepEP low-latency microbenchmark across 3 nodes | ✅ Implemented |
+| `guidellm-inference-test/` | Testing | Automated inference tests with guidellm | ✅ Implemented |
 | `cleanup/` | Cleanup | Removes all llm-d deployments while preserving namespace and RBAC | ✅ Implemented |
 
 ## How Overlays Work
@@ -136,7 +137,7 @@ oc logs -f job/deploy-pd-multinode -n llm-d
 
 ```bash
 # Requires RDMA networking and sufficient GPUs across multiple nodes
-oc apply -k rig/llm-d/overlays/wide-ep-multinode
+oc apply -k rig/llm-d/overlays/ep-multinode
 
 # Monitor LeaderWorkerSets
 oc get leaderworkerset -n llm-d -w
@@ -144,6 +145,26 @@ oc get leaderworkerset -n llm-d -w
 # Check deployment logs
 oc logs -f job/deploy-ep-multinode -n llm-d
 ```
+
+### Validate RDMA/NVSHMEM (Before Production Deployment)
+
+```bash
+# Run DeepEP multi-node test to validate infrastructure
+oc apply -k rig/llm-d/overlays/deepep-test
+
+# Watch test pods (test completes in ~2-3 minutes)
+oc get pods -n llm-d -l app=deepep-test-multinode -w
+
+# Check bandwidth results (expect ~17-18 GB/s per rank)
+oc logs -n llm-d deepep-test-0 -c test | grep "bandwidth"
+oc logs -n llm-d deepep-test-1 -c test | grep "bandwidth"
+oc logs -n llm-d deepep-test-2 -c test | grep "bandwidth"
+
+# Cleanup test
+oc delete -k rig/llm-d/overlays/deepep-test
+```
+
+See [deepep-test/README.md](deepep-test/README.md) for detailed validation documentation.
 
 ### Cleanup Deployment
 

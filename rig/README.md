@@ -45,12 +45,12 @@ oc apply -k rig/llm-d/overlays/pd-disaggregation-multinode
 # Deploy inference scheduling
 oc apply -k rig/llm-d/overlays/inference-scheduling
 
-# Deploy wide-EP for MoE models
-oc apply -k rig/llm-d/overlays/wide-ep-multinode
+# Deploy EP for MoE models
+oc apply -k rig/llm-d/overlays/ep-multinode
 ```
 
 **Features:**
-- 4 deployment scenarios (inference scheduling, P/D disaggregation, wide-EP)
+- 5 deployment scenarios (inference scheduling, P/D disaggregation, EP for MoE models, DeepEP testing)
 - Configurable models - use any vLLM-compatible model
 - Gateway API integration with intelligent request routing
 - Dynamic GPU and RDMA resource discovery
@@ -115,7 +115,7 @@ rig/<workload>/
 │   ├── <scenario-1>/          # Scenario-specific overlay
 │   ├── <scenario-2>/          # Another scenario
 │   ├── cleanup/               # Cleanup overlay
-│   └── inference-test/        # Testing overlay
+│   └── guidellm-inference-test/  # Testing overlay
 ├── README.md                  # Main documentation
 └── QUICK-START.md            # Quick start guide
 ```

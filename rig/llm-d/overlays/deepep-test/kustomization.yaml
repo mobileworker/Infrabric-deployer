@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# DeepEP Multi-Node Test
+# Validates RDMA/NVSHMEM functionality across Kubernetes pods
+# Usage: oc apply -k rig/llm-d/overlays/deepep-test
+
+resources:
+  # Wave -1 to 0: Prerequisites
+  - ../../prereq/client-tools       # llm-d-client service account
+  - ../../prereq/resource-discovery # GPU/RDMA discovery script
+
+  # Wave 20: Test configuration
+  - deepep-test-configmap.yaml      # Test scripts (get-deepep.sh, run-test-multinode.sh)
+  - deepep-test-config.yaml         # LWS template for dynamic patching
+
+  # Wave 25: Deployment job
+  - deploy-deepep-test-job.yaml     # Discovers resources and deploys test
