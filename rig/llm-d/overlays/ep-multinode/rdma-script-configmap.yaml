@@ -16,10 +16,7 @@ data:
     # --- SCRIPT CONFIGURATION ---
     ulimit -l unlimited || true
 
-    WAIT_TIMEOUT="${WAIT_TIMEOUT:-300}"
-    WAIT_INTERVAL="${WAIT_INTERVAL:-5}"
-
-    echo "--- Running InfiniBand HCA discovery script ---" >&2
+    echo "--- Running InfiniBand HCA discovery script (DYNAMIC FILTERING) ---" >&2
 
     # --- VALIDATE PREREQUISITES ---
     if [[ ! -d "/sys/class/infiniband" ]]; then
@@ -27,147 +24,105 @@ data:
         exit 1
     fi
 
-    # --- STEP 1: DISCOVER INFINIBAND HCAs ---
-    declare -a requested_hcas=()
-    while getopts "i:" opt; do
-      case $opt in
-        i) IFS=',' read -r -a requested_hcas <<< "$OPTARG"; echo "Info: Filtering for requested HCAs: ${requested_hcas[*]}" >&2 ;;
-        \?) echo "Error: Invalid option: -$OPTARG" >&2; exit 1 ;;
-      esac
-    done
+    # --- STEP 1: DISCOVER ACCESSIBLE INFINIBAND DEVICES ---
+    # Check /dev/infiniband/uverbs* to see what devices are actually accessible to this pod
+    declare -a accessible_devices=()
 
-    declare -a all_hcas
-    declare -A hca_to_ifname
-    declare -a data_ips
+    echo "--- Checking accessible InfiniBand devices in /dev/infiniband/ ---" >&2
 
-    echo "--- Discovering active InfiniBand HCAs (using sysfs)... ---" >&2
-
-    # Get all InfiniBand devices from sysfs
-    for hca_path in /sys/class/infiniband/mlx5_*; do
-        if [[ ! -d "$hca_path" ]]; then
-            continue
-        fi
-
-        hca=$(basename "$hca_path")
-
-        # Check if port 1 is active
-        port_state=""
-        if [[ -f "$hca_path/ports/1/state" ]]; then
-            port_state=$(cat "$hca_path/ports/1/state" 2>/dev/null | grep -o "ACTIVE" || true)
-        fi
-
-        if [[ "$port_state" == "ACTIVE" ]]; then
-            # Get interface name from sysfs (if available)
-            ifname=""
-            if [[ -d "$hca_path/device/net" ]]; then
-                ifname=$(ls "$hca_path/device/net/" 2>/dev/null | head -1)
-            fi
-
-            # Filter by requested HCAs if -i flag was used
-            if [[ "${#requested_hcas[@]}" -gt 0 ]]; then
-                is_requested=false
-                for requested_hca in "${requested_hcas[@]}"; do
-                    if [[ "$hca" == "$requested_hca" ]]; then
-                        is_requested=true
-                        break
-                    fi
-                done
-
-                if [[ "$is_requested" == false ]]; then
-                    echo "Skipping $hca (not in requested list)" >&2
-                    continue
-                fi
-            fi
-
-            all_hcas+=("$hca")
-
-            # Get IP if interface name exists
-            if [[ -n "$ifname" ]]; then
-                hca_to_ifname["$hca"]="$ifname"
-                # Try to get IP from the interface
-                ip_addr=$(ip -4 addr show "$ifname" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1 || true)
-                if [[ -n "$ip_addr" ]]; then
-                    data_ips+=("$ip_addr")
-                    echo "Discovered: HCA=$hca, Interface=$ifname, IP=$ip_addr, Status=ACTIVE" >&2
-                else
-                    echo "Discovered: HCA=$hca, Interface=$ifname, Status=ACTIVE (no IP)" >&2
-                fi
-            else
-                echo "Discovered: HCA=$hca, Status=ACTIVE (no interface name)" >&2
-            fi
-        else
-            echo "Skipping $hca (port not active)" >&2
+    for dev in /dev/infiniband/uverbs*; do
+        if [[ -c "$dev" ]]; then
+            # Extract device number (e.g., uverbs4 -> 4)
+            dev_num=$(basename "$dev" | sed 's/uverbs//')
+            accessible_devices+=("$dev_num")
+            echo "Found accessible device: uverbs${dev_num}" >&2
         fi
     done
 
-    if [[ "${#all_hcas[@]}" -eq 0 ]]; then
-        echo "Error: No active InfiniBand HCAs found." >&2
+    if [[ "${#accessible_devices[@]}" -eq 0 ]]; then
+        echo "Error: No accessible InfiniBand devices found in /dev/infiniband/" >&2
         exit 1
     fi
 
-    # --- Sort HCAs by device number ---
-    sorted_hcas=($(for hca in "${all_hcas[@]}"; do echo "$hca"; done | sort -V))
-    echo "--- Discovery complete: ${#sorted_hcas[@]} active HCAs found. ---" >&2
+    # --- STEP 2: MAP ACCESSIBLE DEVICES TO HCAs ---
+    declare -a accessible_hcas=()
 
-    # --- STEP 2: DEFINE NETWORK SPLIT ---
+    echo "--- Mapping accessible devices to HCA names ---" >&2
 
+    for dev_num in "${accessible_devices[@]}"; do
+        hca="mlx5_${dev_num}"
+        hca_path="/sys/class/infiniband/${hca}"
+
+        if [[ -d "$hca_path" ]]; then
+            # Check if port 1 is active
+            port_state=""
+            if [[ -f "$hca_path/ports/1/state" ]]; then
+                port_state=$(cat "$hca_path/ports/1/state" 2>/dev/null | grep -o "ACTIVE" || true)
+            fi
+
+            if [[ "$port_state" == "ACTIVE" ]]; then
+                accessible_hcas+=("$hca")
+                echo "Mapped: uverbs${dev_num} -> ${hca} (ACTIVE)" >&2
+            else
+                echo "Warning: ${hca} exists but port is not ACTIVE" >&2
+            fi
+        else
+            echo "Warning: Device uverbs${dev_num} exists but ${hca} sysfs path not found" >&2
+        fi
+    done
+
+    if [[ "${#accessible_hcas[@]}" -eq 0 ]]; then
+        echo "Error: No active HCAs found for accessible devices." >&2
+        exit 1
+    fi
+
+    # Sort HCAs by device number
+    sorted_hcas=($(for hca in "${accessible_hcas[@]}"; do echo "$hca"; done | sort -V))
+    echo "--- Discovery complete: ${#sorted_hcas[@]} accessible active HCAs found. ---" >&2
+
+    # --- STEP 3: NETWORK CONFIGURATION ---
     # Management IP (eth0)
     MGMT_IP=$(ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1 || true)
 
-    # Data IPs (From InfiniBand interfaces, if they have IPs)
-    ALL_DATA_IPS=""
-    i=0
-    for ip in "${data_ips[@]}"; do
-        if [[ -z "$ALL_DATA_IPS" ]]; then ALL_DATA_IPS="$ip"; else ALL_DATA_IPS="$ALL_DATA_IPS,$ip"; fi
-        declare "DATA_IP_$i"="$ip"
-        i=$((i+1))
-    done
-
     echo "--- Network Configuration ---" >&2
     echo "Management Interface (eth0): $MGMT_IP" >&2
-    if [[ -n "$ALL_DATA_IPS" ]]; then
-        echo "Detected Data IPs: $ALL_DATA_IPS" >&2
-    else
-        echo "Note: No Data IPs found (pure RDMA mode - no IP addressing)" >&2
-    fi
+    echo "Note: Pure RDMA mode - no IP addressing on InfiniBand" >&2
 
-    # --- STEP 3: EXPORT VARIABLES ---
+    # --- STEP 4: EXPORT VARIABLES ---
     declare -A env_vars
 
-    # RDMA Hardware Config - Points to ALL detected HCAs
-    declare -a hcas_with_port;
-    for hca in "${sorted_hcas[@]}"; do hcas_with_port+=("${hca}:1"); done;
+    # RDMA Hardware Config - Points ONLY to accessible HCAs
+    declare -a hcas_with_port
+    for hca in "${sorted_hcas[@]}"; do
+        hcas_with_port+=("${hca}:1")
+    done
 
     env_vars["NCCL_IB_HCA"]="$(IFS=','; echo "${hcas_with_port[*]}")"
     env_vars["NVSHMEM_HCA_LIST"]="$(IFS=','; echo "${hcas_with_port[*]}")"
     env_vars["UCX_NET_DEVICES"]="$(IFS=','; echo "${hcas_with_port[*]}")"
 
-    # Socket/Bootstrap Config (Pointing to eth0 for management)
+    # Socket/Bootstrap Config (eth0 for management)
     env_vars["NCCL_SOCKET_IFNAME"]="eth0"
     env_vars["GLOO_SOCKET_IFNAME"]="eth0"
     env_vars["NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME"]="eth0"
 
-    # Explicit Split Variables
+    # Management IP
     env_vars["MGMT_IP"]="${MGMT_IP}"
-    if [[ -n "$DATA_IP_0" ]]; then
-        env_vars["DATA_IP_0"]="${DATA_IP_0}"
-    fi
-    if [[ -n "$ALL_DATA_IPS" ]]; then
-        env_vars["ALL_DATA_IPS"]="${ALL_DATA_IPS}"
-    fi
-
-    # Side channel logic uses mgmt (eth0)
     env_vars["VLLM_NIXL_SIDE_CHANNEL_HOST"]="${MGMT_IP}"
 
-    # LWS Leader logic (Default to self/mgmt if not set)
+    # LWS Leader logic
     if [[ -z "$LWS_LEADER_ADDRESS" ]]; then
        env_vars["FINAL_LEADER_IP"]="${MGMT_IP}"
     else
        env_vars["FINAL_LEADER_IP"]="${LWS_LEADER_ADDRESS}"
     fi
 
+    # Write environment file
     EXPORT_FILE="/data/vllm_env.sh"
     echo "#!/bin/bash" > "$EXPORT_FILE"
-    while IFS= read -r key; do value="${env_vars[$key]}"; printf "export %s='%s'\n" "$key" "$value" >> "$EXPORT_FILE"; done < <(printf "%s\n" "${!env_vars[@]}")
+    while IFS= read -r key; do
+        value="${env_vars[$key]}"
+        printf "export %s='%s'\n" "$key" "$value" >> "$EXPORT_FILE"
+    done < <(printf "%s\n" "${!env_vars[@]}")
 
     echo "--- Discovery script finished. Config saved to $EXPORT_FILE ---" >&2
