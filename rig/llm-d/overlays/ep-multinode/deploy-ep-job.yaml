@@ -194,12 +194,17 @@ spec:
               UNUSED_GPUS=$((GPU_COUNT - DP_SIZE_LOCAL))
 
               # LeaderWorkerSet configuration for multi-node EP
-              # Testing configuration: 1 prefill pod + 2 decode pods
-              # This tests P/D disaggregation scaling with multiple decode pods
+              # Autoscale configuration: 1 prefill pod + (N-1) decode pods
+              # This scales decode pods based on available GPU nodes
               PREFILL_LWS_REPLICAS=1
-              DECODE_LWS_REPLICAS=2
+              DECODE_LWS_REPLICAS=$((NODE_COUNT - 1))
               PREFILL_LWS_SIZE=1  # 1 pod for prefill (fixed)
               DECODE_LWS_SIZE=1   # 1 pod for decode (fixed)
+
+              # Ensure at least 1 decode replica
+              if [ "$DECODE_LWS_REPLICAS" -lt 1 ]; then
+                DECODE_LWS_REPLICAS=1
+              fi
 
               echo ""
               echo "Multi-Node Wide-EP Configuration:"

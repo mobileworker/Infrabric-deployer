@@ -4,10 +4,9 @@ Automatically discovers RDMA-capable network interfaces (InfiniBand and RoCE) an
 
 ## Overview
 
-This replaces the OpenShift SR-IOV Network Operator with NVIDIA Network Operator's SR-IOV device plugin, providing:
+This discovers RDMA-capable network interfaces and configures NVIDIA Network Operator, providing:
 
 - **PCI address-based resource allocation** - Stable device identification across reboots
-- **Boot-time VF creation** - VFs created at boot via MachineConfig systemd service (wave 26)
 - **Mixed topology support** - Handles nodes with different link types (InfiniBand vs RoCE) for the same PCI address
 - **InfiniBand and RoCE** - Unified discovery for both link types
 - **NetworkAttachmentDefinitions** - Standard Kubernetes networking instead of SR-IOV operator CRDs
@@ -130,20 +129,8 @@ env:
     value: "default"
 ```
 
-## VF Creation (MachineConfig Wave 26)
-
-**IMPORTANT:** Virtual Functions are NOT created by NicClusterPolicy. They are created at boot time by a systemd service deployed via MachineConfig (wave 26).
-
-- **MachineConfig**: `99-worker-sriov-max-vfs` creates systemd service
-- **Service**: `sriov-configure-max-vfs.service` runs on every boot
-- **VF Count**: Fixed at 16 VFs per RDMA-capable NIC
-- **When**: Before kubelet starts (ensures VFs available when SR-IOV device plugin loads)
-
-The NUM_VFS configuration above controls how many VF resources the SR-IOV device plugin advertises (1 VF = 1 allocatable resource), NOT how many VFs are created on the hardware.
-
 ## Deployment Order (ArgoCD Sync Waves)
 
-- Wave 26: SR-IOV VF Configuration (MachineConfigs - creates systemd service, triggers node reboots)
 - Wave 28: NVIDIA Network Operator namespace
 - Wave 29: Wait for MOFED ready
 - Wave 35: **PreSync Hook** → Wait for MCPs ready → NIC Discovery → Creates NicClusterPolicy (triggers MOFED deployment)

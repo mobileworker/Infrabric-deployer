@@ -225,21 +225,7 @@ spec:
 
           echo ""
           echo "========================================="
-          echo "STEP 6: Clean MachineConfigs"
-          echo "========================================="
-
-          echo "Deleting SR-IOV MachineConfigs..."
-          oc delete machineconfig \
-            99-worker-sriov-max-vfs \
-            99-worker-dgx-sriov-max-vfs \
-            --ignore-not-found=true
-
-          echo "Note: MachineConfigPools will update to remove the configs."
-          echo "Wait for all MCPs to show UPDATED=True before proceeding."
-
-          echo ""
-          echo "========================================="
-          echo "STEP 7: Reset VFs to 0"
+          echo "STEP 6: Reset VFs to 0"
           echo "========================================="
 
           echo "Resetting VFs on all worker-dgx nodes..."

@@ -6,6 +6,8 @@ metadata:
   namespace: default
   annotations:
     argocd.argoproj.io/sync-wave: "25"
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -13,6 +15,8 @@ metadata:
   name: ib-udev-generator
   annotations:
     argocd.argoproj.io/sync-wave: "25"
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
 rules:
   - apiGroups: [""]
     resources: ["pods", "pods/exec", "pods/log", "nodes", "namespaces"]
@@ -27,6 +31,8 @@ metadata:
   name: ib-udev-generator
   annotations:
     argocd.argoproj.io/sync-wave: "25"
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -65,12 +71,12 @@ spec:
               set -euo pipefail
 
               echo "=========================================="
-              echo "InfiniBand Interface Name Normalizer"
+              echo "RDMA Interface Name Normalizer"
               echo "Wave 25: Runs BEFORE NIC discovery"
               echo "=========================================="
               echo ""
               echo "This job:"
-              echo "  1. Discovers InfiniBand NICs on all nodes"
+              echo "  1. Discovers all RDMA-capable NICs (InfiniBand & RoCE)"
               echo "  2. Generates udev rules for consistent naming"
               echo "  3. Applies MachineConfig to rename interfaces"
               echo "  4. Waits for nodes to reboot"
@@ -92,45 +98,67 @@ spec:
               echo "Found $NODE_COUNT worker nodes"
               echo ""
 
-              # Discover IB NICs
-              echo "=== Discovering InfiniBand NICs ==="
+              # Discover RDMA NICs (InfiniBand + RoCE)
+              echo "=== Discovering RDMA-capable NICs (InfiniBand & RoCE) ==="
               mkdir -p /tmp/discovery
 
               for NODE in $WORKER_NODES; do
                 echo "Node: $NODE"
 
-                # Discover IB interfaces using oc debug
+                # Discover all RDMA interfaces using oc debug
                 oc debug node/$NODE --image=registry.access.redhat.com/ubi9/ubi:latest -- bash -c '
                   chroot /host bash -c "
                     for iface in /sys/class/net/*; do
                       ifname=\$(basename \$iface)
-                      # Check if InfiniBand interface
-                      if [ -d \"/sys/class/net/\$ifname/device/infiniband\" ] || [[ \$ifname == ib* ]]; then
+
+                      # Skip cluster-critical interfaces
+                      # Only exclude interfaces that are actively in use by the cluster:
+                      # 1. Interfaces with IP addresses (management, pod network, etc.)
+                      # 2. Bridge interfaces (OVN, br-ex, etc.)
+                      # 3. Virtual interfaces (veth, vlan, bond, team)
+
+                      # Skip if interface has IP address
+                      has_ip=\$(ip addr show \$ifname 2>/dev/null | grep -c \"inet \" || echo 0)
+                      if [ \"\$has_ip\" -gt 0 ]; then
+                        continue  # Skip - interface in use
+                      fi
+
+                      # Skip virtual/bridge interfaces
+                      if [[ \$ifname =~ ^(br-|veth|ovn|genev|vlan|bond|team) ]]; then
+                        continue  # Skip - virtual interface
+                      fi
+
+                      # Check if RDMA-capable (has infiniband directory)
+                      if [ -d \"/sys/class/net/\$ifname/device/infiniband\" ]; then
                         pci_path=\$(readlink -f /sys/class/net/\$ifname/device 2>/dev/null || echo unknown)
                         pci=\$(basename \$pci_path)
-                        # Verify it is actually InfiniBand (not RoCE)
-                        ib_dev=\$(ls /sys/class/net/\$ifname/device/infiniband 2>/dev/null | head -1)
-                        if [ -n \"\$ib_dev\" ]; then
-                          link_layer=\$(cat /sys/class/infiniband/\$ib_dev/ports/1/link_layer 2>/dev/null || echo unknown)
-                          if [[ \$link_layer == *InfiniBand* ]]; then
-                            echo \"\$ifname|\$pci\"
+                        # Get RDMA device and link layer type
+                        rdma_dev=\$(ls /sys/class/net/\$ifname/device/infiniband 2>/dev/null | head -1)
+                        if [ -n \"\$rdma_dev\" ]; then
+                          link_layer=\$(cat /sys/class/infiniband/\$rdma_dev/ports/1/link_layer 2>/dev/null || echo unknown)
+                          # Include both InfiniBand and RoCE (Ethernet)
+                          if [[ \$link_layer == InfiniBand ]] || [[ \$link_layer == Ethernet ]]; then
+                            echo \"\$ifname|\$pci|\$link_layer\"
                           fi
                         fi
                       fi
                     done
                   "
-                ' 2>&1 | grep -v "Starting pod" | grep -v "Removing debug pod" | grep -v "To use host binaries" | while IFS='|' read -r ifname pci; do
+                ' 2>&1 | grep -v "Starting pod" | grep -v "Removing debug pod" | grep -v "To use host binaries" | while IFS='|' read -r ifname pci link_layer; do
                   # Filter out error messages and lines without valid PCI addresses
                   if [ -n "$ifname" ] && [ "$pci" != "unknown" ] && [ -n "$pci" ] && [[ ! "$ifname" =~ ^E[0-9] ]]; then
-                    echo "  $ifname (PCI: $pci)"
-                    echo "$NODE|$ifname|$pci" >> /tmp/discovery/all-ibs.txt
+                    link_type="unknown"
+                    [ "$link_layer" = "InfiniBand" ] && link_type="IB"
+                    [ "$link_layer" = "Ethernet" ] && link_type="RoCE"
+                    echo "  $ifname (PCI: $pci, Type: $link_type)"
+                    echo "$NODE|$ifname|$pci" >> /tmp/discovery/all-rdma.txt
                   fi
                 done
               done
 
-              if [ ! -f /tmp/discovery/all-ibs.txt ]; then
+              if [ ! -f /tmp/discovery/all-rdma.txt ]; then
                 echo ""
-                echo "No InfiniBand devices found - skipping normalization"
+                echo "No RDMA devices found - skipping normalization"
                 exit 0
               fi
 
@@ -143,10 +171,10 @@ spec:
               import json
               from collections import defaultdict
 
-              # Collect all devices with their PCI addresses
+              # Collect all RDMA devices with their PCI addresses
               pci_to_nodes = defaultdict(list)  # PCI -> list of (node, ifname)
 
-              with open('/tmp/discovery/all-ibs.txt', 'r') as f:
+              with open('/tmp/discovery/all-rdma.txt', 'r') as f:
                 for line in f:
                   node, ifname, pci = line.strip().split('|')
                   pci_to_nodes[pci].append({'node': node, 'ifname': ifname})
@@ -154,7 +182,7 @@ spec:
               # Get all unique PCI addresses and sort them globally
               all_pci_addresses = sorted(pci_to_nodes.keys())
 
-              print(f"Total unique InfiniBand NICs: {len(all_pci_addresses)}")
+              print(f"Total unique RDMA NICs (InfiniBand + RoCE): {len(all_pci_addresses)}")
 
               # Map PCI address -> normalized name
               pci_to_name = {}
@@ -166,7 +194,7 @@ spec:
 
               # Generate udev rules
               rules = [
-                "# Auto-generated udev rules to normalize InfiniBand interface names",
+                "# Auto-generated udev rules to normalize RDMA interface names (InfiniBand & RoCE)",
                 "# Each PCI address gets a globally consistent name across all nodes",
                 "# Generated by ib-udev-generator job",
                 ""
@@ -217,7 +245,7 @@ spec:
               echo ""
               echo "⚠ Worker nodes will reboot to apply changes"
               echo ""
-              echo "New interface names: ib_nic0, ib_nic1, ib_nic2, etc."
+              echo "New interface names: ib_nic0, ib_nic1, ib_nic2, etc. (for all RDMA NICs)"
               echo "Monitor: oc get mcp worker -w"
               echo ""
               echo "=== Job Complete ==="

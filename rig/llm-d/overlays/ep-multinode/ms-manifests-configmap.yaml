@@ -45,9 +45,8 @@ data:
                 command: ["/bin/bash", "-c"]
                 args:
                   - |
-                    /scripts/discover.sh
-                    echo "--- RDMA Discovery Complete ---"
-                    cat /data/vllm_env.sh
+                    echo "RDMA discovery will run in main container (which has RDMA resources allocated)"
+                    echo "Init container complete"
                 volumeMounts:
                   - name: discovery-script
                     mountPath: /scripts
@@ -96,6 +95,12 @@ data:
                     # https://github.com/llm-d/llm-d/issues/352
                     find /dev/shm -type f -delete
 
+                    # Run RDMA discovery (main container has RDMA resources allocated)
+                    echo "Running RDMA discovery..."
+                    /scripts/discover.sh
+                    echo "--- RDMA Discovery Complete ---"
+                    cat /data/vllm_env.sh
+
                     # Source RDMA discovery environment variables
                     if [ -f /data/vllm_env.sh ]; then
                       echo "Loading RDMA configuration..."
@@ -134,8 +139,9 @@ data:
                       --kv_transfer_config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail"}' \
                       --async-scheduling \
                       --enable-eplb \
-                      --eplb-config '{"window_size":"1000","step_interval":"3000","num_redundant_experts":"32","log_balancedness":"False"}' \
+                      --eplb-config '{"window_size":"1000","step_interval":"3000","num_redundant_experts":"0","log_balancedness":"False"}' \
                       --all2all-backend deepep_high_throughput \
+                      --max-model-len 100000 \
                       --gpu-memory-utilization 0.75
 
                 env:
@@ -190,6 +196,10 @@ data:
                     value: "10000"
                   - name: NCCL_DEBUG
                     value: INFO
+                  - name: NCCL_DEBUG_SUBSYS
+                    value: ALL
+                  - name: NCCL_DEBUG_FILE
+                    value: /var/cache/huggingface/nccl-debug-%h-%p.txt
                   - name: NVSHMEM_DEBUG
                     value: INFO
                   - name: VLLM_NIXL_SIDE_CHANNEL_HOST
@@ -253,6 +263,8 @@ data:
                     mountPath: /var/cache/huggingface
                   - name: jit-cache
                     mountPath: /var/cache/vllm
+                  - name: discovery-script
+                    mountPath: /scripts
                   - name: discovery-data
                     mountPath: /data
     ---
@@ -289,9 +301,8 @@ data:
                 command: ["/bin/bash", "-c"]
                 args:
                   - |
-                    /scripts/discover.sh
-                    echo "--- RDMA Discovery Complete ---"
-                    cat /data/vllm_env.sh
+                    echo "RDMA discovery will run in main container (which has RDMA resources allocated)"
+                    echo "Init container complete"
                 volumeMounts:
                   - name: discovery-script
                     mountPath: /scripts
@@ -359,6 +370,12 @@ data:
                     # https://github.com/llm-d/llm-d/issues/352
                     find /dev/shm -type f -delete
 
+                    # Run RDMA discovery (main container has RDMA resources allocated)
+                    echo "Running RDMA discovery..."
+                    /scripts/discover.sh
+                    echo "--- RDMA Discovery Complete ---"
+                    cat /data/vllm_env.sh
+
                     # Source RDMA discovery environment variables
                     if [ -f /data/vllm_env.sh ]; then
                       echo "Loading RDMA configuration..."
@@ -397,9 +414,11 @@ data:
                       --kv_transfer_config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail"}' \
                       --async-scheduling \
                       --enable-eplb \
-                      --eplb-config '{"window_size":"1000","step_interval":"3000","num_redundant_experts":"32","log_balancedness":"False"}' \
+                      --eplb-config '{"window_size":"1000","step_interval":"3000","num_redundant_experts":"0","log_balancedness":"False"}' \
                       --compilation_config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
                       --all2all-backend deepep_low_latency \
+                      --max-model-len 100000 \
+                      --gpu-memory-utilization 0.75 \
                       --kv-cache-memory-bytes=${KV_CACHE_MEMORY_BYTES-}
                 env:
                   - name: HF_TOKEN
@@ -455,6 +474,10 @@ data:
                     value: "10000"
                   - name: NCCL_DEBUG
                     value: INFO
+                  - name: NCCL_DEBUG_SUBSYS
+                    value: ALL
+                  - name: NCCL_DEBUG_FILE
+                    value: /var/cache/huggingface/nccl-debug-%h-%p.txt
                   - name: NVSHMEM_DEBUG
                     value: INFO
                   - name: VLLM_NIXL_SIDE_CHANNEL_HOST
@@ -518,5 +541,7 @@ data:
                     mountPath: /var/cache/huggingface
                   - name: jit-cache
                     mountPath: /var/cache/vllm
+                  - name: discovery-script
+                    mountPath: /scripts
                   - name: discovery-data
                     mountPath: /data
