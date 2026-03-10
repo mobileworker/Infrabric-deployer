@@ -1,0 +1,19 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-metrics
+  namespace: llm-d
+  labels:
+    llm-d.ai/metrics-service: "true"
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless service to scrape all pods individually
+  ports:
+  - name: metrics
+    port: 8000
+    targetPort: 8000
+    protocol: TCP
+  selector:
+    llm-d.ai/inference-serving: "true"
+  publishNotReadyAddresses: true  # Scrape pods even if not ready

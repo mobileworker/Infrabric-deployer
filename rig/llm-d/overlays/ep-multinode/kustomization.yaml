@@ -18,10 +18,11 @@ resources:
   - model-cache-pvc.yaml              # Shared NFS PVC for model cache
 
   # Wave 10: Install Istio gateway
-  # Wave 15: Download model to PVC, Install InferencePool controller
+  # Wave 15: Download model to PVC, Install InferencePool controller, Enable metrics
   - model-download-job.yaml           # Pre-download model to shared PVC
   - ../../prereq/istio-gateway
   - ../../prereq/inferencepool-controller
+  - ../../prereq/vllm-metrics          # Prometheus metrics scraping for vLLM
 
   # Wave 20: RDMA Configuration and Manifests
   - rdma-script-configmap.yaml       # InfiniBand HCA discovery script

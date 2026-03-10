@@ -1,0 +1,20 @@
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vllm-metrics
+  namespace: llm-d
+  labels:
+    llm-d.ai/metrics-monitor: "true"
+spec:
+  selector:
+    matchLabels:
+      llm-d.ai/metrics-service: "true"
+  namespaceSelector:
+    matchNames:
+    - llm-d
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: 10s
+    scheme: http
