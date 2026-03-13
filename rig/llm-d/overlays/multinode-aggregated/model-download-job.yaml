@@ -1,0 +1,81 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wide-aggregated-model-download
+  namespace: llm-d
+  labels:
+    app: llm-d
+    component: wide-aggregated-multinode
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    description: "Pre-download model weights to shared PVC"
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: llm-d
+        component: wide-aggregated-multinode
+        job: model-download
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: model-downloader
+          image: ghcr.io/llm-d/llm-d-cuda:v0.5.1-rc.5
+          command:
+            - /bin/bash
+            - -c
+          args:
+            - |
+              set -e
+              echo "Starting model download to shared PVC..."
+              echo "Target model: RedHatAI/Qwen3-235B-A22B-FP8-dynamic"
+
+              # Use huggingface-cli to download the model
+              python3 -c "
+              from huggingface_hub import snapshot_download
+              import os
+
+              model_id = 'RedHatAI/Qwen3-235B-A22B-FP8-dynamic'
+              cache_dir = '/model-cache'
+
+              print(f'Downloading {model_id} to {cache_dir}...')
+
+              snapshot_download(
+                  repo_id=model_id,
+                  cache_dir=cache_dir,
+                  token=os.getenv('HF_TOKEN'),
+                  resume_download=True,
+                  max_workers=4
+              )
+
+              print('Model download complete!')
+              "
+
+              echo "Download completed successfully"
+              du -sh /model-cache
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: llm-d-hf-token
+                  key: HF_TOKEN
+                  optional: false
+            - name: HF_HUB_CACHE
+              value: /model-cache/huggingface
+          volumeMounts:
+            - name: model-cache
+              mountPath: /model-cache
+          resources:
+            requests:
+              cpu: 2
+              memory: 8Gi
+            limits:
+              cpu: 4
+              memory: 16Gi
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: wide-aggregated-model-cache

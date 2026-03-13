@@ -1,0 +1,35 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Note: namespace field removed from overlay level to avoid transforming istio-system
+# All resources explicitly set their namespace in metadata
+
+# Wide-Aggregated Multi-Node Deployment
+# Deploy RedHatAI/Qwen3-235B-A22B-FP8-dynamic in aggregated mode across multiple GPU nodes
+# Usage: oc apply -k rig/llm-d/overlays/multinode-aggregated
+
+resources:
+  # Wave -1: Namespace + RBAC + Resource Discovery
+  - ../../prereq/client-tools
+  - ../../prereq/resource-discovery
+
+  # Wave 5: Istio namespace
+  # Wave 10: Create model cache PVC (will reuse if already exists)
+  - model-cache-pvc.yaml              # Shared NFS PVC for model cache
+
+  # Wave 15: Download model to PVC, Enable metrics
+  - model-download-job.yaml           # Pre-download model to shared PVC
+  - ../../prereq/vllm-metrics          # Prometheus metrics scraping for vLLM
+
+  # Wave 20: Deploy Wide-Aggregated Multi-Node (waits for model download)
+  - aggregated-lws.yaml               # Aggregated LeaderWorkerSet deployment
+
+# Labels - using 'labels' instead of 'commonLabels' to avoid adding to service selectors
+labels:
+  - pairs:
+      app.kubernetes.io/name: llm-d
+      app.kubernetes.io/component: multinode-aggregated
+      deployment-type: multinode-aggregated
+    includeSelectors: false
+
+# No patches needed - all configuration is in manifests
