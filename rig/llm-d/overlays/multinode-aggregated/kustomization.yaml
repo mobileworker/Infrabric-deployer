@@ -21,8 +21,11 @@ resources:
   - model-download-job.yaml           # Pre-download model to shared PVC
   - ../../prereq/vllm-metrics          # Prometheus metrics scraping for vLLM
 
-  # Wave 20: Deploy Wide-Aggregated Multi-Node (waits for model download)
-  - aggregated-lws.yaml               # Aggregated LeaderWorkerSet deployment
+  # Wave 20: Model server manifests
+  - ms-manifests-configmap.yaml       # Aggregated LeaderWorkerSet template
+
+  # Wave 25: Deploy Wide-Aggregated Multi-Node (waits for model download)
+  - deploy-aggregated-job.yaml        # Deployment job with dynamic resource allocation
 
 # Labels - using 'labels' instead of 'commonLabels' to avoid adding to service selectors
 labels:

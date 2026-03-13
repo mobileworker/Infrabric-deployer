@@ -1,0 +1,230 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: deploy-wide-aggregated
+  namespace: llm-d
+  labels:
+    app: llm-d
+    component: multinode-aggregated
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: llm-d
+        component: multinode-aggregated
+        job: deploy
+    spec:
+      serviceAccountName: llm-d-client
+      restartPolicy: OnFailure
+
+      # Init containers
+      initContainers:
+        # 0. Wait for model download to complete
+        - name: wait-for-model-cache
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "⏳ Waiting for model download to complete..."
+
+              # Install kubectl
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              # Wait for model download job to complete (timeout 1 hour)
+              echo "Waiting for wide-aggregated-model-download job to complete..."
+              kubectl wait --for=condition=complete job/wide-aggregated-model-download -n llm-d --timeout=3600s
+
+              echo "✅ Model cache is ready"
+
+        # 1. Discover GPU and RDMA resources
+        - name: discover-resources
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "🔍 Discovering GPU and RDMA resources for multi-node deployment..."
+
+              # Install dependencies
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+
+              echo "Installing kubectl..."
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              echo "Installing jq..."
+              JQ_VERSION="1.7.1"
+              curl -sSL "https://github.com/jqlang/jq/releases/download/jq-${JQ_VERSION}/jq-linux-amd64" -o /tmp/bin/jq
+              chmod +x /tmp/bin/jq
+
+              # Run discovery script
+              export OUTPUT_FILE=/data/discovered-resources.yaml
+              bash /scripts/discover-gpu-rdma.sh
+
+              echo "✅ Resource discovery complete"
+          volumeMounts:
+            - name: discovery-script
+              mountPath: /scripts
+            - name: shared-data
+              mountPath: /data
+
+      containers:
+        - name: deployer
+          image: quay.io/openshift/origin-cli:4.17
+          command:
+            - /bin/bash
+            - -c
+          args:
+            - |
+              set -e
+
+              echo "🚀 Deploying Wide-Aggregated Multi-Node Configuration"
+              echo "================================================"
+
+              # Install yq for YAML manipulation
+              YQ_VERSION="v4.44.1"
+              curl -sL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o /usr/local/bin/yq
+              chmod +x /usr/local/bin/yq
+
+              # Wait for resource discovery to complete
+              echo "⏳ Waiting for GPU resource discovery..."
+              max_wait=300
+              elapsed=0
+              while [ ! -f /data/discovered-resources.yaml ] && [ $elapsed -lt $max_wait ]; do
+                sleep 5
+                elapsed=$((elapsed + 5))
+                echo "   Waiting for /data/discovered-resources.yaml... (${elapsed}s)"
+              done
+
+              if [ ! -f /data/discovered-resources.yaml ]; then
+                echo "❌ ERROR: Resource discovery file not found after ${max_wait}s"
+                exit 1
+              fi
+
+              echo "✓ Resource discovery complete"
+              cat /data/discovered-resources.yaml
+              echo ""
+
+              # Extract discovered resources
+              GPU_COUNT=$(yq '.discovered.gpuCount' /data/discovered-resources.yaml)
+              RDMA_COUNT=$(yq '.discovered.rdmaCount' /data/discovered-resources.yaml)
+              NODE_COUNT=$(yq '.discovered.nodeCount' /data/discovered-resources.yaml)
+              USABLE_MEMORY_GI=$(yq '.resources.limits.memory' /data/discovered-resources.yaml | sed 's/Gi$//')
+
+              # For aggregated mode: Use ALL nodes (no prefill reservation needed)
+              AGGREGATED_REPLICAS=$NODE_COUNT
+
+              # Calculate Tensor Parallel Size - must be power of 2
+              # Find largest power of 2 <= GPU_COUNT
+              TENSOR_PARALLEL_SIZE=1
+              while [ $((TENSOR_PARALLEL_SIZE * 2)) -le $GPU_COUNT ]; do
+                TENSOR_PARALLEL_SIZE=$((TENSOR_PARALLEL_SIZE * 2))
+              done
+
+              UNUSED_GPUS=$((GPU_COUNT - TENSOR_PARALLEL_SIZE))
+              MEMORY_PER_POD=$USABLE_MEMORY_GI
+
+              echo ""
+              echo "Multi-Node Aggregated Configuration:"
+              echo "  - Total GPU nodes: $NODE_COUNT"
+              echo "  - GPUs per node: $GPU_COUNT"
+              echo "  - Tensor Parallel Size: $TENSOR_PARALLEL_SIZE"
+              echo "  - Unused GPUs per node: $UNUSED_GPUS"
+              echo "  - RDMA resources: $RDMA_COUNT"
+              echo "  - Memory per pod: ${MEMORY_PER_POD}Gi"
+              echo "  - Aggregated LWS replicas: $AGGREGATED_REPLICAS"
+              echo "  - Expected total pods: $AGGREGATED_REPLICAS"
+              echo ""
+
+              if [ "$UNUSED_GPUS" -gt 0 ]; then
+                echo "⚠️  WARNING: $UNUSED_GPUS GPU(s) per node will remain unused due to power-of-2 constraint"
+              fi
+
+              # Copy manifest to tmp for patching
+              echo "📦 Patching LeaderWorkerSet manifest with dynamic resources..."
+              cp /config/ms/aggregated-lws.yaml /tmp/aggregated-lws.yaml
+
+              # Patch replicas
+              yq -i ".spec.replicas = $AGGREGATED_REPLICAS" /tmp/aggregated-lws.yaml
+
+              # Update GPU count
+              yq -i ".spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\" = \"$TENSOR_PARALLEL_SIZE\"" /tmp/aggregated-lws.yaml
+              yq -i ".spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\" = \"$TENSOR_PARALLEL_SIZE\"" /tmp/aggregated-lws.yaml
+
+              # Update Memory
+              yq -i ".spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.limits.memory = \"${MEMORY_PER_POD}Gi\"" /tmp/aggregated-lws.yaml
+              yq -i ".spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.requests.memory = \"${MEMORY_PER_POD}Gi\"" /tmp/aggregated-lws.yaml
+
+              # Update TP_SIZE in vllm serve command
+              yq -i ".spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].args[0] |= sub(\"--tensor-parallel-size 8\", \"--tensor-parallel-size $TENSOR_PARALLEL_SIZE\")" /tmp/aggregated-lws.yaml
+
+              # Add RDMA resources from discovery
+              if [ "$RDMA_COUNT" -gt 0 ]; then
+                echo "🌐 Injecting RDMA resource requests for multi-node deployment..."
+
+                RDMA_RESOURCES=$(yq '.resources.limits | to_entries | .[] | select(.key | test("^rdma/")) | .key + "=\"" + .value + "\""' /data/discovered-resources.yaml)
+
+                if [ -n "$RDMA_RESOURCES" ]; then
+                  echo "$RDMA_RESOURCES" | while IFS='=' read -r key value; do
+                    value=$(echo "$value" | tr -d '"')
+                    yq -i ".spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.limits.\"$key\" = \"$value\"" /tmp/aggregated-lws.yaml
+                    yq -i ".spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.requests.\"$key\" = \"$value\"" /tmp/aggregated-lws.yaml
+                  done
+                  echo "   ✓ RDMA resources injected"
+                fi
+              fi
+
+              # Display patched manifest
+              echo ""
+              echo "📄 Patched LeaderWorkerSet manifest:"
+              echo "---"
+              cat /tmp/aggregated-lws.yaml
+              echo ""
+
+              # Apply the patched manifest
+              echo "🚀 Deploying Wide-Aggregated LeaderWorkerSet..."
+              oc apply -f /tmp/aggregated-lws.yaml
+
+              echo ""
+              echo "✅ Wide-Aggregated deployment complete!"
+              echo "   - Replicas: $AGGREGATED_REPLICAS"
+              echo "   - GPUs per pod: $TENSOR_PARALLEL_SIZE"
+              echo "   - Memory per pod: ${MEMORY_PER_POD}Gi"
+
+          volumeMounts:
+            - name: shared-data
+              mountPath: /data
+              readOnly: true
+            - name: ms-manifests
+              mountPath: /config/ms
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: discovery-script
+          configMap:
+            name: gpu-rdma-discovery-script
+            defaultMode: 0755
+        - name: shared-data
+          emptyDir: {}
+        - name: ms-manifests
+          configMap:
+            name: ms-manifests-aggregated
