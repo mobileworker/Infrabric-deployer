@@ -22,7 +22,7 @@ data:
         llm-d.ai/guide: "wide-ep-multinode"
         llm-d.ai/accelerator-variant: "gpu"
         llm-d.ai/accelerator-vendor: "nvidia"
-        llm-d.ai/model: Qwen3-235B-A22B-FP8
+        llm-d.ai/model: Qwen3-235B-FP8-dynamic
         llm-d.ai/role: prefill
     spec:
       replicas: 1
@@ -35,7 +35,7 @@ data:
               llm-d.ai/guide: "wide-ep-multinode"
               llm-d.ai/accelerator-variant: "gpu"
               llm-d.ai/accelerator-vendor: "nvidia"
-              llm-d.ai/model: Qwen3-235B-A22B-FP8
+              llm-d.ai/model: Qwen3-235B-FP8-dynamic
               llm-d.ai/role: prefill
           spec:
             serviceAccountName: llm-d-modelserver
@@ -124,7 +124,7 @@ data:
                     fi
 
                     exec vllm serve \
-                      Qwen/Qwen3-235B-A22B-Thinking-2507-FP8 \
+                      RedHatAI/Qwen3-235B-A22B-FP8-dynamic \
                       --port 8000 \
                       --trust-remote-code \
                       --disable-uvicorn-access-log \
@@ -141,7 +141,7 @@ data:
                       --enable-eplb \
                       --eplb-config '{"window_size":"1000","step_interval":"3000","num_redundant_experts":"0","log_balancedness":"False"}' \
                       --all2all-backend deepep_high_throughput \
-                      --max-model-len 100000 \
+                      --max-model-len 40960 \
                       --gpu-memory-utilization 0.75
 
                 env:
@@ -151,9 +151,6 @@ data:
                         name: llm-d-hf-token
                         key: HF_TOKEN
                         optional: false
-                  # Limit rayon thread pool to prevent ThreadPoolBuildError
-                  - name: RAYON_NUM_THREADS
-                    value: "1"
                   # LeaderWorkerSet worker index (injected from pod label)
                   - name: LWS_WORKER_INDEX
                     valueFrom:
@@ -216,6 +213,10 @@ data:
                     value: /var/cache/vllm/flashinfer
                   - name: HF_HUB_CACHE
                     value: /var/cache/huggingface
+                  - name: UCX_MAX_RMA_RAILS
+                    value: "1"
+                  - name: RAYON_NUM_THREADS
+                    value: "1"
 
                 ports:
                   - containerPort: 8000
@@ -278,7 +279,7 @@ data:
         llm-d.ai/guide: "wide-ep-multinode"
         llm-d.ai/accelerator-variant: "gpu"
         llm-d.ai/accelerator-vendor: "nvidia"
-        llm-d.ai/model: Qwen3-235B-A22B-FP8
+        llm-d.ai/model: Qwen3-235B-FP8-dynamic
         llm-d.ai/role: decode
     spec:
       replicas: 1
@@ -291,7 +292,7 @@ data:
               llm-d.ai/guide: "wide-ep-multinode"
               llm-d.ai/accelerator-variant: "gpu"
               llm-d.ai/accelerator-vendor: "nvidia"
-              llm-d.ai/model: Qwen3-235B-A22B-FP8
+              llm-d.ai/model: Qwen3-235B-FP8-dynamic
               llm-d.ai/role: decode
           spec:
             serviceAccountName: llm-d-modelserver
@@ -399,7 +400,7 @@ data:
                     fi
 
                     exec vllm serve \
-                      Qwen/Qwen3-235B-A22B-Thinking-2507-FP8 \
+                      RedHatAI/Qwen3-235B-A22B-FP8-dynamic \
                       --port 8200 \
                       --trust-remote-code \
                       --disable-uvicorn-access-log \
@@ -417,7 +418,7 @@ data:
                       --eplb-config '{"window_size":"1000","step_interval":"3000","num_redundant_experts":"0","log_balancedness":"False"}' \
                       --compilation_config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
                       --all2all-backend deepep_low_latency \
-                      --max-model-len 100000 \
+                      --max-model-len 40960 \
                       --gpu-memory-utilization 0.75 \
                       --kv-cache-memory-bytes=${KV_CACHE_MEMORY_BYTES-}
                 env:
@@ -427,9 +428,6 @@ data:
                         name: llm-d-hf-token
                         key: HF_TOKEN
                         optional: false
-                  # Limit rayon thread pool to prevent ThreadPoolBuildError
-                  - name: RAYON_NUM_THREADS
-                    value: "1"
                   # LeaderWorkerSet worker index (injected from pod label)
                   - name: LWS_WORKER_INDEX
                     valueFrom:
@@ -494,6 +492,10 @@ data:
                     value: /var/cache/vllm/flashinfer
                   - name: HF_HUB_CACHE
                     value: /var/cache/huggingface
+                  - name: UCX_MAX_RMA_RAILS
+                    value: "1"
+                  - name: RAYON_NUM_THREADS
+                    value: "1"
 
                 ports:
                   - containerPort: 8200

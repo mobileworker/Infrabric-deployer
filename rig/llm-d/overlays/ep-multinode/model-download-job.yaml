@@ -31,14 +31,14 @@ spec:
             - |
               set -e
               echo "Starting model download to shared PVC..."
-              echo "Target model: Qwen/Qwen3-235B-A22B-Thinking-2507-FP8"
+              echo "Target model: RedHatAI/Qwen3-235B-A22B-FP8-dynamic"
 
               # Use huggingface-cli to download the model
               python3 -c "
               from huggingface_hub import snapshot_download
               import os
 
-              model_id = 'Qwen/Qwen3-235B-A22B-Thinking-2507-FP8'
+              model_id = 'RedHatAI/Qwen3-235B-A22B-FP8-dynamic'
               cache_dir = '/model-cache'
 
               print(f'Downloading {model_id} to {cache_dir}...')

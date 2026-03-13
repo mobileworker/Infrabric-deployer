@@ -154,10 +154,10 @@ data:
     PD_SPLIT=$(calculate_pd_split $GPU_COUNT)
     TOTAL_USED_GPUS=$((PD_SPLIT * 2))
 
-    # Calculate CPU/Memory split for single-node (conservative: use 50% of allocatable, split evenly)
-    # Leave 50% for system overhead and other pods
+    # Calculate CPU/Memory split for single-node (use 80% of allocatable, split evenly)
+    # Leave 20% for system overhead and other pods
     USABLE_CPU_CORES=$((CPU_CORES * 50 / 100))
-    USABLE_MEMORY_GI=$((MEMORY_GI * 50 / 100))
+    USABLE_MEMORY_GI=$((MEMORY_GI * 80 / 100))
 
     # Split evenly between prefill and decode
     CPU_PER_POD=$((USABLE_CPU_CORES / 2))
@@ -172,7 +172,7 @@ data:
     fi
 
     echo "   💻 Usable CPU: $USABLE_CPU_CORES cores (50% of $CPU_CORES)"
-    echo "   🧠 Usable Memory: ${USABLE_MEMORY_GI}Gi (50% of ${MEMORY_GI}Gi)"
+    echo "   🧠 Usable Memory: ${USABLE_MEMORY_GI}Gi (80% of ${MEMORY_GI}Gi)"
     echo "   ⚖️  Per pod: ${CPU_PER_POD} cores, ${MEMORY_PER_POD}Gi memory"
 
     # Generate vLLM configuration

@@ -182,6 +182,12 @@ spec:
               RDMA_COUNT=$(yq '.discovered.rdmaCount' /data/discovered-resources.yaml)
               NODE_COUNT=$(yq '.discovered.nodeCount' /data/discovered-resources.yaml)
 
+              # Extract memory values - for wide-EP use full usable memory per node
+              USABLE_MEMORY_GI=$(yq '.singleNodeResources.usableMemoryGi' /data/discovered-resources.yaml)
+
+              # For multi-node wide-EP: 1 pod per node, use full usable memory
+              MEMORY_PER_POD=$USABLE_MEMORY_GI
+
               # Data Parallel configuration
               # DP_SIZE_LOCAL: Number of GPUs per pod used for data parallelism
               # Use all available GPUs on each node for DP/EP
@@ -213,6 +219,7 @@ spec:
               echo "  - Tensor Parallel Size: $TENSOR_PARALLEL_SIZE"
               echo "  - Unused GPUs per node: $UNUSED_GPUS"
               echo "  - RDMA resources: $RDMA_COUNT"
+              echo "  - Memory per pod: ${MEMORY_PER_POD}Gi"
               echo "  - Prefill LWS replicas: $PREFILL_LWS_REPLICAS (size=$PREFILL_LWS_SIZE pods)"
               echo "  - Decode LWS replicas: $DECODE_LWS_REPLICAS (size=$DECODE_LWS_SIZE pods)"
               echo "  - Data Parallel Size (local): $DP_SIZE_LOCAL"
@@ -237,6 +244,10 @@ spec:
               # Update GPU count (in workerTemplate) - use DP_SIZE_LOCAL GPUs per pod
               yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$DP_SIZE_LOCAL\"" /tmp/ep-lws.yaml
               yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$DP_SIZE_LOCAL\"" /tmp/ep-lws.yaml
+
+              # Update Memory
+              yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.limits.memory) = \"${MEMORY_PER_POD}Gi\"" /tmp/ep-lws.yaml
+              yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.requests.memory) = \"${MEMORY_PER_POD}Gi\"" /tmp/ep-lws.yaml
 
               # Update TP_SIZE environment variable
               yq -i "(select(.metadata.name == \"wide-ep-prefill\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$TENSOR_PARALLEL_SIZE\"" /tmp/ep-lws.yaml
@@ -276,6 +287,10 @@ spec:
               # Update GPU count - use DP_SIZE_LOCAL GPUs per pod
               yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$DP_SIZE_LOCAL\"" /tmp/ep-lws.yaml
               yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$DP_SIZE_LOCAL\"" /tmp/ep-lws.yaml
+
+              # Update Memory
+              yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.limits.memory) = \"${MEMORY_PER_POD}Gi\"" /tmp/ep-lws.yaml
+              yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].resources.requests.memory) = \"${MEMORY_PER_POD}Gi\"" /tmp/ep-lws.yaml
 
               # Update TP_SIZE environment variable
               yq -i "(select(.metadata.name == \"wide-ep-decode\") | .spec.leaderWorkerTemplate.workerTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$TENSOR_PARALLEL_SIZE\"" /tmp/ep-lws.yaml

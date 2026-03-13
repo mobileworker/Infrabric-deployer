@@ -132,7 +132,7 @@ data:
         matchLabels:
           llm-d.ai/inference-serving: "true"
           llm-d.ai/guide: "wide-ep-multinode"
-          llm-d.ai/model: Qwen3-235B-A22B-FP8
+          llm-d.ai/model: Qwen3-235B-FP8-dynamic
 
     provider:
       name: istio
