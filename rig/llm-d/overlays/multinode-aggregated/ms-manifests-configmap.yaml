@@ -20,6 +20,11 @@ data:
       leaderWorkerTemplate:
         size: 1
         workerTemplate:
+          metadata:
+            labels:
+              llm-d.ai/inference-serving: "true"
+              llm-d.ai/guide: "multinode-aggregated"
+              llm-d.ai/model: "Qwen3-235B"
           spec:
             serviceAccountName: llm-d-modelserver
             volumes:
@@ -69,6 +74,18 @@ data:
                         name: llm-d-hf-token
                         key: HF_TOKEN
                         optional: false
+                  # NCCL configuration for multi-GPU tensor parallelism
+                  - name: NCCL_IB_HCA
+                    value: "mlx"
+                  - name: NCCL_SOCKET_IFNAME
+                    value: "eth0"
+                  - name: GLOO_SOCKET_IFNAME
+                    value: "eth0"
+                  - name: VLLM_SKIP_P2P_CHECK
+                    value: "1"
+                  - name: NVIDIA_GDRCOPY
+                    value: "enabled"
+                  # vLLM paths and configuration
                   - name: TRITON_LIBCUDA_PATH
                     value: /usr/lib64
                   - name: VLLM_LOGGING_LEVEL

@@ -17,15 +17,22 @@ resources:
   # Wave 10: Create model cache PVC (will reuse if already exists)
   - model-cache-pvc.yaml              # Shared NFS PVC for model cache
 
-  # Wave 15: Download model to PVC, Enable metrics
+  # Wave 10: Install Istio gateway
+  # Wave 15: Download model to PVC, Install InferencePool controller, Enable metrics
   - model-download-job.yaml           # Pre-download model to shared PVC
+  - ../../prereq/istio-gateway
+  - ../../prereq/inferencepool-controller-aggregated
   - ../../prereq/vllm-metrics          # Prometheus metrics scraping for vLLM
 
-  # Wave 20: Model server manifests
+  # Wave 20: Gateway and Model server manifests
+  - gaie-values-configmap.yaml        # Gateway configuration
   - ms-manifests-configmap.yaml       # Aggregated LeaderWorkerSet template
 
   # Wave 25: Deploy Wide-Aggregated Multi-Node (waits for model download)
   - deploy-aggregated-job.yaml        # Deployment job with dynamic resource allocation
+
+  # Wave 30: HTTP Routing
+  - httproute.yaml                    # Routes inference requests to InferencePool
 
 # Labels - using 'labels' instead of 'commonLabels' to avoid adding to service selectors
 labels:

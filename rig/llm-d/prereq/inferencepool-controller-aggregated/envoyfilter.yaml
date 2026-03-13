@@ -1,0 +1,44 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: inference-extproc-filter-aggregated
+  namespace: llm-d
+  labels:
+    app: llm-d
+    component: inferencepool-controller-aggregated
+  annotations:
+    argocd.argoproj.io/sync-wave: "14"
+    description: "Configures aggregated Istio gateway to use GAIE Aggregated EPP for inference routing"
+spec:
+  # Apply specifically to aggregated gateway
+  workloadSelector:
+    labels:
+      gateway.networking.k8s.io/gateway-name: infra-aggregated-gateway
+  configPatches:
+  # Insert the ext_proc filter before the router filter
+  - applyTo: HTTP_FILTER
+    match:
+      context: GATEWAY
+      listener:
+        filterChain:
+          filter:
+            name: "envoy.filters.network.http_connection_manager"
+            subFilter:
+              name: "envoy.filters.http.router"
+    patch:
+      operation: INSERT_BEFORE
+      value:
+        name: envoy.filters.http.ext_proc
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+          grpc_service:
+            envoy_grpc:
+              cluster_name: "outbound|9002||gaie-aggregated-epp.llm-d.svc.cluster.local"
+            timeout: 30s
+          message_timeout: 30s
+          failure_mode_allow: false
+          processing_mode:
+            request_header_mode: SEND
+            response_header_mode: SKIP
+            request_body_mode: NONE
+            response_body_mode: NONE

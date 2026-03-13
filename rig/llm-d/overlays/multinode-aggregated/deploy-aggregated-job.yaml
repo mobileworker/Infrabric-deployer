@@ -118,6 +118,23 @@ spec:
               cat /data/discovered-resources.yaml
               echo ""
 
+              # Step 1: Create Gateway Resource
+              echo ""
+              echo "========================================="
+              echo "Step 1: Creating Gateway Resource"
+              echo "========================================="
+
+              echo "📦 Creating Gateway..."
+              oc apply -f /config/gaie/gateway.yaml
+
+              echo "✅ Gateway created"
+
+              # Step 2: Deploy Model Server with Aggregated Multi-Node
+              echo ""
+              echo "========================================="
+              echo "Step 2: Deploying Model Server (Aggregated Multi-Node)"
+              echo "========================================="
+
               # Extract discovered resources
               GPU_COUNT=$(yq '.discovered.gpuCount' /data/discovered-resources.yaml)
               RDMA_COUNT=$(yq '.discovered.rdmaCount' /data/discovered-resources.yaml)
@@ -208,6 +225,9 @@ spec:
             - name: shared-data
               mountPath: /data
               readOnly: true
+            - name: gaie-values
+              mountPath: /config/gaie
+              readOnly: true
             - name: ms-manifests
               mountPath: /config/ms
               readOnly: true
@@ -225,6 +245,9 @@ spec:
             defaultMode: 0755
         - name: shared-data
           emptyDir: {}
+        - name: gaie-values
+          configMap:
+            name: gaie-aggregated-values
         - name: ms-manifests
           configMap:
             name: ms-manifests-aggregated

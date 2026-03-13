@@ -1,0 +1,97 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: install-gaie-aggregated-controller
+  namespace: llm-d
+  labels:
+    app: gaie-aggregated-installer
+    component: inferencepool-controller-aggregated
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 5
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: gaie-aggregated-installer
+    spec:
+      serviceAccountName: llm-d-client
+      restartPolicy: OnFailure
+      containers:
+        - name: install-gaie-aggregated
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "========================================="
+              echo "Aggregated InferencePool Controller (GAIE) Installation"
+              echo "========================================="
+
+              # Install kubectl
+              echo "📦 Installing kubectl..."
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              echo "✅ kubectl installed"
+              kubectl version --client
+
+              # Apply GAIE manifests
+              echo ""
+              echo "========================================="
+              echo "Deploying Aggregated InferencePool Controller"
+              echo "========================================="
+
+              echo "📦 Applying GAIE aggregated manifests..."
+              kubectl apply -f /manifests/manifests.yaml
+
+              # Wait for deployment
+              echo "⏳ Waiting for GAIE aggregated controller to be ready..."
+              kubectl wait --for=condition=available --timeout=600s deployment/gaie-aggregated-epp -n llm-d
+
+              echo "✅ Aggregated InferencePool controller deployed"
+
+              # Verification
+              echo ""
+              echo "========================================="
+              echo "Verification"
+              echo "========================================="
+
+              echo "InferencePool CRD:"
+              kubectl get crd inferencepools.inference.networking.k8s.io
+
+              echo ""
+              echo "Aggregated GAIE Pods:"
+              kubectl get pods -n llm-d -l app.kubernetes.io/name=gaie-aggregated-epp
+
+              echo ""
+              echo "Aggregated InferencePool:"
+              kubectl get inferencepool gaie-aggregated -n llm-d
+
+              echo ""
+              echo "✅ GAIE Aggregated installation complete!"
+              echo "========================================="
+
+          volumeMounts:
+            - name: manifests
+              mountPath: /manifests
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+      volumes:
+        - name: manifests
+          configMap:
+            name: gaie-aggregated-manifests
