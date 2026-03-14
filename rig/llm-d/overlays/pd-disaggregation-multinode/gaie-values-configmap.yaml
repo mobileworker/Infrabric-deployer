@@ -28,10 +28,10 @@ data:
                 resources:
                   limits:
                     cpu: "2"
-                    memory: 1Gi
+                    memory: 4Gi
                   requests:
                     cpu: 100m
-                    memory: 128Mi
+                    memory: 512Mi
       service: |
         spec:
           type: "ClusterIP"
@@ -71,8 +71,7 @@ data:
         kind: Gateway
         name: infra-pd-inference-gateway
       accessLogging:
-      - providers:
-        - name: envoy
+      - disabled: true
 
   values.yaml: |
     inferenceExtension:
@@ -81,10 +80,11 @@ data:
         # in vLLM 10.0+, the metric is renamed while upstream GAIE is still using the old name as default.
         # See https://github.com/kubernetes-sigs/gateway-api-inference-extension/pull/1905.
         kv-cache-usage-percentage-metric: "vllm:kv_cache_usage_perc"
+        v: 1
       image:
         name: llm-d-inference-scheduler
         hub: ghcr.io/llm-d
-        tag: v0.4.0
+        tag: v0.5.1
         pullPolicy: Always
       extProcPort: 9002
       pluginsConfigFile: "pd-config.yaml"

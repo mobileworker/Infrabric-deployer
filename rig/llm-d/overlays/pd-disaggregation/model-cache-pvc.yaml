@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pd-model-cache
+  namespace: llm-d
+  labels:
+    app: llm-d
+    component: pd-disaggregation
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+    description: "Shared model cache for P/D disaggregation deployment"
+spec:
+  accessModes:
+    - ReadWriteMany  # Required for NFS to allow multiple pods to mount
+  storageClassName: nfs-disk-1-sc
+  resources:
+    requests:
+      storage: 100Gi  # Llama-3.1-8B-FP8 is smaller than Qwen3-235B

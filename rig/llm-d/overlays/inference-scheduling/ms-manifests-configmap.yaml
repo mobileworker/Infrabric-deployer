@@ -57,7 +57,7 @@ data:
                   path: /dev/infiniband
             containers:
               - name: vllm
-                image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+                image: ghcr.io/llm-d/llm-d-cuda:v0.5.1
                 securityContext:
                   capabilities:
                     add:
@@ -168,7 +168,7 @@ data:
                   path: /dev/infiniband
             containers:
               - name: vllm
-                image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+                image: ghcr.io/llm-d/llm-d-cuda:v0.5.1
                 securityContext:
                   capabilities:
                     add:

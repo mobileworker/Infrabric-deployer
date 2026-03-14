@@ -1,0 +1,19 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: infra-ep-inference-gateway
+  namespace: llm-d
+  labels:
+    app: llm-d
+    component: ep-multinode
+  annotations:
+    argocd.argoproj.io/sync-wave: "35"
+    description: "External route for inference gateway"
+spec:
+  port:
+    targetPort: 80
+  to:
+    kind: Service
+    name: infra-ep-inference-gateway-istio
+    weight: 100
+  wildcardPolicy: None

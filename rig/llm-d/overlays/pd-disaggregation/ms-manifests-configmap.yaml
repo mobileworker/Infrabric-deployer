@@ -40,9 +40,10 @@ data:
               - name: dshm
                 emptyDir:
                   medium: Memory
-                  sizeLimit: 256Gi
+                  sizeLimit: 2Gi
               - name: hf-cache
-                emptyDir: {}
+                persistentVolumeClaim:
+                  claimName: pd-model-cache
               - name: rdma-script
                 configMap:
                   name: ib-hca-discovery-script
@@ -52,7 +53,7 @@ data:
                   path: /dev/infiniband
             containers:
               - name: vllm
-                image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+                image: ghcr.io/llm-d/llm-d-cuda:v0.5.1
                 command:
                   - /bin/bash
                   - -c
@@ -73,6 +74,7 @@ data:
                     vllm serve RedHatAI/Meta-Llama-3.1-8B-FP8 \
                       --port 8000 \
                       --tensor-parallel-size ${TP_SIZE} \
+                      --data-parallel-size ${DP_SIZE} \
                       --block-size 128 \
                       --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}' \
                       --disable-log-requests \
@@ -159,9 +161,10 @@ data:
               - name: dshm
                 emptyDir:
                   medium: Memory
-                  sizeLimit: 256Gi
+                  sizeLimit: 2Gi
               - name: hf-cache
-                emptyDir: {}
+                persistentVolumeClaim:
+                  claimName: pd-model-cache
               - name: rdma-script
                 configMap:
                   name: ib-hca-discovery-script
@@ -171,7 +174,7 @@ data:
                   path: /dev/infiniband
             containers:
               - name: vllm
-                image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+                image: ghcr.io/llm-d/llm-d-cuda:v0.5.1
                 command:
                   - /bin/bash
                   - -c
@@ -192,6 +195,7 @@ data:
                     vllm serve RedHatAI/Meta-Llama-3.1-8B-FP8 \
                       --port 8000 \
                       --tensor-parallel-size ${TP_SIZE} \
+                      --data-parallel-size ${DP_SIZE} \
                       --block-size 128 \
                       --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}' \
                       --disable-log-requests \
@@ -306,9 +310,10 @@ data:
               - name: dshm
                 emptyDir:
                   medium: Memory
-                  sizeLimit: 256Gi
+                  sizeLimit: 2Gi
               - name: hf-cache
-                emptyDir: {}
+                persistentVolumeClaim:
+                  claimName: pd-model-cache
               - name: rdma-script
                 configMap:
                   name: ib-hca-discovery-script
@@ -318,7 +323,7 @@ data:
                   path: /dev/infiniband
             containers:
               - name: vllm
-                image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+                image: ghcr.io/llm-d/llm-d-cuda:v0.5.1
                 command:
                   - /bin/bash
                   - -c
@@ -339,6 +344,7 @@ data:
                     vllm serve RedHatAI/Meta-Llama-3.1-8B-FP8 \
                       --port 8000 \
                       --tensor-parallel-size ${TP_SIZE} \
+                      --data-parallel-size ${DP_SIZE} \
                       --block-size 128 \
                       --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}' \
                       --disable-log-requests \
@@ -438,9 +444,10 @@ data:
               - name: dshm
                 emptyDir:
                   medium: Memory
-                  sizeLimit: 256Gi
+                  sizeLimit: 2Gi
               - name: hf-cache
-                emptyDir: {}
+                persistentVolumeClaim:
+                  claimName: pd-model-cache
               - name: rdma-script
                 configMap:
                   name: ib-hca-discovery-script
@@ -450,7 +457,7 @@ data:
                   path: /dev/infiniband
             containers:
               - name: vllm
-                image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+                image: ghcr.io/llm-d/llm-d-cuda:v0.5.1
                 command:
                   - /bin/bash
                   - -c
@@ -471,6 +478,7 @@ data:
                     vllm serve RedHatAI/Meta-Llama-3.1-8B-FP8 \
                       --port 8000 \
                       --tensor-parallel-size ${TP_SIZE} \
+                      --data-parallel-size ${DP_SIZE} \
                       --block-size 128 \
                       --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}' \
                       --disable-log-requests \

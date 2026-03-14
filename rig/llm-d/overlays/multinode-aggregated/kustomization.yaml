@@ -34,6 +34,9 @@ resources:
   # Wave 30: HTTP Routing
   - httproute.yaml                    # Routes inference requests to InferencePool
 
+  # Wave 35: External Access
+  - gateway-route.yaml                # OpenShift Route for external access
+
 # Labels - using 'labels' instead of 'commonLabels' to avoid adding to service selectors
 labels:
   - pairs:

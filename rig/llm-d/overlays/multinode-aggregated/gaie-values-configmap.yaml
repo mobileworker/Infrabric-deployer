@@ -29,10 +29,10 @@ data:
                 resources:
                   limits:
                     cpu: "2"
-                    memory: 1Gi
+                    memory: 4Gi
                   requests:
                     cpu: 100m
-                    memory: 128Mi
+                    memory: 512Mi
       service: |
         spec:
           type: "ClusterIP"
@@ -72,8 +72,7 @@ data:
         kind: Gateway
         name: infra-aggregated-gateway
       accessLogging:
-      - providers:
-        - name: envoy
+      - disabled: true
 
   values.yaml: |
     inferenceExtension:

@@ -11,8 +11,9 @@ metadata:
     argocd.argoproj.io/hook: Sync
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
 spec:
-  backoffLimit: 3
-  ttlSecondsAfterFinished: 600
+  backoffLimit: 5
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 3600
   template:
     metadata:
       labels:
@@ -23,7 +24,28 @@ spec:
 
       # Init containers
       initContainers:
-        # 1. Discover GPU and RDMA resources
+        # 1. Wait for model download
+        - name: wait-for-model-download
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "Waiting for model download job to complete..."
+
+              # Install kubectl to local directory
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              # Wait for model download job
+              kubectl wait --for=condition=complete job/pd-multinode-model-download -n llm-d --timeout=1800s
+
+              echo "✅ Model download complete"
+
+        # 2. Discover GPU and RDMA resources
         - name: discover-resources
           image: registry.access.redhat.com/ubi9/ubi:latest
           command: ["/bin/bash", "-c"]
@@ -57,14 +79,14 @@ spec:
             - name: shared-data
               mountPath: /data
 
-        # 2. Wait for gateway ready
+        # 3. Wait for Istio gateway ready
         - name: wait-for-gateway
           image: registry.access.redhat.com/ubi9/ubi:latest
           command: ["/bin/bash", "-c"]
           args:
             - |
               set -euo pipefail
-              echo "Waiting for gateway-ready job to complete..."
+              echo "Waiting for Istio gateway to be ready..."
 
               # Install kubectl to local directory
               mkdir -p /tmp/bin
@@ -73,10 +95,10 @@ spec:
               curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
               chmod +x /tmp/bin/kubectl
 
-              # Wait for gateway ready job
-              kubectl wait --for=condition=complete job/wait-for-gateway-ready -n llm-d --timeout=600s
+              # Wait for Istio gateway deployment to be ready
+              kubectl wait --for=condition=available --timeout=600s deployment/istio-ingressgateway -n istio-system || echo "Warning: Istio gateway timeout, continuing..."
 
-              echo "✅ Gateway is ready"
+              echo "✅ Gateway check complete"
 
       containers:
         - name: deploy-pd

@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pd-multinode-model-cache
+  namespace: llm-d
+  labels:
+    app: llm-d
+    component: pd-disaggregation-multinode
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+    description: "Shared model cache for P/D disaggregation multi-node deployment"
+spec:
+  accessModes:
+    - ReadWriteMany  # Required for NFS to allow multiple pods to mount
+  storageClassName: nfs-disk-1-sc
+  resources:
+    requests:
+      storage: 1Ti  # Qwen3-235B-A22B-FP8-dynamic model cache

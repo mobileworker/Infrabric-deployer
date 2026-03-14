@@ -17,6 +17,12 @@ resources:
   - ../../prereq/istio-gateway
   - ../../prereq/inferencepool-controller
 
+  # Wave 10: Model Storage
+  - model-cache-pvc.yaml              # Shared PVC for model cache
+
+  # Wave 15: Model Download
+  - model-download-job.yaml           # Pre-download model to PVC
+
   # Wave 20: RDMA Configuration and Manifests
   - rdma-script-configmap.yaml       # InfiniBand HCA discovery script
   - gaie-values-configmap.yaml        # InferencePool configuration (Helm values)
@@ -32,6 +38,9 @@ resources:
 
   # Wave 30: HTTP Routing
   - httproute.yaml                    # Routes inference requests to InferencePool
+
+  # Wave 35: External Access
+  - gateway-route.yaml                # OpenShift Route for external access
 
 # Labels - using 'labels' instead of 'commonLabels' to avoid adding to service selectors
 labels:

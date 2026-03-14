@@ -32,7 +32,7 @@ data:
               llm-d.ai/role: prefill
               llm-d.ai/guide: pd-disaggregation-multinode
             annotations:
-              inference.lanl.gov/model-name: RedHatAI/Meta-Llama-3.1-8B-FP8
+              inference.lanl.gov/model-name: RedHatAI/Qwen3-235B-A22B-FP8-dynamic
           spec:
             serviceAccountName: llm-d-modelserver
             # Anti-affinity: Ensure prefill and decode are on DIFFERENT nodes
@@ -54,9 +54,10 @@ data:
               - name: dshm
                 emptyDir:
                   medium: Memory
-                  sizeLimit: 256Gi
+                  sizeLimit: 2Gi
               - name: hf-cache
-                emptyDir: {}
+                persistentVolumeClaim:
+                  claimName: pd-multinode-model-cache
               - name: rdma-script
                 configMap:
                   name: ib-hca-discovery-script
@@ -66,7 +67,7 @@ data:
                   path: /dev/infiniband
             containers:
               - name: vllm
-                image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+                image: ghcr.io/llm-d/llm-d-cuda:v0.5.1
                 command:
                   - /bin/bash
                   - -c
@@ -85,14 +86,15 @@ data:
                     echo "NCCL_SOCKET_IFNAME: ${NCCL_SOCKET_IFNAME}"
                     echo "Tensor Parallel Size: ${TP_SIZE}"
 
-                    vllm serve RedHatAI/Meta-Llama-3.1-8B-FP8 \
+                    vllm serve RedHatAI/Qwen3-235B-A22B-FP8-dynamic \
                       --port 8000 \
                       --tensor-parallel-size ${TP_SIZE} \
+                      --data-parallel-size ${DP_SIZE} \
                       --block-size 128 \
                       --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}' \
                       --disable-log-requests \
                       --disable-uvicorn-access-log \
-                      --max-model-len 8192 \
+                      --max-model-len 40960 \
                       --trust-remote-code || sleep infinity
                 env:
                   - name: VLLM_NIXL_SIDE_CHANNEL_HOST
@@ -111,6 +113,8 @@ data:
                         name: llm-d-hf-token
                         key: HF_TOKEN
                         optional: true
+                  - name: HF_HOME
+                    value: "/root/.cache/huggingface"
                   - name: VLLM_SKIP_P2P_CHECK
                     value: "1"
                   - name: NVIDIA_GDRCOPY
@@ -168,7 +172,7 @@ data:
               llm-d.ai/role: prefill
               llm-d.ai/guide: pd-disaggregation-multinode
             annotations:
-              inference.lanl.gov/model-name: RedHatAI/Meta-Llama-3.1-8B-FP8
+              inference.lanl.gov/model-name: RedHatAI/Qwen3-235B-A22B-FP8-dynamic
           spec:
             serviceAccountName: llm-d-modelserver
             affinity:
@@ -189,9 +193,10 @@ data:
               - name: dshm
                 emptyDir:
                   medium: Memory
-                  sizeLimit: 256Gi
+                  sizeLimit: 2Gi
               - name: hf-cache
-                emptyDir: {}
+                persistentVolumeClaim:
+                  claimName: pd-multinode-model-cache
               - name: rdma-script
                 configMap:
                   name: ib-hca-discovery-script
@@ -201,7 +206,7 @@ data:
                   path: /dev/infiniband
             containers:
               - name: vllm
-                image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+                image: ghcr.io/llm-d/llm-d-cuda:v0.5.1
                 command:
                   - /bin/bash
                   - -c
@@ -220,14 +225,15 @@ data:
                     echo "NCCL_SOCKET_IFNAME: ${NCCL_SOCKET_IFNAME}"
                     echo "Tensor Parallel Size: ${TP_SIZE}"
 
-                    vllm serve RedHatAI/Meta-Llama-3.1-8B-FP8 \
+                    vllm serve RedHatAI/Qwen3-235B-A22B-FP8-dynamic \
                       --port 8000 \
                       --tensor-parallel-size ${TP_SIZE} \
+                      --data-parallel-size ${DP_SIZE} \
                       --block-size 128 \
                       --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}' \
                       --disable-log-requests \
                       --disable-uvicorn-access-log \
-                      --max-model-len 8192 \
+                      --max-model-len 40960 \
                       --trust-remote-code || sleep infinity
                 env:
                   - name: VLLM_NIXL_SIDE_CHANNEL_HOST
@@ -246,6 +252,8 @@ data:
                         name: llm-d-hf-token
                         key: HF_TOKEN
                         optional: true
+                  - name: HF_HOME
+                    value: "/root/.cache/huggingface"
                   - name: VLLM_SKIP_P2P_CHECK
                     value: "1"
                   - name: NVIDIA_GDRCOPY
@@ -317,7 +325,7 @@ data:
               llm-d.ai/role: decode
               llm-d.ai/guide: pd-disaggregation-multinode
             annotations:
-              inference.lanl.gov/model-name: RedHatAI/Meta-Llama-3.1-8B-FP8
+              inference.lanl.gov/model-name: RedHatAI/Qwen3-235B-A22B-FP8-dynamic
           spec:
             serviceAccountName: llm-d-modelserver
             # Anti-affinity: Ensure decode pods avoid nodes with prefill
@@ -339,9 +347,10 @@ data:
               - name: dshm
                 emptyDir:
                   medium: Memory
-                  sizeLimit: 256Gi
+                  sizeLimit: 2Gi
               - name: hf-cache
-                emptyDir: {}
+                persistentVolumeClaim:
+                  claimName: pd-multinode-model-cache
               - name: rdma-script
                 configMap:
                   name: ib-hca-discovery-script
@@ -351,7 +360,7 @@ data:
                   path: /dev/infiniband
             containers:
               - name: vllm
-                image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+                image: ghcr.io/llm-d/llm-d-cuda:v0.5.1
                 command:
                   - /bin/bash
                   - -c
@@ -370,14 +379,15 @@ data:
                     echo "NCCL_SOCKET_IFNAME: ${NCCL_SOCKET_IFNAME}"
                     echo "Tensor Parallel Size: ${TP_SIZE}"
 
-                    vllm serve RedHatAI/Meta-Llama-3.1-8B-FP8 \
+                    vllm serve RedHatAI/Qwen3-235B-A22B-FP8-dynamic \
                       --port 8000 \
                       --tensor-parallel-size ${TP_SIZE} \
+                      --data-parallel-size ${DP_SIZE} \
                       --block-size 128 \
                       --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}' \
                       --disable-log-requests \
                       --disable-uvicorn-access-log \
-                      --max-model-len 8192 \
+                      --max-model-len 40960 \
                       --trust-remote-code || sleep infinity
                 env:
                   - name: VLLM_NIXL_SIDE_CHANNEL_HOST
@@ -396,6 +406,8 @@ data:
                         name: llm-d-hf-token
                         key: HF_TOKEN
                         optional: true
+                  - name: HF_HOME
+                    value: "/root/.cache/huggingface"
                   - name: VLLM_SKIP_P2P_CHECK
                     value: "1"
                   - name: NVIDIA_GDRCOPY
@@ -453,7 +465,7 @@ data:
               llm-d.ai/role: decode
               llm-d.ai/guide: pd-disaggregation-multinode
             annotations:
-              inference.lanl.gov/model-name: RedHatAI/Meta-Llama-3.1-8B-FP8
+              inference.lanl.gov/model-name: RedHatAI/Qwen3-235B-A22B-FP8-dynamic
           spec:
             serviceAccountName: llm-d-modelserver
             affinity:
@@ -474,9 +486,10 @@ data:
               - name: dshm
                 emptyDir:
                   medium: Memory
-                  sizeLimit: 256Gi
+                  sizeLimit: 2Gi
               - name: hf-cache
-                emptyDir: {}
+                persistentVolumeClaim:
+                  claimName: pd-multinode-model-cache
               - name: rdma-script
                 configMap:
                   name: ib-hca-discovery-script
@@ -486,7 +499,7 @@ data:
                   path: /dev/infiniband
             containers:
               - name: vllm
-                image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+                image: ghcr.io/llm-d/llm-d-cuda:v0.5.1
                 command:
                   - /bin/bash
                   - -c
@@ -505,14 +518,15 @@ data:
                     echo "NCCL_SOCKET_IFNAME: ${NCCL_SOCKET_IFNAME}"
                     echo "Tensor Parallel Size: ${TP_SIZE}"
 
-                    vllm serve RedHatAI/Meta-Llama-3.1-8B-FP8 \
+                    vllm serve RedHatAI/Qwen3-235B-A22B-FP8-dynamic \
                       --port 8000 \
                       --tensor-parallel-size ${TP_SIZE} \
+                      --data-parallel-size ${DP_SIZE} \
                       --block-size 128 \
                       --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}' \
                       --disable-log-requests \
                       --disable-uvicorn-access-log \
-                      --max-model-len 8192 \
+                      --max-model-len 40960 \
                       --trust-remote-code || sleep infinity
                 env:
                   - name: VLLM_NIXL_SIDE_CHANNEL_HOST
@@ -531,6 +545,8 @@ data:
                         name: llm-d-hf-token
                         key: HF_TOKEN
                         optional: true
+                  - name: HF_HOME
+                    value: "/root/.cache/huggingface"
                   - name: VLLM_SKIP_P2P_CHECK
                     value: "1"
                   - name: NVIDIA_GDRCOPY
