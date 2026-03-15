@@ -358,6 +358,25 @@ data:
               - name: dev-infiniband
                 hostPath:
                   path: /dev/infiniband
+            initContainers:
+              - name: routing-proxy
+                image: ghcr.io/llm-d/llm-d-routing-sidecar:v0.6.0
+                imagePullPolicy: Always
+                args:
+                  - --port=8000
+                  - --vllm-port=8200
+                  - --connector=nixlv2
+                  - --zap-encoder=json
+                  - --zap-log-level=debug
+                  - --secure-proxy=false
+                ports:
+                  - containerPort: 8000
+                    name: http
+                    protocol: TCP
+                restartPolicy: Always
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  runAsNonRoot: true
             containers:
               - name: vllm
                 image: ghcr.io/llm-d/llm-d-cuda:v0.5.1
@@ -380,7 +399,7 @@ data:
                     echo "Tensor Parallel Size: ${TP_SIZE}"
 
                     vllm serve RedHatAI/Qwen3-235B-A22B-FP8-dynamic \
-                      --port 8000 \
+                      --port 8200 \
                       --tensor-parallel-size ${TP_SIZE} \
                       --data-parallel-size ${DP_SIZE} \
                       --block-size 128 \
@@ -427,10 +446,10 @@ data:
                   - name: DP_SIZE_LOCAL
                     value: "1"
                 ports:
-                  - containerPort: 8000
-                    name: http
-                  - containerPort: 5555
-                    name: rpc
+                  - containerPort: 8200
+                    name: vllm
+                  - containerPort: 5600
+                    name: nixl
                 securityContext:
                   runAsUser: 0
                   privileged: true
@@ -497,6 +516,25 @@ data:
               - name: dev-infiniband
                 hostPath:
                   path: /dev/infiniband
+            initContainers:
+              - name: routing-proxy
+                image: ghcr.io/llm-d/llm-d-routing-sidecar:v0.6.0
+                imagePullPolicy: Always
+                args:
+                  - --port=8000
+                  - --vllm-port=8200
+                  - --connector=nixlv2
+                  - --zap-encoder=json
+                  - --zap-log-level=debug
+                  - --secure-proxy=false
+                ports:
+                  - containerPort: 8000
+                    name: http
+                    protocol: TCP
+                restartPolicy: Always
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  runAsNonRoot: true
             containers:
               - name: vllm
                 image: ghcr.io/llm-d/llm-d-cuda:v0.5.1
@@ -519,7 +557,7 @@ data:
                     echo "Tensor Parallel Size: ${TP_SIZE}"
 
                     vllm serve RedHatAI/Qwen3-235B-A22B-FP8-dynamic \
-                      --port 8000 \
+                      --port 8200 \
                       --tensor-parallel-size ${TP_SIZE} \
                       --data-parallel-size ${DP_SIZE} \
                       --block-size 128 \
@@ -566,10 +604,10 @@ data:
                   - name: DP_SIZE_LOCAL
                     value: "1"
                 ports:
-                  - containerPort: 8000
-                    name: http
-                  - containerPort: 5555
-                    name: rpc
+                  - containerPort: 8200
+                    name: vllm
+                  - containerPort: 5600
+                    name: nixl
                 securityContext:
                   runAsUser: 0
                   privileged: true

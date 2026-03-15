@@ -203,14 +203,14 @@ spec:
 
               # Patch PREFILL LeaderWorkerSet (first document in the YAML)
               # Set replicas (always 1 for prefill in multi-node)
-              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.replicas) = $PREFILL_REPLICAS" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.replicas) = $PREFILL_REPLICAS" /tmp/pd-lws.yaml
 
               # Update GPU count
-              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
-              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
 
               # Update TP_SIZE environment variable
-              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
 
               # Add RDMA resources from discovery (multi-node uses RDMA resource requests)
               if [ "$RDMA_COUNT" -gt 0 ]; then
@@ -223,10 +223,10 @@ spec:
                   echo "$RDMA_RESOURCES" | while IFS='=' read -r key value; do
                     value=$(echo "$value" | tr -d '"')
                     # Inject into both prefill and decode
-                    yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"$key\") = \"$value\"" /tmp/pd-lws.yaml
-                    yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"$key\") = \"$value\"" /tmp/pd-lws.yaml
-                    yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"$key\") = \"$value\"" /tmp/pd-lws.yaml
-                    yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"$key\") = \"$value\"" /tmp/pd-lws.yaml
+                    yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"$key\") = \"$value\"" /tmp/pd-lws.yaml
+                    yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"$key\") = \"$value\"" /tmp/pd-lws.yaml
+                    yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"$key\") = \"$value\"" /tmp/pd-lws.yaml
+                    yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"$key\") = \"$value\"" /tmp/pd-lws.yaml
                   done
                   echo "   ✓ RDMA resources injected for cross-node communication"
                 fi
@@ -236,14 +236,14 @@ spec:
 
               # Patch DECODE LeaderWorkerSet (second document in the YAML)
               # Set replicas (NODE_COUNT - 1 for multi-node)
-              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.replicas) = $DECODE_REPLICAS" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.replicas) = $DECODE_REPLICAS" /tmp/pd-lws.yaml
 
               # Update GPU count
-              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
-              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
 
               # Update TP_SIZE environment variable
-              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
 
               echo "✅ Dynamic configuration prepared"
               echo ""
