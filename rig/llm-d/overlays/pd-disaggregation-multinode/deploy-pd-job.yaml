@@ -40,10 +40,33 @@ spec:
               curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
               chmod +x /tmp/bin/kubectl
 
-              # Wait for model download job
+              # Wait for job to exist first (handles race condition during simultaneous apply)
+              echo "Checking if model download job exists..."
+              RETRY=0
+              MAX_RETRIES=60
+              while [ $RETRY -lt $MAX_RETRIES ]; do
+                if kubectl get job/pd-multinode-model-download -n llm-d &>/dev/null; then
+                  echo "Job found, waiting for completion..."
+                  break
+                fi
+                echo "Job not found yet, waiting... (${RETRY}/${MAX_RETRIES})"
+                sleep 5
+                RETRY=$((RETRY + 1))
+              done
+
+              if [ $RETRY -eq $MAX_RETRIES ]; then
+                echo "ERROR: Model download job not found after ${MAX_RETRIES} retries"
+                exit 1
+              fi
+
+              # Wait for model download job to complete
               kubectl wait --for=condition=complete job/pd-multinode-model-download -n llm-d --timeout=1800s
 
-              echo "✅ Model download complete"
+              echo "✅ Model download job complete"
+          volumeMounts:
+            - name: model-cache
+              mountPath: /model-cache
+              readOnly: true
 
         # 2. Discover GPU and RDMA resources
         - name: discover-resources
@@ -347,3 +370,6 @@ spec:
             defaultMode: 0755
         - name: shared-data
           emptyDir: {}
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: pd-multinode-model-cache
