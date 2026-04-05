@@ -26,7 +26,8 @@ resources:
   # Wave 20: RDMA Configuration and Manifests
   - rdma-script-configmap.yaml       # InfiniBand HCA discovery script
   - gaie-values-configmap.yaml        # InferencePool configuration (Helm values)
-  - ms-manifests-configmap.yaml       # Model server Kubernetes manifests
+  - ms-manifests-configmap.yaml       # Model server manifests (traditional RDMA)
+  - ibmcloud-manifests-configmap.yaml # Model server manifests (IBM Cloud)
 
   # Wave 24: Services
   - prefill-service.yaml              # Prefill service

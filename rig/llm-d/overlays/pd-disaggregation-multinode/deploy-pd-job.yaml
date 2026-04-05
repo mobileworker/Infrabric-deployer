@@ -185,6 +185,12 @@ spec:
               RDMA_COUNT=$(yq '.discovered.rdmaCount' /data/discovered-resources.yaml)
               NODE_COUNT=$(yq '.discovered.nodeCount' /data/discovered-resources.yaml)
 
+              # Extract resource limits from discovery
+              CPU_LIMIT=$(yq '.resources.limits.cpu' /data/discovered-resources.yaml)
+              MEMORY_LIMIT=$(yq '.resources.limits.memory' /data/discovered-resources.yaml)
+              CPU_REQUEST=$(yq '.resources.requests.cpu' /data/discovered-resources.yaml)
+              MEMORY_REQUEST=$(yq '.resources.requests.memory' /data/discovered-resources.yaml)
+
               # For multi-node: Use ALL GPUs per node for tensor parallelism
               # Must be power of 2 (1, 2, 4, 8, 16, etc)
               # Find largest power of 2 <= GPU_COUNT
@@ -228,9 +234,13 @@ spec:
               # Set replicas (always 1 for prefill in multi-node)
               yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.replicas) = $PREFILL_REPLICAS" /tmp/pd-lws.yaml
 
-              # Update GPU count
+              # Update resource limits and requests for PREFILL
               yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
               yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.cpu) = \"$CPU_LIMIT\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.cpu) = \"$CPU_REQUEST\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.memory) = \"$MEMORY_LIMIT\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.memory) = \"$MEMORY_REQUEST\"" /tmp/pd-lws.yaml
 
               # Update TP_SIZE environment variable
               yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
@@ -257,13 +267,66 @@ spec:
                 echo "   ⚠️  No RDMA resources found - may impact cross-node performance"
               fi
 
+              # Check network mode and apply IBM Cloud specific configuration
+              NETWORK_MODE=$(yq '.network.mode' /data/discovered-resources.yaml)
+              echo ""
+              echo "📡 Network mode detected: $NETWORK_MODE"
+
+              if [ "$NETWORK_MODE" = "ibm-cloud" ]; then
+                echo "🌐 Applying IBM Cloud NetworkAttachmentDefinition configuration..."
+
+                # Detect deployment strategy
+                DEPLOYMENT_STRATEGY=$(yq '.network.strategy' /data/discovered-resources.yaml)
+                echo "   Strategy: $DEPLOYMENT_STRATEGY"
+
+                if [ "$DEPLOYMENT_STRATEGY" = "all-nics-per-pod" ]; then
+                  # Multi-Node: All pods use same NAD annotations (different physical nodes)
+                  echo "   🔧 Multi-Node: All pods get ALL NICs (anti-affinity ensures different nodes)"
+
+                  SHARED_NAD_ANNOTATION=$(yq '.network.sharedNadAnnotation' /data/discovered-resources.yaml)
+                  SHARED_DEVICES=$(yq '.network.sharedDevicesString' /data/discovered-resources.yaml)
+
+                  echo "   Shared NADs: $SHARED_NAD_ANNOTATION"
+                  echo "   Shared Devices: $SHARED_DEVICES"
+
+                  # Both prefill and decode use same NAD annotation
+                  yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.metadata.annotations.\"k8s.v1.cni.cncf.io/networks\") = \"$SHARED_NAD_ANNOTATION\"" /tmp/pd-lws.yaml
+                  yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.metadata.annotations.\"k8s.v1.cni.cncf.io/networks\") = \"$SHARED_NAD_ANNOTATION\"" /tmp/pd-lws.yaml
+
+                  # Both use same NCCL devices
+                  yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].env[] | select(.name == \"NCCL_IB_HCA\") | .value) = \"$SHARED_DEVICES\"" /tmp/pd-lws.yaml
+                  yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].env[] | select(.name == \"NCCL_IB_HCA\") | .value) = \"$SHARED_DEVICES\"" /tmp/pd-lws.yaml
+
+                  echo "   ✅ Multi-Node all-nics-per-pod configuration applied"
+
+                else
+                  echo "   ⚠️  Unknown strategy: $DEPLOYMENT_STRATEGY"
+                fi
+
+                # Remove /dev/infiniband hostPath volume for IBM Cloud (virtio doesn't use it)
+                yq -i '(select(.metadata.name == "pd-prefill") | .spec.leaderWorkerTemplate.leaderTemplate.spec.volumes) |= map(select(.name != "dev-infiniband"))' /tmp/pd-lws.yaml
+                yq -i '(select(.metadata.name == "pd-decode") | .spec.leaderWorkerTemplate.leaderTemplate.spec.volumes) |= map(select(.name != "dev-infiniband"))' /tmp/pd-lws.yaml
+
+                # Remove /dev/infiniband volumeMount for IBM Cloud
+                yq -i '(select(.metadata.name == "pd-prefill") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].volumeMounts) |= map(select(.name != "dev-infiniband"))' /tmp/pd-lws.yaml
+                yq -i '(select(.metadata.name == "pd-decode") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].volumeMounts) |= map(select(.name != "dev-infiniband"))' /tmp/pd-lws.yaml
+
+                echo "   ✅ IBM Cloud NAD configuration applied"
+              else
+                echo "   ℹ️  Using traditional RDMA configuration (rdma/* resources)"
+              fi
+
               # Patch DECODE LeaderWorkerSet (second document in the YAML)
               # Set replicas (NODE_COUNT - 1 for multi-node)
               yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.replicas) = $DECODE_REPLICAS" /tmp/pd-lws.yaml
 
-              # Update GPU count
+              # Update resource limits and requests for DECODE
               yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
               yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.cpu) = \"$CPU_LIMIT\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.cpu) = \"$CPU_REQUEST\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.memory) = \"$MEMORY_LIMIT\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.memory) = \"$MEMORY_REQUEST\"" /tmp/pd-lws.yaml
 
               # Update TP_SIZE environment variable
               yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
@@ -366,7 +429,7 @@ spec:
             name: ms-pd-manifests
         - name: discovery-script
           configMap:
-            name: gpu-rdma-discovery-script
+            name: gpu-rdma-discovery-script-ibm
             defaultMode: 0755
         - name: shared-data
           emptyDir: {}

@@ -29,7 +29,7 @@ InfraBrig Deployer provides a complete, production-ready ArgoCD-based GitOps dep
 ### 🧹 Utilities
 
 - **[Cluster Cleanup](manifests/99-cleanup/README.md)** - Complete infrastructure cleanup for fresh deployments
-- **[Network Performance Tests](manifests/99-network-perf-tests/README.md)** - RDMA bandwidth and NCCL testing
+- **[Full Network Valadation & Performance Tests](manifests/99-network-perf-tests/README.md)** - RDMA bandwidth and NCCL testing
 
 ### 🤖 LLM Deployments
 

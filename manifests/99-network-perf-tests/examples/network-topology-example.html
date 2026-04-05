@@ -1,0 +1,1033 @@
+<!DOCTYPE html>
+<html><head>
+    <style id="__________cytoscape_stylesheet">.__________cytoscape_container { position: relative; }</style><title>Network Topology - Server Icons</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #dc3545 0%, #c82333 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 98%;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #dc3545 0%, #c82333 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        .header h1 { font-size: 2.2em; margin-bottom: 10px; }
+        .controls {
+            background: #f8f9fa;
+            padding: 20px;
+            border-bottom: 1px solid #ddd;
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .btn {
+            background: linear-gradient(135deg, #dc3545 0%, #c82333 100%);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+        #cy {
+            width: 100%;
+            height: 800px;
+            background: #fafafa;
+        }
+        .info-panel {
+            position: absolute;
+            top: 120px;
+            right: 30px;
+            width: 320px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            padding: 15px;
+            max-height: 85vh;
+            overflow-y: auto;
+            display: none;
+            z-index: 1000;
+        }
+        .info-panel.visible {
+            display: block;
+        }
+        .info-panel h3 {
+            color: #dc3545;
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+        .info-panel .close-btn {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: none;
+            border: none;
+            font-size: 20px;
+            cursor: pointer;
+            color: #999;
+        }
+        .info-item {
+            margin: 8px 0;
+            font-size: 12px;
+            padding: 8px;
+            background: #f8f9fa;
+            border-radius: 4px;
+        }
+        .info-item strong {
+            color: #dc3545;
+        }
+        .multinode-nccl {
+            background: #fff3e0;
+            padding: 15px;
+            margin: 20px;
+            border-left: 4px solid #ff9800;
+            border-radius: 4px;
+        }
+        .multinode-nccl h3 {
+            color: #e65100;
+            margin-bottom: 10px;
+        }
+        .nccl-item {
+            font-size: 13px;
+            margin: 5px 0;
+            padding: 5px;
+            background: white;
+            border-radius: 4px;
+        }
+        .legend {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            margin: 20px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin: 8px 0;
+            font-size: 14px;
+        }
+        .info-text {
+            background: #e3f2fd;
+            padding: 10px;
+            margin: 20px;
+            border-left: 4px solid #2196f3;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+        .legend-warning-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin: 20px;
+        }
+        .legend-warning-container > div {
+            flex: 1;
+        }
+        .warning-box {
+            background: #fff3cd;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            border-left: 4px solid #ff9800;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .warning-box.success {
+            background: #d4edda;
+            border-left: 4px solid #28a745;
+        }
+        .warning-box h3 {
+            color: #ff9800;
+            margin-bottom: 10px;
+        }
+        .warning-box.success h3 {
+            color: #28a745;
+        }
+        .warning-item {
+            margin: 8px 0;
+            font-size: 14px;
+            line-height: 1.6;
+            color: #856404;
+        }
+        .warning-box.success .warning-item {
+            color: #155724;
+        }
+    </style>
+</head>
+<body data-new-gr-c-s-check-loaded="14.1272.0" data-gr-ext-installed="">
+    <div class="container">
+        <div class="header">
+            <h1>🖥️ Network Topology - Server View</h1>
+        </div>
+
+        <div class="controls">
+            <button class="btn" onclick="resetView()">🔄 Reset View</button>
+            <button class="btn" onclick="cy.zoom(cy.zoom() * 1.2); cy.center()">🔍+ Zoom In</button>
+            <button class="btn" onclick="cy.zoom(cy.zoom() * 0.8); cy.center()">🔍- Zoom Out</button>
+            <button class="btn" onclick="fitToScreen()">📐 Fit to Screen</button>
+            <button class="btn" onclick="exportPNG()">📸 Export PNG</button>
+            <button class="btn" onclick="exportJSON()">💾 Export JSON</button>
+            <button class="btn" onclick="exportHTML()">📄 Export HTML</button>
+        </div>
+
+        <div class="info-text">
+            <strong>💡 Controls:</strong>
+            Scroll to zoom | Drag background to pan | <strong>Drag server icons to move</strong> |
+            Click server for details | <strong>Double-click canvas to reset zoom</strong> | <strong>Drag to box-select and zoom</strong>
+        </div>
+
+        <div style="position: relative;">
+            <div id="cy" class="" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></div>
+            <div id="info-panel" class="info-panel">
+                <button class="close-btn" onclick="closeInfo()">✕</button>
+                <div id="info-content"></div>
+            </div>
+        </div>
+
+        <div class="legend">
+            <h3 style="margin-bottom: 10px;">Legend</h3>
+            <div class="legend-item">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 280" width="24" height="24" style="margin-right: 10px;">
+                    <rect x="0" y="0" width="280" height="280" fill="white"></rect>
+                    <rect x="20" y="20" width="240" height="240" fill="white" stroke="#dc3545" stroke-width="16" rx="12"></rect>
+                    <rect x="60" y="80" width="90" height="16" fill="#dc3545" rx="8"></rect>
+                    <rect x="60" y="132" width="90" height="16" fill="#dc3545" rx="8"></rect>
+                    <rect x="60" y="184" width="90" height="16" fill="#dc3545" rx="8"></rect>
+                    <circle cx="210" cy="88" r="10" fill="#dc3545"></circle>
+                    <circle cx="210" cy="140" r="10" fill="#dc3545"></circle>
+                    <circle cx="210" cy="192" r="10" fill="#dc3545"></circle>
+                </svg>
+                <span>Source server (center)</span>
+            </div>
+            <div class="legend-item">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 280" width="24" height="24" style="margin-right: 10px;">
+                    <rect x="0" y="0" width="280" height="280" fill="white"></rect>
+                    <rect x="20" y="20" width="240" height="240" fill="white" stroke="#2196f3" stroke-width="16" rx="12"></rect>
+                    <rect x="60" y="80" width="90" height="16" fill="#2196f3" rx="8"></rect>
+                    <rect x="60" y="132" width="90" height="16" fill="#2196f3" rx="8"></rect>
+                    <rect x="60" y="184" width="90" height="16" fill="#2196f3" rx="8"></rect>
+                    <circle cx="210" cy="88" r="10" fill="#2196f3"></circle>
+                    <circle cx="210" cy="140" r="10" fill="#2196f3"></circle>
+                    <circle cx="210" cy="192" r="10" fill="#2196f3"></circle>
+                </svg>
+                <span>Target servers</span>
+            </div>
+            <div class="legend-item">
+                <div style="width: 40px; height: 3px; background: #00c853; margin-right: 10px;"></div>
+                <span>Individual NIC (Sequential) - Excellent (≥90% of NIC speed)</span>
+            </div>
+            <div class="legend-item">
+                <div style="width: 40px; height: 3px; background: #ffd600; margin-right: 10px;"></div>
+                <span>Individual NIC (Sequential) - Good (70-90% of NIC speed)</span>
+            </div>
+            <div class="legend-item">
+                <div style="width: 40px; height: 3px; background: #ff1744; margin-right: 10px;"></div>
+                <span>Individual NIC (Sequential) - Needs Investigation (&lt;70% of NIC speed)</span>
+            </div>
+            <div class="legend-item">
+                <div style="width: 40px; height: 3px; background: #ff9800; border-top: 3px dashed #ff9800; margin-right: 10px;"></div>
+                <span><strong>ALL NICs (Parallel)</strong> - Combined throughput of all NICs</span>
+            </div>
+        </div>
+
+        <div id="warnings-box" class="warning-box" style="margin: 20px;">
+            <h3>⚠️ System Warnings</h3>
+            <div id="warnings-content"><div class="warning-item"><strong>⚠️ Disconnected Links by Node:</strong></div><div class="warning-item"><strong>Node 4knlw (RoCE/RDMA):</strong></div><div class="warning-item">  • mlx5_10 - No test results (link may be down)</div><div class="warning-item">  • mlx5_11 - No test results (link may be down)</div><div class="warning-item">  • mlx5_3 - No test results (link may be down)</div><div class="warning-item">  • mlx5_4 - No test results (link may be down)</div><div class="warning-item">  • mlx5_5 - No test results (link may be down)</div><div class="warning-item">  • mlx5_6 - No test results (link may be down)</div><div class="warning-item">  • mlx5_9 - No test results (link may be down)</div><div class="warning-item"><strong>Node 4w8nv (RoCE/RDMA):</strong></div><div class="warning-item">  • mlx5_10 - No test results (link may be down)</div><div class="warning-item">  • mlx5_11 - No test results (link may be down)</div><div class="warning-item">  • mlx5_3 - No test results (link may be down)</div><div class="warning-item">  • mlx5_4 - No test results (link may be down)</div><div class="warning-item">  • mlx5_5 - No test results (link may be down)</div><div class="warning-item">  • mlx5_6 - No test results (link may be down)</div><div class="warning-item">  • mlx5_9 - No test results (link may be down)</div></div>
+        </div>
+    </div>
+
+    <script>
+        const elements = {"nodes": [{"data": {"id": "network-perf-test-worker-2sjjj", "label": "network-perf-test-worker-2sjjj", "type": "source", "eth0": "N/A", "gpu": "NVIDIA H200", "cpu": "Intel Xeon", "cores": "64", "nics": "[{\"name\": \"mlx5_10\", \"ip\": \"10.1.0.1\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_11\", \"ip\": \"10.1.1.1\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_3\", \"ip\": \"10.1.2.1\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_4\", \"ip\": \"10.1.3.1\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_5\", \"ip\": \"10.1.4.1\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_6\", \"ip\": \"10.1.5.1\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_9\", \"ip\": \"10.1.6.1\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}]", "nccl": "{\"all_reduce\": 231.991254, \"all_gather\": 384.316374, \"reduce_scatter\": 361.260174, \"broadcast\": 329.725408}"}}, {"data": {"id": "network-perf-test-worker-4knlw", "label": "network-perf-test-worker-4knlw", "type": "target", "eth0": "N/A", "gpu": "NVIDIA H200", "cpu": "Intel Xeon", "cores": "64", "nics": "[{\"name\": \"mlx5_10\", \"ip\": \"10.1.0.2\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_11\", \"ip\": \"10.1.1.2\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_3\", \"ip\": \"10.1.2.2\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_4\", \"ip\": \"10.1.3.2\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_5\", \"ip\": \"10.1.4.2\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_6\", \"ip\": \"10.1.5.2\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_9\", \"ip\": \"10.1.6.2\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}]", "nccl": "{\"all_reduce\": 232.642278, \"all_gather\": 384.903972, \"reduce_scatter\": 360.646391, \"broadcast\": 329.596504}"}}, {"data": {"id": "network-perf-test-worker-4w8nv", "label": "network-perf-test-worker-4w8nv", "type": "target", "eth0": "N/A", "gpu": "NVIDIA H200", "cpu": "Intel Xeon", "cores": "64", "nics": "[{\"name\": \"mlx5_10\", \"ip\": \"10.1.0.3\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_11\", \"ip\": \"10.1.1.3\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_3\", \"ip\": \"10.1.2.3\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_4\", \"ip\": \"10.1.3.3\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_5\", \"ip\": \"10.1.4.3\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_6\", \"ip\": \"10.1.5.3\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}, {\"name\": \"mlx5_9\", \"ip\": \"10.1.6.3\", \"routes\": \"N/A\", \"model\": \"Mellanox ConnectX-7\", \"speed\": \"400000Mb/s\"}]", "nccl": "{\"all_reduce\": 232.493254, \"all_gather\": 385.178742, \"reduce_scatter\": 361.012148, \"broadcast\": 329.158642}"}}], "edges": [{"data": {"id": "network-perf-test-worker-2sjjj-network-perf-test-worker-4knlw-mlx5_10", "source": "network-perf-test-worker-2sjjj", "target": "network-perf-test-worker-4knlw", "nic": "mlx5_10", "nicIndex": 0, "edgeType": "individual", "roce_seq": 379.78, "cuda_seq": 396.52, "tcp_seq": 0, "ucx_host_bw_seq": 378.076, "ucx_host_bw_par": 339.78767999999997, "ucx_cuda_bw_seq": 360.97504, "ucx_cuda_bw_par": 361.53896000000003, "ucx_host_lat": 0, "ucx_cuda_lat": 0, "ucx_host_lat_par": 154.289, "ucx_cuda_lat_par": 104.889, "ib_host_lat_par": 96.3, "ib_cuda_lat_par": 87.89, "lat_host": 91.75, "lat_cuda": 87.85, "ib_host_lat_under_load": 275.77, "ib_cuda_lat_under_load": 132.61, "ucx_host_lat_under_load": 152.363, "ucx_cuda_lat_under_load": 235.081, "nic_speed": "400000Mb/s", "bandwidth": 396.52, "label": "mlx5_10"}}, {"data": {"id": "network-perf-test-worker-2sjjj-network-perf-test-worker-4knlw-mlx5_11", "source": "network-perf-test-worker-2sjjj", "target": "network-perf-test-worker-4knlw", "nic": "mlx5_11", "nicIndex": 1, "edgeType": "individual", "roce_seq": 380.14, "cuda_seq": 396.54, "tcp_seq": 0, "ucx_host_bw_seq": 377.94608, "ucx_host_bw_par": 338.832, "ucx_cuda_bw_seq": 361.6656, "ucx_cuda_bw_par": 361.33456, "ucx_host_lat": 0, "ucx_cuda_lat": 0, "ucx_host_lat_par": 140.534, "ucx_cuda_lat_par": 103.634, "ib_host_lat_par": 92.38, "ib_cuda_lat_par": 87.87, "lat_host": 91.26, "lat_cuda": 87.97, "ib_host_lat_under_load": 207.7, "ib_cuda_lat_under_load": 131.69, "ucx_host_lat_under_load": 259.562, "ucx_cuda_lat_under_load": 235.789, "nic_speed": "400000Mb/s", "bandwidth": 396.54, "label": "mlx5_11"}}, {"data": {"id": "network-perf-test-worker-2sjjj-network-perf-test-worker-4knlw-mlx5_3", "source": "network-perf-test-worker-2sjjj", "target": "network-perf-test-worker-4knlw", "nic": "mlx5_3", "nicIndex": 2, "edgeType": "individual", "roce_seq": 378.66, "cuda_seq": 396.55, "tcp_seq": 0, "ucx_host_bw_seq": 0, "ucx_host_bw_par": 0, "ucx_cuda_bw_seq": 0, "ucx_cuda_bw_par": 0, "ucx_host_lat": 0, "ucx_cuda_lat": 0, "ucx_host_lat_par": 0, "ucx_cuda_lat_par": 0, "ib_host_lat_par": 91.59, "ib_cuda_lat_par": 87.83, "lat_host": 0, "lat_cuda": 0, "ib_host_lat_under_load": 245.84, "ib_cuda_lat_under_load": 131.97, "ucx_host_lat_under_load": 0, "ucx_cuda_lat_under_load": 0, "nic_speed": "400000Mb/s", "bandwidth": 396.55, "label": "mlx5_3"}}, {"data": {"id": "network-perf-test-worker-2sjjj-network-perf-test-worker-4knlw-mlx5_4", "source": "network-perf-test-worker-2sjjj", "target": "network-perf-test-worker-4knlw", "nic": "mlx5_4", "nicIndex": 3, "edgeType": "individual", "roce_seq": 378.43, "cuda_seq": 396.58, "tcp_seq": 0, "ucx_host_bw_seq": 377.96848, "ucx_host_bw_par": 340.13344, "ucx_cuda_bw_seq": 360.92647999999997, "ucx_cuda_bw_par": 361.42215999999996, "ucx_host_lat": 0, "ucx_cuda_lat": 0, "ucx_host_lat_par": 123.112, "ucx_cuda_lat_par": 103.656, "ib_host_lat_par": 92.64, "ib_cuda_lat_par": 87.75, "lat_host": 91.27, "lat_cuda": 87.97, "ib_host_lat_under_load": 331.14, "ib_cuda_lat_under_load": 132.06, "ucx_host_lat_under_load": 154.788, "ucx_cuda_lat_under_load": 232.514, "nic_speed": "400000Mb/s", "bandwidth": 396.58, "label": "mlx5_4"}}, {"data": {"id": "network-perf-test-worker-2sjjj-network-perf-test-worker-4knlw-mlx5_5", "source": "network-perf-test-worker-2sjjj", "target": "network-perf-test-worker-4knlw", "nic": "mlx5_5", "nicIndex": 4, "edgeType": "individual", "roce_seq": 378.47, "cuda_seq": 396.55, "tcp_seq": 0, "ucx_host_bw_seq": 378.07168, "ucx_host_bw_par": 338.30415999999997, "ucx_cuda_bw_seq": 361.53896000000003, "ucx_cuda_bw_par": 360.92647999999997, "ucx_host_lat": 0, "ucx_cuda_lat": 0, "ucx_host_lat_par": 121.617, "ucx_cuda_lat_par": 103.522, "ib_host_lat_par": 92.08, "ib_cuda_lat_par": 87.96, "lat_host": 91.9, "lat_cuda": 88.08, "ib_host_lat_under_load": 334.46, "ib_cuda_lat_under_load": 132.41, "ucx_host_lat_under_load": 159.811, "ucx_cuda_lat_under_load": 235.747, "nic_speed": "400000Mb/s", "bandwidth": 396.55, "label": "mlx5_5"}}, {"data": {"id": "network-perf-test-worker-2sjjj-network-perf-test-worker-4knlw-mlx5_6", "source": "network-perf-test-worker-2sjjj", "target": "network-perf-test-worker-4knlw", "nic": "mlx5_6", "nicIndex": 5, "edgeType": "individual", "roce_seq": 379.87, "cuda_seq": 396.58, "tcp_seq": 0, "ucx_host_bw_seq": 378.076, "ucx_host_bw_par": 378.10728, "ucx_cuda_bw_seq": 359.94888000000003, "ucx_cuda_bw_par": 361.37352000000004, "ucx_host_lat": 0, "ucx_cuda_lat": 0, "ucx_host_lat_par": 152.335, "ucx_cuda_lat_par": 103.614, "ib_host_lat_par": 91.62, "ib_cuda_lat_par": 87.95, "lat_host": 91.47, "lat_cuda": 88.06, "ib_host_lat_under_load": 252.89, "ib_cuda_lat_under_load": 132.25, "ucx_host_lat_under_load": 215.845, "ucx_cuda_lat_under_load": 232.831, "nic_speed": "400000Mb/s", "bandwidth": 396.58, "label": "mlx5_6"}}, {"data": {"id": "network-perf-test-worker-2sjjj-network-perf-test-worker-4knlw-mlx5_9", "source": "network-perf-test-worker-2sjjj", "target": "network-perf-test-worker-4knlw", "nic": "mlx5_9", "nicIndex": 6, "edgeType": "individual", "roce_seq": 379.33, "cuda_seq": 396.54, "tcp_seq": 0, "ucx_host_bw_seq": 378.076, "ucx_host_bw_par": 378.07847999999996, "ucx_cuda_bw_seq": 361.2568, "ucx_cuda_bw_par": 361.05271999999997, "ucx_host_lat": 0, "ucx_cuda_lat": 0, "ucx_host_lat_par": 156.662, "ucx_cuda_lat_par": 104.202, "ib_host_lat_par": 91.98, "ib_cuda_lat_par": 87.99, "lat_host": 91.91, "lat_cuda": 88.08, "ib_host_lat_under_load": 334.88, "ib_cuda_lat_under_load": 132.42, "ucx_host_lat_under_load": 266.411, "ucx_cuda_lat_under_load": 234.24, "nic_speed": "400000Mb/s", "bandwidth": 396.54, "label": "mlx5_9"}}, {"data": {"id": "network-perf-test-worker-2sjjj-network-perf-test-worker-4knlw-aggregate", "source": "network-perf-test-worker-2sjjj", "target": "network-perf-test-worker-4knlw", "nic": "ALL NICs", "nicIndex": 7, "edgeType": "aggregate", "roce_par": 2073.6, "cuda_par": 2775.9, "tcp_par": 0, "ucx_host_par": 2113.24304, "ucx_cuda_par": 2167.6484000000005, "ucx_host_lat_par": 141.42483333333334, "ucx_cuda_lat_par": 103.91949999999999, "ib_host_lat_par": 92.6557142857143, "ib_cuda_lat_par": 87.89142857142858, "roce_par_nics": "{\"mlx5_3\": 379.28, \"mlx5_4\": 300.52, \"mlx5_5\": 296.25, \"mlx5_6\": 244.5, \"mlx5_9\": 241.37, \"mlx5_10\": 369.34, \"mlx5_11\": 242.34}", "cuda_par_nics": "{\"mlx5_3\": 396.57, \"mlx5_4\": 396.59, \"mlx5_5\": 396.57, \"mlx5_6\": 396.56, \"mlx5_9\": 396.54, \"mlx5_10\": 396.51, \"mlx5_11\": 396.56}", "tcp_par_nics": "{}", "ucx_host_par_nics": "{\"mlx5_10\": 339.78767999999997, \"mlx5_11\": 338.832, \"mlx5_4\": 340.13344, \"mlx5_5\": 338.30415999999997, \"mlx5_6\": 378.10728, \"mlx5_9\": 378.07847999999996}", "ucx_cuda_par_nics": "{\"mlx5_10\": 361.53896000000003, \"mlx5_11\": 361.33456, \"mlx5_4\": 361.42215999999996, \"mlx5_5\": 360.92647999999997, \"mlx5_6\": 361.37352000000004, \"mlx5_9\": 361.05271999999997}", "ucx_host_lat_par_nics": "{\"mlx5_10\": 154.289, \"mlx5_11\": 140.534, \"mlx5_4\": 123.112, \"mlx5_5\": 121.617, \"mlx5_6\": 152.335, \"mlx5_9\": 156.662}", "ucx_cuda_lat_par_nics": "{\"mlx5_10\": 104.889, \"mlx5_11\": 103.634, \"mlx5_4\": 103.656, \"mlx5_5\": 103.522, \"mlx5_6\": 103.614, \"mlx5_9\": 104.202}", "ib_host_lat_par_nics": "{\"mlx5_3\": 91.59, \"mlx5_4\": 92.64, \"mlx5_5\": 92.08, \"mlx5_6\": 91.62, \"mlx5_9\": 91.98, \"mlx5_10\": 96.3, \"mlx5_11\": 92.38}", "ib_cuda_lat_par_nics": "{\"mlx5_3\": 87.83, \"mlx5_4\": 87.75, \"mlx5_5\": 87.96, \"mlx5_6\": 87.95, \"mlx5_9\": 87.99, \"mlx5_10\": 87.89, \"mlx5_11\": 87.87}", "ib_host_lat_under_load": 283.24, "ib_cuda_lat_under_load": 132.20142857142855, "ucx_host_lat_under_load": 201.46333333333334, "ucx_cuda_lat_under_load": 234.367, "ib_host_lat_under_load_nics": "{\"mlx5_3\": 245.84, \"mlx5_4\": 331.14, \"mlx5_5\": 334.46, \"mlx5_6\": 252.89, \"mlx5_9\": 334.88, \"mlx5_10\": 275.77, \"mlx5_11\": 207.7}", "ib_cuda_lat_under_load_nics": "{\"mlx5_3\": 131.97, \"mlx5_4\": 132.06, \"mlx5_5\": 132.41, \"mlx5_6\": 132.25, \"mlx5_9\": 132.42, \"mlx5_10\": 132.61, \"mlx5_11\": 131.69}", "ucx_host_lat_under_load_nics": "{\"mlx5_10\": 152.363, \"mlx5_11\": 259.562, \"mlx5_4\": 154.788, \"mlx5_5\": 159.811, \"mlx5_6\": 215.845, \"mlx5_9\": 266.411}", "ucx_cuda_lat_under_load_nics": "{\"mlx5_10\": 235.081, \"mlx5_11\": 235.789, \"mlx5_4\": 232.514, \"mlx5_5\": 235.747, \"mlx5_6\": 232.831, \"mlx5_9\": 234.24}", "bandwidth": 2775.9, "total_nic_capacity": 2800.0, "label": "ALL (Parallel)"}}, {"data": {"id": "network-perf-test-worker-2sjjj-network-perf-test-worker-4w8nv-mlx5_10", "source": "network-perf-test-worker-2sjjj", "target": "network-perf-test-worker-4w8nv", "nic": "mlx5_10", "nicIndex": 0, "edgeType": "individual", "roce_seq": 379.73, "cuda_seq": 396.57, "tcp_seq": 0, "ucx_host_bw_seq": 377.97376, "ucx_host_bw_par": 260.24752, "ucx_cuda_bw_seq": 360.97504, "ucx_cuda_bw_par": 361.21792, "ucx_host_lat": 0, "ucx_cuda_lat": 0, "ucx_host_lat_par": 154.727, "ucx_cuda_lat_par": 102.766, "ib_host_lat_par": 92.46, "ib_cuda_lat_par": 87.78, "lat_host": 91.75, "lat_cuda": 87.82, "ib_host_lat_under_load": 162.32, "ib_cuda_lat_under_load": 130.69, "ucx_host_lat_under_load": 252.93, "ucx_cuda_lat_under_load": 233.41, "nic_speed": "400000Mb/s", "bandwidth": 396.57, "label": "mlx5_10"}}, {"data": {"id": "network-perf-test-worker-2sjjj-network-perf-test-worker-4w8nv-mlx5_11", "source": "network-perf-test-worker-2sjjj", "target": "network-perf-test-worker-4w8nv", "nic": "mlx5_11", "nicIndex": 1, "edgeType": "individual", "roce_seq": 380.57, "cuda_seq": 396.55, "tcp_seq": 0, "ucx_host_bw_seq": 378.06744, "ucx_host_bw_par": 249.91648, "ucx_cuda_bw_seq": 361.54871999999995, "ucx_cuda_bw_par": 361.01384, "ucx_host_lat": 0, "ucx_cuda_lat": 0, "ucx_host_lat_par": 151.064, "ucx_cuda_lat_par": 103.587, "ib_host_lat_par": 91.44, "ib_cuda_lat_par": 87.88, "lat_host": 91.75, "lat_cuda": 87.98, "ib_host_lat_under_load": 147.06, "ib_cuda_lat_under_load": 132.15, "ucx_host_lat_under_load": 199.589, "ucx_cuda_lat_under_load": 234.166, "nic_speed": "400000Mb/s", "bandwidth": 396.55, "label": "mlx5_11"}}, {"data": {"id": "network-perf-test-worker-2sjjj-network-perf-test-worker-4w8nv-mlx5_3", "source": "network-perf-test-worker-2sjjj", "target": "network-perf-test-worker-4w8nv", "nic": "mlx5_3", "nicIndex": 2, "edgeType": "individual", "roce_seq": 378.54, "cuda_seq": 396.56, "tcp_seq": 0, "ucx_host_bw_seq": 377.96528, "ucx_host_bw_par": 192.37312, "ucx_cuda_bw_seq": 361.09152, "ucx_cuda_bw_par": 361.29568, "ucx_host_lat": 0, "ucx_cuda_lat": 0, "ucx_host_lat_par": 132.005, "ucx_cuda_lat_par": 104.255, "ib_host_lat_par": 91.91, "ib_cuda_lat_par": 87.88, "lat_host": 91.76, "lat_cuda": 87.82, "ib_host_lat_under_load": 261.57, "ib_cuda_lat_under_load": 132.39, "ucx_host_lat_under_load": 191.357, "ucx_cuda_lat_under_load": 233.786, "nic_speed": "400000Mb/s", "bandwidth": 396.56, "label": "mlx5_3"}}, {"data": {"id": "network-perf-test-worker-2sjjj-network-perf-test-worker-4w8nv-mlx5_4", "source": "network-perf-test-worker-2sjjj", "target": "network-perf-test-worker-4w8nv", "nic": "mlx5_4", "nicIndex": 3, "edgeType": "individual", "roce_seq": 378.45, "cuda_seq": 396.58, "tcp_seq": 0, "ucx_host_bw_seq": 377.96416, "ucx_host_bw_par": 195.70584, "ucx_cuda_bw_seq": 360.88768, "ucx_cuda_bw_par": 361.34432, "ucx_host_lat": 0, "ucx_cuda_lat": 0, "ucx_host_lat_par": 130.858, "ucx_cuda_lat_par": 103.108, "ib_host_lat_par": 95.81, "ib_cuda_lat_par": 87.76, "lat_host": 91.21, "lat_cuda": 87.95, "ib_host_lat_under_load": 227.62, "ib_cuda_lat_under_load": 131.34, "ucx_host_lat_under_load": 192.272, "ucx_cuda_lat_under_load": 238.145, "nic_speed": "400000Mb/s", "bandwidth": 396.58, "label": "mlx5_4"}}, {"data": {"id": "network-perf-test-worker-2sjjj-network-perf-test-worker-4w8nv-mlx5_5", "source": "network-perf-test-worker-2sjjj", "target": "network-perf-test-worker-4w8nv", "nic": "mlx5_5", "nicIndex": 4, "edgeType": "individual", "roce_seq": 378.47, "cuda_seq": 396.52, "tcp_seq": 0, "ucx_host_bw_seq": 377.93336, "ucx_host_bw_par": 194.5548, "ucx_cuda_bw_seq": 360.40312, "ucx_cuda_bw_par": 360.77128000000005, "ucx_host_lat": 0, "ucx_cuda_lat": 0, "ucx_host_lat_par": 135.254, "ucx_cuda_lat_par": 102.859, "ib_host_lat_par": 93.17, "ib_cuda_lat_par": 87.78, "lat_host": 92.27, "lat_cuda": 88.07, "ib_host_lat_under_load": 159.98, "ib_cuda_lat_under_load": 130.86, "ucx_host_lat_under_load": 202.163, "ucx_cuda_lat_under_load": 233.675, "nic_speed": "400000Mb/s", "bandwidth": 396.52, "label": "mlx5_5"}}, {"data": {"id": "network-perf-test-worker-2sjjj-network-perf-test-worker-4w8nv-mlx5_6", "source": "network-perf-test-worker-2sjjj", "target": "network-perf-test-worker-4w8nv", "nic": "mlx5_6", "nicIndex": 5, "edgeType": "individual", "roce_seq": 379.77, "cuda_seq": 396.55, "tcp_seq": 0, "ucx_host_bw_seq": 377.93864, "ucx_host_bw_par": 239.8116, "ucx_cuda_bw_seq": 361.46103999999997, "ucx_cuda_bw_par": 361.29568, "ucx_host_lat": 0, "ucx_cuda_lat": 0, "ucx_host_lat_par": 142.456, "ucx_cuda_lat_par": 102.942, "ib_host_lat_par": 91.7, "ib_cuda_lat_par": 87.88, "lat_host": 92.14, "lat_cuda": 87.96, "ib_host_lat_under_load": 250.1, "ib_cuda_lat_under_load": 132.32, "ucx_host_lat_under_load": 253.674, "ucx_cuda_lat_under_load": 234.287, "nic_speed": "400000Mb/s", "bandwidth": 396.55, "label": "mlx5_6"}}, {"data": {"id": "network-perf-test-worker-2sjjj-network-perf-test-worker-4w8nv-mlx5_9", "source": "network-perf-test-worker-2sjjj", "target": "network-perf-test-worker-4w8nv", "nic": "mlx5_9", "nicIndex": 6, "edgeType": "individual", "roce_seq": 379.88, "cuda_seq": 396.57, "tcp_seq": 0, "ucx_host_bw_seq": 378.07168, "ucx_host_bw_par": 247.81232, "ucx_cuda_bw_seq": 361.2568, "ucx_cuda_bw_par": 361.33456, "ucx_host_lat": 0, "ucx_cuda_lat": 0, "ucx_host_lat_par": 154.786, "ucx_cuda_lat_par": 103.552, "ib_host_lat_par": 91.97, "ib_cuda_lat_par": 87.78, "lat_host": 92.17, "lat_cuda": 88.09, "ib_host_lat_under_load": 132.59, "ib_cuda_lat_under_load": 132.05, "ucx_host_lat_under_load": 238.117, "ucx_cuda_lat_under_load": 234.272, "nic_speed": "400000Mb/s", "bandwidth": 396.57, "label": "mlx5_9"}}, {"data": {"id": "network-perf-test-worker-2sjjj-network-perf-test-worker-4w8nv-aggregate", "source": "network-perf-test-worker-2sjjj", "target": "network-perf-test-worker-4w8nv", "nic": "ALL NICs", "nicIndex": 7, "edgeType": "aggregate", "roce_par": 1889.5000000000002, "cuda_par": 2775.81, "tcp_par": 0, "ucx_host_par": 1580.42168, "ucx_cuda_par": 2528.2732800000003, "ucx_host_lat_par": 143.02142857142857, "ucx_cuda_lat_par": 103.29557142857144, "ib_host_lat_par": 92.63714285714286, "ib_cuda_lat_par": 87.81999999999998, "roce_par_nics": "{\"mlx5_3\": 377.93, \"mlx5_4\": 379.56, \"mlx5_5\": 379.55, \"mlx5_6\": 187.96, \"mlx5_9\": 189.11, \"mlx5_10\": 186.9, \"mlx5_11\": 188.49}", "cuda_par_nics": "{\"mlx5_3\": 396.52, \"mlx5_4\": 396.56, \"mlx5_5\": 396.51, \"mlx5_6\": 396.52, \"mlx5_9\": 396.58, \"mlx5_10\": 396.55, \"mlx5_11\": 396.57}", "tcp_par_nics": "{}", "ucx_host_par_nics": "{\"mlx5_10\": 260.24752, \"mlx5_11\": 249.91648, \"mlx5_3\": 192.37312, \"mlx5_4\": 195.70584, \"mlx5_5\": 194.5548, \"mlx5_6\": 239.8116, \"mlx5_9\": 247.81232}", "ucx_cuda_par_nics": "{\"mlx5_10\": 361.21792, \"mlx5_11\": 361.01384, \"mlx5_3\": 361.29568, \"mlx5_4\": 361.34432, \"mlx5_5\": 360.77128000000005, \"mlx5_6\": 361.29568, \"mlx5_9\": 361.33456}", "ucx_host_lat_par_nics": "{\"mlx5_10\": 154.727, \"mlx5_11\": 151.064, \"mlx5_3\": 132.005, \"mlx5_4\": 130.858, \"mlx5_5\": 135.254, \"mlx5_6\": 142.456, \"mlx5_9\": 154.786}", "ucx_cuda_lat_par_nics": "{\"mlx5_10\": 102.766, \"mlx5_11\": 103.587, \"mlx5_3\": 104.255, \"mlx5_4\": 103.108, \"mlx5_5\": 102.859, \"mlx5_6\": 102.942, \"mlx5_9\": 103.552}", "ib_host_lat_par_nics": "{\"mlx5_3\": 91.91, \"mlx5_4\": 95.81, \"mlx5_5\": 93.17, \"mlx5_6\": 91.7, \"mlx5_9\": 91.97, \"mlx5_10\": 92.46, \"mlx5_11\": 91.44}", "ib_cuda_lat_par_nics": "{\"mlx5_3\": 87.88, \"mlx5_4\": 87.76, \"mlx5_5\": 87.78, \"mlx5_6\": 87.88, \"mlx5_9\": 87.78, \"mlx5_10\": 87.78, \"mlx5_11\": 87.88}", "ib_host_lat_under_load": 191.60571428571424, "ib_cuda_lat_under_load": 131.68571428571428, "ucx_host_lat_under_load": 218.58599999999998, "ucx_cuda_lat_under_load": 234.53442857142858, "ib_host_lat_under_load_nics": "{\"mlx5_3\": 261.57, \"mlx5_4\": 227.62, \"mlx5_5\": 159.98, \"mlx5_6\": 250.1, \"mlx5_9\": 132.59, \"mlx5_10\": 162.32, \"mlx5_11\": 147.06}", "ib_cuda_lat_under_load_nics": "{\"mlx5_3\": 132.39, \"mlx5_4\": 131.34, \"mlx5_5\": 130.86, \"mlx5_6\": 132.32, \"mlx5_9\": 132.05, \"mlx5_10\": 130.69, \"mlx5_11\": 132.15}", "ucx_host_lat_under_load_nics": "{\"mlx5_10\": 252.93, \"mlx5_11\": 199.589, \"mlx5_3\": 191.357, \"mlx5_4\": 192.272, \"mlx5_5\": 202.163, \"mlx5_6\": 253.674, \"mlx5_9\": 238.117}", "ucx_cuda_lat_under_load_nics": "{\"mlx5_10\": 233.41, \"mlx5_11\": 234.166, \"mlx5_3\": 233.786, \"mlx5_4\": 238.145, \"mlx5_5\": 233.675, \"mlx5_6\": 234.287, \"mlx5_9\": 234.272}", "bandwidth": 2775.81, "total_nic_capacity": 2800.0, "label": "ALL (Parallel)"}}]};
+        const multinodeNccl = [];
+
+        const nicColors = ['#2196f3', '#ff9800', '#9c27b0', '#4caf50', '#e91e63', '#00bcd4'];
+
+        // Convert NIC speed from Mb/s to Gb/s
+        function formatNicSpeed(speed) {
+            if (speed === 'Unknown') return 'Unknown';
+            const match = speed.match(/(\d+)Mb\/s/);
+            if (match) {
+                const mbps = parseInt(match[1]);
+                const gbps = mbps / 1000;
+                return `${speed} (${gbps} Gb/s)`;
+            }
+            return speed;
+        }
+
+        function formatBreakdown(nicsJson, total) {
+            if (!nicsJson || nicsJson === '{}') {
+                return `<strong>Total Bandwidth:</strong> ${total.toFixed(2)} Gb/s`;
+            }
+
+            try {
+                const nics = JSON.parse(nicsJson);
+                const nicEntries = Object.entries(nics);
+
+                if (nicEntries.length === 0) {
+                    return `<strong>Total Bandwidth:</strong> ${total.toFixed(2)} Gb/s`;
+                }
+
+                const parts = nicEntries.map(([nic, bw]) => `${bw.toFixed(2)}G (${nic})`);
+                const breakdown = parts.join(' + ');
+                return `<strong>Breakdown:</strong> ${breakdown} = ${total.toFixed(2)} Gb/s`;
+            } catch (e) {
+                return `<strong>Total Bandwidth:</strong> ${total.toFixed(2)} Gb/s`;
+            }
+        }
+
+        function formatLatencyBreakdown(nicsJson) {
+            if (!nicsJson || nicsJson === '{}') {
+                return '';
+            }
+
+            try {
+                const nics = JSON.parse(nicsJson);
+                const nicEntries = Object.entries(nics);
+
+                if (nicEntries.length === 0) {
+                    return '';
+                }
+
+                const parts = nicEntries.map(([nic, lat]) => `${lat.toFixed(2)}μs (${nic})`);
+                const breakdown = parts.join(', ');
+                return `<br><span style="font-size: 0.9em;">Per-NIC: ${breakdown}</span>`;
+            } catch (e) {
+                return '';
+            }
+        }
+
+        function calculateUtilization(bandwidth, nicSpeed) {
+            if (!nicSpeed || nicSpeed === 'Unknown' || bandwidth === 0) {
+                return null;
+            }
+
+            const match = nicSpeed.match(/(\d+)Mb\/s/);
+            if (match) {
+                const nicSpeedGbps = parseInt(match[1]) / 1000;
+                const utilization = (bandwidth / nicSpeedGbps) * 100;
+                return utilization.toFixed(1);
+            }
+            return null;
+        }
+
+        function formatUtilization(bandwidth, nicSpeed) {
+            const util = calculateUtilization(bandwidth, nicSpeed);
+            if (util === null) return '';
+
+            let color = '#ff1744';  // Red
+            if (util >= 90) color = '#00c853';  // Green
+            else if (util >= 70) color = '#ffd600';  // Yellow
+
+            return `<div style="margin-top: 5px; padding: 5px; background: ${color}22; border-left: 3px solid ${color};">
+                <strong>Utilization:</strong> ${util}% of NIC capability
+            </div>`;
+        }
+
+        // Server rack icon with custom design
+        function createServerIcon(color, isSource) {
+            const size = isSource ? 80 : 60;
+            const svg = `
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 280" width="${size}" height="${size}">
+                    <!-- White background -->
+                    <rect x="0" y="0" width="280" height="280" fill="white"/>
+
+                    <!-- Red border with rounded corners -->
+                    <rect x="20" y="20" width="240" height="240" fill="white" stroke="${color}" stroke-width="16" rx="12"/>
+
+                    <!-- Server unit bars (3 horizontal bars on left) -->
+                    <rect x="60" y="80" width="90" height="16" fill="${color}" rx="8"/>
+                    <rect x="60" y="132" width="90" height="16" fill="${color}" rx="8"/>
+                    <rect x="60" y="184" width="90" height="16" fill="${color}" rx="8"/>
+
+                    <!-- LED indicators (3 dots on right) -->
+                    <circle cx="210" cy="88" r="10" fill="${color}"/>
+                    <circle cx="210" cy="140" r="10" fill="${color}"/>
+                    <circle cx="210" cy="192" r="10" fill="${color}"/>
+                </svg>
+            `;
+            return 'data:image/svg+xml;base64,' + btoa(svg);
+        }
+
+        const cy = cytoscape({
+            container: document.getElementById('cy'),
+            elements: elements,
+            style: [
+                {
+                    selector: 'node',
+                    style: {
+                        'shape': 'rectangle',
+                        'background-image': ele => createServerIcon('#2196f3', false),
+                        'background-fit': 'contain',
+                        'background-clip': 'none',
+                        'background-color': 'transparent',
+                        'label': 'data(label)',
+                        'width': 80,
+                        'height': 80,
+                        'font-size': 11,
+                        'text-valign': 'bottom',
+                        'text-halign': 'center',
+                        'text-margin-y': 5,
+                        'color': '#333',
+                        'font-weight': 'bold',
+                        'overlay-opacity': 0,
+                        'border-width': 0,
+                        'text-wrap': 'wrap',
+                        'text-max-width': 140
+                    }
+                },
+                {
+                    selector: 'node[type="source"]',
+                    style: {
+                        'background-image': ele => createServerIcon('#dc3545', true),
+                        'width': 100,
+                        'height': 100,
+                        'font-size': 12
+                    }
+                },
+                {
+                    selector: 'node:selected',
+                    style: {
+                        'border-width': 3,
+                        'border-color': '#ff9800',
+                        'border-opacity': 1
+                    }
+                },
+                {
+                    selector: 'edge',
+                    style: {
+                        'width': 'mapData(bandwidth, 0, 100, 2, 8)',
+                        'line-color': ele => {
+                            // Calculate percentage of NIC capability
+                            const bw = ele.data('bandwidth');
+                            const nicSpeed = ele.data('nic_speed');
+
+                            if (!nicSpeed || nicSpeed === 'Unknown') {
+                                // Fallback to absolute values if NIC speed unknown
+                                if (bw > 80) return '#00c853';
+                                if (bw > 40) return '#ffd600';
+                                return '#ff1744';
+                            }
+
+                            // Parse NIC speed (e.g., "100000Mb/s" -> 100 Gb/s)
+                            const match = nicSpeed.match(/(\d+)Mb\/s/);
+                            if (match) {
+                                const nicSpeedGbps = parseInt(match[1]) / 1000;
+                                const utilization = (bw / nicSpeedGbps) * 100;
+
+                                if (utilization >= 90) return '#00c853';  // Green: 90-100%
+                                if (utilization >= 70) return '#ffd600';  // Yellow: 70-90%
+                                return '#ff1744';  // Red: <70%
+                            }
+
+                            // Fallback
+                            if (bw > 80) return '#00c853';
+                            if (bw > 40) return '#ffd600';
+                            return '#ff1744';
+                        },
+                        'target-arrow-color': ele => {
+                            const nicIdx = ele.data('nicIndex');
+                            return nicColors[nicIdx % nicColors.length];
+                        },
+                        'target-arrow-shape': 'triangle',
+                        'curve-style': 'bezier',
+                        'label': 'data(label)',
+                        'font-size': 16,
+                        'text-rotation': 'autorotate',
+                        'text-margin-y': -10,
+                        'color': '#333',
+                        'font-weight': 'bold',
+                        'opacity': 0.8
+                    }
+                },
+                {
+                    selector: 'edge:selected',
+                    style: {
+                        'width': 'mapData(bandwidth, 0, 100, 4, 12)',
+                        'opacity': 1
+                    }
+                },
+                {
+                    selector: 'edge[edgeType="aggregate"]',
+                    style: {
+                        'line-style': 'dashed',
+                        'line-dash-pattern': [10, 5],
+                        'width': 6,
+                        'line-color': ele => {
+                            // Calculate percentage of total NIC capacity
+                            const bw = ele.data('bandwidth');
+                            const totalCapacity = ele.data('total_nic_capacity');
+
+                            if (!totalCapacity || totalCapacity === 0) {
+                                // Fallback to orange if no capacity data
+                                return '#ff9800';
+                            }
+
+                            const utilization = (bw / totalCapacity) * 100;
+
+                            if (utilization >= 90) return '#00c853';  // Green: ≥90%
+                            if (utilization >= 70) return '#ffd600';  // Yellow: 70-90%
+                            return '#ff1744';  // Red: <70%
+                        },
+                        'target-arrow-color': ele => {
+                            // Match line color
+                            const bw = ele.data('bandwidth');
+                            const totalCapacity = ele.data('total_nic_capacity');
+
+                            if (!totalCapacity || totalCapacity === 0) {
+                                return '#ff9800';
+                            }
+
+                            const utilization = (bw / totalCapacity) * 100;
+
+                            if (utilization >= 90) return '#00c853';
+                            if (utilization >= 70) return '#ffd600';
+                            return '#ff1744';
+                        },
+                        'font-size': 16,
+                        'font-weight': 'bold',
+                        'color': '#333'
+                    }
+                }
+            ],
+            layout: {
+                name: 'circle',
+                radius: 300,
+                startAngle: -Math.PI / 2,
+                animate: true,
+                animationDuration: 500
+            },
+            wheelSensitivity: 0.2,
+            minZoom: 0.1,
+            maxZoom: 5,
+            // Enable box selection WITHOUT requiring Shift key
+            boxSelectionEnabled: true,
+            selectionType: 'additive'
+        });
+
+        // Click node to show info
+        cy.on('tap', 'node', function(evt) {
+            // Unselect all previously selected elements
+            cy.$(':selected').unselect();
+
+            const node = evt.target;
+            const data = node.data();
+            const nics = JSON.parse(data.nics);
+            const ncclData = JSON.parse(data.nccl);
+
+            let html = `
+                <h3><i class="fas fa-server"></i> ${data.label}</h3>
+                <div class="info-item"><strong>CPU:</strong> ${data.cpu} (${data.cores} cores)</div>
+                <div class="info-item"><strong>GPU:</strong> ${data.gpu}</div>
+                <div class="info-item"><strong>eth0:</strong> ${data.eth0}</div>
+                <h4 style="margin-top: 15px; color: #dc3545;">Network Interfaces</h4>
+            `;
+
+            nics.forEach((nic, idx) => {
+                const color = nicColors[idx % nicColors.length];
+                html += `
+                    <div class="info-item" style="border-left: 4px solid ${color};">
+                        <strong>${nic.name}</strong><br>
+                        Speed: ${formatNicSpeed(nic.speed)}<br>
+                        IP: ${nic.ip}<br>
+                        Routes: ${nic.routes}<br>
+                        Model: ${nic.model}
+                    </div>
+                `;
+            });
+
+            // Add Local NCCL Performance section
+            html += `<h4 style="margin-top: 15px; color: #dc3545;">Local NCCL Performance</h4>`;
+
+            if (ncclData.all_reduce > 0 || ncclData.all_gather > 0 || ncclData.reduce_scatter > 0 || ncclData.broadcast > 0) {
+                html += `
+                    <div class="info-item" style="background: #fff3e0; border-left: 4px solid #ff9800;">
+                        <strong>all_reduce:</strong> ${ncclData.all_reduce.toFixed(2)} GB/s<br>
+                        <strong>all_gather:</strong> ${ncclData.all_gather.toFixed(2)} GB/s<br>
+                        <strong>reduce_scatter:</strong> ${ncclData.reduce_scatter.toFixed(2)} GB/s<br>
+                        <strong>broadcast:</strong> ${ncclData.broadcast.toFixed(2)} GB/s
+                    </div>
+                `;
+            } else {
+                html += `<div class="info-item"><em>No local NCCL data available</em></div>`;
+            }
+
+            document.getElementById('info-content').innerHTML = html;
+            document.getElementById('info-panel').classList.add('visible');
+        });
+
+        // Click edge to show connection details
+        cy.on('tap', 'edge', function(evt) {
+            // Unselect all previously selected elements
+            cy.$(':selected').unselect();
+
+            const edge = evt.target;
+            const data = edge.data();
+            let html = '';
+
+            if (data.edgeType === 'individual') {
+                // Individual NIC - show sequential data only
+                html = `
+                    <h3><i class="fas fa-network-wired"></i> ${data.nic} Connection</h3>
+                    <div class="info-item">
+                        <strong>Source:</strong> ${data.source}<br>
+                        <strong>Target:</strong> ${data.target}<br>
+                        <strong>Type:</strong> Individual NIC (Sequential)<br>
+                        <strong>Auto-negotiated Speed:</strong> ${formatNicSpeed(data.nic_speed)}
+                    </div>
+
+                    <h4 style="margin-top: 15px; color: #dc3545;">
+                        <i class="fas fa-chart-line"></i> TCP Sequential Performance
+                    </h4>
+                    <div class="info-item" style="background: #e3f2fd; border-left: 4px solid #2196f3;">
+                        <strong>Bandwidth:</strong> ${data.tcp_seq.toFixed(2)} Gb/s
+                        ${formatUtilization(data.tcp_seq, data.nic_speed)}
+                    </div>
+
+                    <h4 style="margin-top: 15px; color: #dc3545;">
+                        <i class="fas fa-bolt"></i> RDMA Sequential Performance
+                    </h4>
+                    <div class="info-item" style="background: #f3e5f5; border-left: 4px solid #9c27b0;">
+                        <strong>Bandwidth:</strong> ${data.roce_seq.toFixed(2)} Gb/s
+                        ${formatUtilization(data.roce_seq, data.nic_speed)}
+                    </div>
+
+                    <h4 style="margin-top: 15px; color: #dc3545;">
+                        <i class="fas fa-microchip"></i> GPUDirect RDMA Sequential
+                    </h4>
+                    <div class="info-item" style="background: #e8f5e9; border-left: 4px solid #4caf50;">
+                        <strong>Bandwidth:</strong> ${data.cuda_seq.toFixed(2)} Gb/s
+                        ${formatUtilization(data.cuda_seq, data.nic_speed)}
+                    </div>
+                `;
+
+                // Add UCX results if available
+                if (data.ucx_host_bw_seq > 0 || data.ucx_host_bw_par > 0 || data.ucx_cuda_bw_seq > 0 || data.ucx_cuda_bw_par > 0) {
+                    html += `
+                        <h4 style="margin-top: 15px; color: #dc3545;">
+                            <i class="fas fa-vial"></i> UCX Performance
+                        </h4>`;
+                    if (data.ucx_host_bw_seq > 0 || data.ucx_host_bw_par > 0) {
+                        html += `
+                            <div class="info-item" style="background: #f3e5f5; border-left: 4px solid #9c27b0;">
+                                <strong>HOST Bandwidth:</strong><br>
+                                Sequential: ${data.ucx_host_bw_seq > 0 ? data.ucx_host_bw_seq.toFixed(2) + ' Gb/s' : 'N/A'}<br>
+                                Parallel: ${data.ucx_host_bw_par > 0 ? data.ucx_host_bw_par.toFixed(2) + ' Gb/s' : 'N/A'}
+                            </div>`;
+                    }
+                    if (data.ucx_cuda_bw_seq > 0 || data.ucx_cuda_bw_par > 0) {
+                        html += `
+                            <div class="info-item" style="background: #e8f5e9; border-left: 4px solid #4caf50;">
+                                <strong>CUDA Bandwidth:</strong><br>
+                                Sequential: ${data.ucx_cuda_bw_seq > 0 ? data.ucx_cuda_bw_seq.toFixed(2) + ' Gb/s' : 'N/A'}<br>
+                                Parallel: ${data.ucx_cuda_bw_par > 0 ? data.ucx_cuda_bw_par.toFixed(2) + ' Gb/s' : 'N/A'}
+                            </div>`;
+                    }
+                    if (data.ucx_host_lat > 0 || data.ucx_host_lat_par > 0) {
+                        html += `
+                            <div class="info-item" style="background: #e3f2fd; border-left: 4px solid #2196f3;">
+                                <strong>HOST Latency:</strong><br>
+                                Sequential: ${data.ucx_host_lat > 0 ? data.ucx_host_lat.toFixed(2) + ' μs' : 'N/A'}<br>
+                                Parallel: ${data.ucx_host_lat_par > 0 ? data.ucx_host_lat_par.toFixed(2) + ' μs' : 'N/A'}
+                            </div>`;
+                    }
+                    if (data.ucx_cuda_lat > 0 || data.ucx_cuda_lat_par > 0) {
+                        html += `
+                            <div class="info-item" style="background: #fff3e0; border-left: 4px solid #ff9800;">
+                                <strong>CUDA Latency:</strong><br>
+                                Sequential: ${data.ucx_cuda_lat > 0 ? data.ucx_cuda_lat.toFixed(2) + ' μs' : 'N/A'}<br>
+                                Parallel: ${data.ucx_cuda_lat_par > 0 ? data.ucx_cuda_lat_par.toFixed(2) + ' μs' : 'N/A'}
+                            </div>`;
+                    }
+                    if (data.ib_host_lat_par > 0 || data.ib_cuda_lat_par > 0) {
+                        html += `
+                            <h4 style="margin-top: 15px; color: #dc3545;">
+                                <i class="fas fa-stopwatch"></i> IB Parallel Latency
+                            </h4>`;
+                        if (data.ib_host_lat_par > 0) {
+                            html += `
+                                <div class="info-item" style="background: #e3f2fd; border-left: 4px solid #2196f3;">
+                                    <strong>HOST:</strong> ${data.ib_host_lat_par.toFixed(2)} μs
+                                </div>`;
+                        }
+                        if (data.ib_cuda_lat_par > 0) {
+                            html += `
+                                <div class="info-item" style="background: #fff3e0; border-left: 4px solid #ff9800;">
+                                    <strong>CUDA:</strong> ${data.ib_cuda_lat_par.toFixed(2)} μs
+                                </div>`;
+                        }
+                    }
+
+                    // Add latency-under-load results if available
+                    if (data.ib_host_lat_under_load > 0 || data.ib_cuda_lat_under_load > 0 || data.ucx_host_lat_under_load > 0 || data.ucx_cuda_lat_under_load > 0) {
+                        html += `
+                            <h4 style="margin-top: 15px; color: #ff1744;">
+                                <i class="fas fa-fire"></i> Latency Under Bandwidth Load
+                            </h4>`;
+                        if (data.ib_host_lat_under_load > 0 || data.ib_cuda_lat_under_load > 0) {
+                            html += `<div class="info-item" style="background: #ffebee; border-left: 4px solid #f44336;">
+                                <strong>IB:</strong><br>`;
+                            if (data.ib_host_lat_under_load > 0) {
+                                html += `HOST: ${data.ib_host_lat_under_load.toFixed(2)} μs<br>`;
+                            }
+                            if (data.ib_cuda_lat_under_load > 0) {
+                                html += `CUDA: ${data.ib_cuda_lat_under_load.toFixed(2)} μs`;
+                            }
+                            html += `</div>`;
+                        }
+                        if (data.ucx_host_lat_under_load > 0 || data.ucx_cuda_lat_under_load > 0) {
+                            html += `<div class="info-item" style="background: #fff3e0; border-left: 4px solid #ff9800;">
+                                <strong>UCX:</strong><br>`;
+                            if (data.ucx_host_lat_under_load > 0) {
+                                html += `HOST: ${data.ucx_host_lat_under_load.toFixed(2)} μs<br>`;
+                            }
+                            if (data.ucx_cuda_lat_under_load > 0) {
+                                html += `CUDA: ${data.ucx_cuda_lat_under_load.toFixed(2)} μs`;
+                            }
+                            html += `</div>`;
+                        }
+                    }
+                }
+
+                // Add latency test results if available
+                if (data.lat_host > 0 || data.lat_cuda > 0) {
+                    html += `
+                        <h4 style="margin-top: 15px; color: #dc3545;">
+                            <i class="fas fa-stopwatch"></i> RDMA Latency
+                        </h4>`;
+                    if (data.lat_host > 0) {
+                        html += `
+                            <div class="info-item" style="background: #e3f2fd; border-left: 4px solid #2196f3;">
+                                <strong>HOST:</strong> ${data.lat_host.toFixed(2)} μs
+                            </div>`;
+                    }
+                    if (data.lat_cuda > 0) {
+                        html += `
+                            <div class="info-item" style="background: #fff3e0; border-left: 4px solid #ff9800;">
+                                <strong>CUDA:</strong> ${data.lat_cuda.toFixed(2)} μs
+                            </div>`;
+                    }
+                }
+
+                html += `
+                `;
+            } else {
+                // Aggregate - show parallel data (sum of all NICs)
+                html = `
+                    <h3><i class="fas fa-project-diagram"></i> Aggregate Connection</h3>
+                    <div class="info-item">
+                        <strong>Source:</strong> ${data.source}<br>
+                        <strong>Target:</strong> ${data.target}<br>
+                        <strong>Type:</strong> All NICs Combined (Parallel)
+                    </div>
+
+                    <h4 style="margin-top: 15px; color: #dc3545;">
+                        <i class="fas fa-chart-line"></i> TCP Parallel Performance
+                    </h4>
+                    <div class="info-item" style="background: #e3f2fd; border-left: 4px solid #2196f3;">
+                        ${formatBreakdown(data.tcp_par_nics, data.tcp_par)}
+                    </div>
+
+                    <h4 style="margin-top: 15px; color: #dc3545;">
+                        <i class="fas fa-bolt"></i> RDMA Parallel Performance
+                    </h4>
+                    <div class="info-item" style="background: #f3e5f5; border-left: 4px solid #9c27b0;">
+                        ${formatBreakdown(data.roce_par_nics, data.roce_par)}
+                    </div>
+
+                    <h4 style="margin-top: 15px; color: #dc3545;">
+                        <i class="fas fa-microchip"></i> GPUDirect RDMA Parallel
+                    </h4>
+                    <div class="info-item" style="background: #e8f5e9; border-left: 4px solid #4caf50;">
+                        ${formatBreakdown(data.cuda_par_nics, data.cuda_par)}
+                    </div>
+                `;
+
+                // Add UCX Parallel Performance if available
+                if (data.ucx_host_par > 0 || data.ucx_cuda_par > 0) {
+                    if (data.ucx_host_par > 0) {
+                        html += `
+                            <h4 style="margin-top: 15px; color: #dc3545;">
+                                <i class="fas fa-vial"></i> UCX HOST Parallel
+                            </h4>
+                            <div class="info-item" style="background: #f3e5f5; border-left: 4px solid #9c27b0;">
+                                ${formatBreakdown(data.ucx_host_par_nics, data.ucx_host_par)}
+                            </div>
+                        `;
+                    }
+                    if (data.ucx_cuda_par > 0) {
+                        html += `
+                            <h4 style="margin-top: 15px; color: #dc3545;">
+                                <i class="fas fa-vial"></i> UCX CUDA Parallel (GPUDirect)
+                            </h4>
+                            <div class="info-item" style="background: #e8f5e9; border-left: 4px solid #4caf50;">
+                                ${formatBreakdown(data.ucx_cuda_par_nics, data.ucx_cuda_par)}
+                            </div>
+                        `;
+                    }
+                }
+
+                // Add UCX Parallel Latency if available
+                if (data.ucx_host_lat_par > 0 || data.ucx_cuda_lat_par > 0) {
+                    if (data.ucx_host_lat_par > 0) {
+                        html += `
+                            <h4 style="margin-top: 15px; color: #dc3545;">
+                                <i class="fas fa-clock"></i> UCX HOST Parallel Latency
+                            </h4>
+                            <div class="info-item" style="background: #f3e5f5; border-left: 4px solid #9c27b0;">
+                                <strong>Average:</strong> ${data.ucx_host_lat_par.toFixed(2)} μs
+                                ${formatLatencyBreakdown(data.ucx_host_lat_par_nics)}
+                            </div>
+                        `;
+                    }
+                    if (data.ucx_cuda_lat_par > 0) {
+                        html += `
+                            <h4 style="margin-top: 15px; color: #dc3545;">
+                                <i class="fas fa-clock"></i> UCX CUDA Parallel Latency (GPUDirect)
+                            </h4>
+                            <div class="info-item" style="background: #e8f5e9; border-left: 4px solid #4caf50;">
+                                <strong>Average:</strong> ${data.ucx_cuda_lat_par.toFixed(2)} μs
+                                ${formatLatencyBreakdown(data.ucx_cuda_lat_par_nics)}
+                            </div>
+                        `;
+                    }
+                }
+
+                // Add IB Parallel Latency if available
+                if (data.ib_host_lat_par > 0 || data.ib_cuda_lat_par > 0) {
+                    if (data.ib_host_lat_par > 0) {
+                        html += `
+                            <h4 style="margin-top: 15px; color: #dc3545;">
+                                <i class="fas fa-clock"></i> IB HOST Parallel Latency
+                            </h4>
+                            <div class="info-item" style="background: #f3e5f5; border-left: 4px solid #9c27b0;">
+                                <strong>Average:</strong> ${data.ib_host_lat_par.toFixed(2)} μs
+                                ${formatLatencyBreakdown(data.ib_host_lat_par_nics)}
+                            </div>
+                        `;
+                    }
+                    if (data.ib_cuda_lat_par > 0) {
+                        html += `
+                            <h4 style="margin-top: 15px; color: #dc3545;">
+                                <i class="fas fa-clock"></i> IB CUDA Parallel Latency (GPUDirect)
+                            </h4>
+                            <div class="info-item" style="background: #e8f5e9; border-left: 4px solid #4caf50;">
+                                <strong>Average:</strong> ${data.ib_cuda_lat_par.toFixed(2)} μs
+                                ${formatLatencyBreakdown(data.ib_cuda_lat_par_nics)}
+                            </div>
+                        `;
+                    }
+                }
+
+                // Add Latency-Under-Load results if available
+                if (data.ib_host_lat_under_load > 0 || data.ib_cuda_lat_under_load > 0 || data.ucx_host_lat_under_load > 0 || data.ucx_cuda_lat_under_load > 0) {
+                    html += `
+                        <h4 style="margin-top: 20px; color: #ff1744;">
+                            <i class="fas fa-fire"></i> Latency Under Bandwidth Load
+                        </h4>`;
+                    if (data.ib_host_lat_under_load > 0 || data.ib_cuda_lat_under_load > 0) {
+                        if (data.ib_host_lat_under_load > 0) {
+                            html += `
+                                <div class="info-item" style="background: #ffebee; border-left: 4px solid #f44336;">
+                                    <strong>IB HOST:</strong> ${data.ib_host_lat_under_load.toFixed(2)} μs (avg)
+                                    ${formatLatencyBreakdown(data.ib_host_lat_under_load_nics)}
+                                </div>`;
+                        }
+                        if (data.ib_cuda_lat_under_load > 0) {
+                            html += `
+                                <div class="info-item" style="background: #fff3e0; border-left: 4px solid #ff9800;">
+                                    <strong>IB CUDA (GPUDirect):</strong> ${data.ib_cuda_lat_under_load.toFixed(2)} μs (avg)
+                                    ${formatLatencyBreakdown(data.ib_cuda_lat_under_load_nics)}
+                                </div>`;
+                        }
+                    }
+                    if (data.ucx_host_lat_under_load > 0 || data.ucx_cuda_lat_under_load > 0) {
+                        if (data.ucx_host_lat_under_load > 0) {
+                            html += `
+                                <div class="info-item" style="background: #e8eaf6; border-left: 4px solid #3f51b5;">
+                                    <strong>UCX HOST:</strong> ${data.ucx_host_lat_under_load.toFixed(2)} μs (avg)
+                                    ${formatLatencyBreakdown(data.ucx_host_lat_under_load_nics)}
+                                </div>`;
+                        }
+                        if (data.ucx_cuda_lat_under_load > 0) {
+                            html += `
+                                <div class="info-item" style="background: #e0f2f1; border-left: 4px solid #009688;">
+                                    <strong>UCX CUDA (GPUDirect):</strong> ${data.ucx_cuda_lat_under_load.toFixed(2)} μs (avg)
+                                    ${formatLatencyBreakdown(data.ucx_cuda_lat_under_load_nics)}
+                                </div>`;
+                        }
+                    }
+                }
+
+                html += `
+                    <div class="info-item" style="background: #fff3e0; border-left: 4px solid #ff9800; margin-top: 15px;">
+                        <i class="fas fa-info-circle"></i>
+                        <strong>Note:</strong> Parallel tests use all NICs simultaneously, so this represents the combined throughput.
+                    </div>
+                `;
+
+                // Add Multi-Node NCCL Performance section to aggregate line
+                if (multinodeNccl.length > 0) {
+                    html += `<h4 style="margin-top: 15px; color: #dc3545;"><i class="fas fa-network-wired"></i> Multi-Node NCCL Performance</h4>`;
+                    multinodeNccl.forEach(result => {
+                        html += `
+                            <div class="info-item" style="background: #e8f5e9; border-left: 4px solid #4caf50;">
+                                <strong>${result.size}:</strong> ${result.bandwidth.toFixed(2)} Gb/s
+                                <span style="color: #4caf50;">✓ ${result.status}</span>
+                            </div>
+                        `;
+                    });
+                }
+            }
+
+            document.getElementById('info-content').innerHTML = html;
+            document.getElementById('info-panel').classList.add('visible');
+        });
+
+        // Double-click on canvas (background) to reset zoom and fit
+        cy.on('dbltap', function(evt) {
+            // Only reset if clicked on background, not on a node or edge
+            if (evt.target === cy) {
+                cy.fit();
+                cy.center();
+            }
+        });
+
+        // Click on background to deselect all and close info panel
+        cy.on('tap', function(evt) {
+            if (evt.target === cy) {
+                // Clicked on background (not on a node or edge)
+                cy.$(':selected').unselect();
+                document.getElementById('info-panel').classList.remove('visible');
+            }
+        });
+
+        // Box selection zoom: when nodes are selected via box-select, zoom to fit them
+        cy.on('boxend', function(evt) {
+            const selectedNodes = cy.$(':selected');
+            if (selectedNodes.length > 0) {
+                cy.fit(selectedNodes, 50); // Fit with 50px padding
+                // Deselect after zoom
+                setTimeout(() => selectedNodes.unselect(), 500);
+            }
+        });
+
+        function closeInfo() {
+            document.getElementById('info-panel').classList.remove('visible');
+        }
+
+        function resetView() {
+            cy.layout({
+                name: 'circle',
+                radius: 300,
+                startAngle: -Math.PI / 2,
+                animate: true,
+                animationDuration: 500
+            }).run();
+            cy.fit();
+        }
+
+        function fitToScreen() {
+            cy.fit();
+        }
+
+        function exportPNG() {
+            const png = cy.png({
+                output: 'blob',
+                bg: '#fafafa',
+                full: true,
+                scale: 4
+            });
+
+            const url = URL.createObjectURL(png);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = 'network-topology-servers.png';
+            link.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function exportJSON() {
+            const json = cy.json();
+            const blob = new Blob([JSON.stringify(json, null, 2)], {type: 'application/json'});
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = 'network-topology.json';
+            link.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function exportHTML() {
+            // Clone the entire document
+            const docClone = document.documentElement.cloneNode(true);
+
+            // Find the #cy container in the clone and reset it to empty state
+            const cyClone = docClone.querySelector('#cy');
+            if (cyClone) {
+                // Remove all Cytoscape-generated content (canvas elements, etc.)
+                cyClone.innerHTML = '';
+                // Remove Cytoscape classes
+                cyClone.className = '';
+            }
+
+            // Hide info panel in the clone
+            const infoPanelClone = docClone.querySelector('#info-panel');
+            if (infoPanelClone) {
+                // Remove visible class (CSS already has display:none as default)
+                infoPanelClone.classList.remove('visible');
+                // Clear any inline styles that might have been added
+                infoPanelClone.removeAttribute('style');
+                // Also clear its content
+                const infoContentClone = infoPanelClone.querySelector('#info-content');
+                if (infoContentClone) {
+                    infoContentClone.innerHTML = '';
+                }
+            }
+
+            // Get the cleaned HTML
+            const htmlContent = '<!DOCTYPE html>\n' + docClone.outerHTML;
+            const blob = new Blob([htmlContent], {type: 'text/html'});
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = 'network-topology-complete.html';
+            link.click();
+            URL.revokeObjectURL(url);
+        }
+
+        cy.ready(function() {
+            cy.fit();
+        });
+
+        // Load warnings
+        
+        const warningsContent = document.getElementById('warnings-content');
+        warningsContent.innerHTML = '<div class="warning-item"><strong>⚠️ Disconnected Links by Node:</strong></div><div class="warning-item"><strong>Node 4knlw (RoCE/RDMA):</strong></div><div class="warning-item">  • mlx5_10 - No test results (link may be down)</div><div class="warning-item">  • mlx5_11 - No test results (link may be down)</div><div class="warning-item">  • mlx5_3 - No test results (link may be down)</div><div class="warning-item">  • mlx5_4 - No test results (link may be down)</div><div class="warning-item">  • mlx5_5 - No test results (link may be down)</div><div class="warning-item">  • mlx5_6 - No test results (link may be down)</div><div class="warning-item">  • mlx5_9 - No test results (link may be down)</div><div class="warning-item"><strong>Node 4w8nv (RoCE/RDMA):</strong></div><div class="warning-item">  • mlx5_10 - No test results (link may be down)</div><div class="warning-item">  • mlx5_11 - No test results (link may be down)</div><div class="warning-item">  • mlx5_3 - No test results (link may be down)</div><div class="warning-item">  • mlx5_4 - No test results (link may be down)</div><div class="warning-item">  • mlx5_5 - No test results (link may be down)</div><div class="warning-item">  • mlx5_6 - No test results (link may be down)</div><div class="warning-item">  • mlx5_9 - No test results (link may be down)</div>';
+        
+    </script>
+
+</body><grammarly-desktop-integration data-grammarly-shadow-root="true"></grammarly-desktop-integration></html>

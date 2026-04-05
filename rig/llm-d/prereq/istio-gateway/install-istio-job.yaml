@@ -64,11 +64,18 @@ spec:
               # Create namespace
               kubectl create namespace istio-system --dry-run=client -o yaml | kubectl apply -f -
 
-              # Download and install istioctl (small, fast download)
-              echo "📦 Downloading istioctl..."
-              ISTIO_VERSION="1.28.1"
-              curl -sL https://istio.io/downloadIstio | ISTIO_VERSION=${ISTIO_VERSION} sh -
+              # Download and install istioctl
+              echo "📦 Finding latest Istio version..."
+              ISTIO_VERSION=$(curl -sL https://api.github.com/repos/istio/istio/releases | grep '"tag_name"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+              if [ -z "$ISTIO_VERSION" ]; then
+                echo "⚠️  Could not detect version, using 1.29.1"
+                ISTIO_VERSION="1.29.1"
+              fi
+              echo "📦 Downloading Istio $ISTIO_VERSION..."
+              cd /tmp
+              curl -sL https://istio.io/downloadIstio | ISTIO_VERSION=${ISTIO_VERSION} bash
               mv istio-${ISTIO_VERSION}/bin/istioctl /tmp/bin/
+              echo "✅ istioctl installed"
 
               # Install Istio with minimal profile + Gateway API + Inference Extension
               echo "Installing Istio minimal profile..."

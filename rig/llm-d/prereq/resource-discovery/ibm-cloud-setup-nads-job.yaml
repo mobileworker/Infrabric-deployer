@@ -1,0 +1,219 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ibm-cloud-setup-nads
+  namespace: llm-d
+  labels:
+    app: ibm-cloud-nad-setup
+    component: resource-discovery
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    description: "Discovers NICs on IBM Cloud and creates NetworkAttachmentDefinitions"
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: ibm-cloud-nad-setup
+    spec:
+      serviceAccountName: llm-d-client
+      restartPolicy: OnFailure
+      containers:
+        - name: setup-nads
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "==========================================="
+              echo "IBM Cloud NetworkAttachmentDefinition Setup"
+              echo "==========================================="
+
+              # Install dependencies
+              echo "📦 Installing dependencies..."
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+
+              # Install kubectl
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              # Install jq
+              curl -sSL https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64 -o /tmp/bin/jq
+              chmod +x /tmp/bin/jq
+
+              echo "✅ Tools installed"
+              kubectl version --client
+
+              # Detect cloud platform
+              echo ""
+              echo "☁️  Detecting cloud platform..."
+              PLATFORM=$(kubectl get infrastructure cluster -o jsonpath='{.status.platform}' 2>/dev/null || echo "")
+
+              if [ "$PLATFORM" != "IBMCloud" ]; then
+                  echo "ℹ️  Not running on IBM Cloud (platform: ${PLATFORM:-unknown})"
+                  echo "   Skipping NAD setup - this job is for IBM Cloud only"
+                  exit 0
+              fi
+
+              echo "✅ Detected IBM Cloud OpenShift cluster"
+
+              # Check if NADs already exist
+              echo ""
+              echo "🔍 Checking for existing NADs..."
+              EXISTING_NADS=$(kubectl get network-attachment-definitions -n llm-d -l auto-generated=true -o name 2>/dev/null | wc -l || echo "0")
+
+              if [ "$EXISTING_NADS" -gt 0 ]; then
+                  echo "ℹ️  Found $EXISTING_NADS existing auto-generated NADs"
+                  echo "   Skipping NAD creation (delete with: kubectl delete nad -n llm-d -l auto-generated=true)"
+                  exit 0
+              fi
+
+              # Find GPU nodes
+              echo ""
+              echo "📊 Finding GPU nodes..."
+              GPU_NODES=$(kubectl get nodes -o json | jq -r '.items[] | select(.status.allocatable["nvidia.com/gpu"]? != null and (.status.allocatable["nvidia.com/gpu"] | tonumber) > 0) | .metadata.name')
+
+              if [ -z "$GPU_NODES" ]; then
+                  echo "❌ No GPU nodes found!"
+                  exit 1
+              fi
+
+              SAMPLE_NODE=$(echo "$GPU_NODES" | head -1)
+              NODE_COUNT=$(echo "$GPU_NODES" | wc -l)
+
+              echo "   Found $NODE_COUNT GPU node(s)"
+              echo "   Sampling NICs from: $SAMPLE_NODE"
+
+              # Discover NICs on the node
+              echo ""
+              echo "🌐 Discovering virtio NICs..."
+
+              # Create discovery pod
+              DISCOVERY_POD="nic-discovery-$(date +%s)"
+
+              cat <<EOF | kubectl apply -f - >/dev/null
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: $DISCOVERY_POD
+                namespace: llm-d
+              spec:
+                nodeSelector:
+                  kubernetes.io/hostname: $SAMPLE_NODE
+                hostNetwork: true
+                hostPID: true
+                containers:
+                - name: discover
+                  image: registry.access.redhat.com/ubi9/ubi:latest
+                  command: ["sleep", "3600"]
+                  securityContext:
+                    privileged: true
+                restartPolicy: Never
+              EOF
+
+              echo "   Waiting for discovery pod..."
+              kubectl wait --for=condition=Ready pod/$DISCOVERY_POD -n llm-d --timeout=60s >/dev/null 2>&1
+
+              # Get NIC list
+              NICS=$(kubectl exec -n llm-d $DISCOVERY_POD -- bash -c \
+                "ip -o link show | grep -E '^[0-9]+: enp[1-9]' | awk '{print \$2}' | tr -d ':'" 2>/dev/null)
+
+              # Cleanup discovery pod
+              kubectl delete pod $DISCOVERY_POD -n llm-d --ignore-not-found=true >/dev/null 2>&1
+
+              if [ -z "$NICS" ]; then
+                  echo "❌ No virtio NICs found (looking for enp* interfaces)"
+                  exit 1
+              fi
+
+              NIC_COUNT=$(echo "$NICS" | wc -l)
+              echo "✅ Found $NIC_COUNT virtio NIC(s):"
+              echo "$NICS" | while read nic; do
+                  echo "      - $nic"
+              done
+
+              # Generate and apply NADs
+              echo ""
+              echo "📝 Creating NetworkAttachmentDefinitions..."
+
+              PORT_NUM=1
+              while IFS= read -r NIC_NAME; do
+                  [ -z "$NIC_NAME" ] && continue
+
+                  NAD_NAME="ibm-rdma-port-${PORT_NUM}"
+                  GATEWAY_OCTET=$((PORT_NUM - 1))
+                  GATEWAY="10.${GATEWAY_OCTET}.0.1"
+
+                  cat <<EOFNAD | kubectl apply -f - >/dev/null
+              apiVersion: k8s.cni.cncf.io/v1
+              kind: NetworkAttachmentDefinition
+              metadata:
+                name: $NAD_NAME
+                namespace: llm-d
+                annotations:
+                  description: "IBM Cloud virtio NIC $NIC_NAME with RDMA support - Auto-generated"
+                labels:
+                  app: llm-d
+                  nic-type: virtio-rdma
+                  auto-generated: "true"
+              spec:
+                config: |
+                  {
+                    "cniVersion": "0.3.1",
+                    "name": "$NAD_NAME",
+                    "plugins": [
+                      {
+                        "type": "host-device",
+                        "device": "$NIC_NAME",
+                        "isRdma": true,
+                        "ipam": {
+                          "type": "dhcp"
+                        }
+                      },
+                      {
+                        "type": "sbr-custom",
+                        "gateway": "$GATEWAY",
+                        "addSourceHints": true
+                      },
+                      {
+                        "type": "tuning",
+                        "name": "rdma-tuning",
+                        "mtu": 9000
+                      }
+                    ]
+                  }
+              EOFNAD
+
+                  echo "   ✓ Created: $NAD_NAME ($NIC_NAME -> $GATEWAY)"
+                  PORT_NUM=$((PORT_NUM + 1))
+
+              done <<< "$NICS"
+
+              # Summary
+              echo ""
+              echo "==========================================="
+              echo "NAD Setup Complete"
+              echo "==========================================="
+              echo ""
+              echo "Summary:"
+              echo "  - Cloud Platform: IBM Cloud"
+              echo "  - NICs Discovered: $NIC_COUNT"
+              echo "  - NADs Created: $((PORT_NUM - 1))"
+              echo ""
+              echo "Verify NADs:"
+              echo "  kubectl get network-attachment-definitions -n llm-d -l auto-generated=true"
+              echo ""
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

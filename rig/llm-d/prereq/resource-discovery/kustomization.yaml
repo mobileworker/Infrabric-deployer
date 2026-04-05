@@ -4,4 +4,10 @@ kind: Kustomization
 namespace: llm-d
 
 resources:
+  # Discovery scripts (loaded into ConfigMaps)
   - discovery-configmap.yaml
+  - discovery-configmap-ibm.yaml
+
+  # IBM Cloud: Auto-setup NetworkAttachmentDefinitions
+  # This job runs on IBM Cloud to discover NICs and create NADs
+  - ibm-cloud-setup-nads-job.yaml

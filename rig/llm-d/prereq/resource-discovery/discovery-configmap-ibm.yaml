@@ -1,0 +1,461 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-rdma-discovery-script-ibm
+  namespace: llm-d
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+    description: "Enhanced GPU/RDMA discovery with IBM Cloud support (virtio NICs via NADs)"
+data:
+  discover-gpu-rdma.sh: |
+    #!/bin/bash
+    # Enhanced GPU and RDMA resource discovery script with IBM Cloud support
+    # Supports:
+    # - Traditional RDMA: rdma/* resources from node allocatable (all pods share all NICs)
+    # - IBM Cloud Single-Node: ipvlan NADs (both pods share all 8 ports)
+    # - IBM Cloud Multi-Node: host-device NADs (proportional allocation per pod)
+    #
+    # Auto-detects cloud provider and deployment type
+    
+    set -e
+    
+    # Configuration
+    OUTPUT_FILE="${OUTPUT_FILE:-/data/discovered-resources.yaml}"
+    NODE_SELECTOR="${NODE_SELECTOR:-}"
+    CLOUD_PROVIDER="${CLOUD_PROVIDER:-auto}"
+    NAMESPACE="${NAMESPACE:-llm-d}"
+    
+    echo "🔍 Enhanced GPU and RDMA resource discovery (with IBM Cloud support)..."
+    
+    # --- STEP 1: DETECT CLOUD PROVIDER ---
+    detect_cloud_provider() {
+        if [ "$CLOUD_PROVIDER" != "auto" ]; then
+            echo "☁️  Cloud provider: $CLOUD_PROVIDER (manual override)"
+            return
+        fi
+    
+        # Try OpenShift infrastructure resource (most reliable)
+        if command -v oc &> /dev/null || command -v kubectl &> /dev/null; then
+            PLATFORM=$(kubectl get infrastructure cluster -o jsonpath='{.status.platform}' 2>/dev/null || echo "")
+    
+            if [ "$PLATFORM" = "IBMCloud" ]; then
+                CLOUD_PROVIDER="ibm-cloud"
+                echo "☁️  Detected: IBM Cloud (via OpenShift infrastructure)"
+                return
+            fi
+        fi
+    
+        # Fallback: Check node annotations for IBM CSI
+        IBM_ANNOTATION=$(kubectl get nodes -o json 2>/dev/null | jq -r '.items[0].metadata.annotations["csi.volume.kubernetes.io/nodeid"]' 2>/dev/null || echo "")
+        if echo "$IBM_ANNOTATION" | grep -q "vpc.block.csi.ibm.io"; then
+            CLOUD_PROVIDER="ibm-cloud"
+            echo "☁️  Detected: IBM Cloud (via node annotations)"
+            return
+        fi
+    
+        # Default to traditional RDMA
+        CLOUD_PROVIDER="traditional"
+        echo "☁️  Detected: Traditional RDMA environment"
+    }
+    
+    detect_cloud_provider
+    
+    # --- STEP 2: DISCOVER GPU NODES ---
+    echo ""
+    echo "📊 Discovering GPU nodes..."
+    
+    if [ -n "$NODE_SELECTOR" ]; then
+        NODES=$(kubectl get nodes -l "$NODE_SELECTOR" -o json)
+    else
+        NODES=$(kubectl get nodes -o json)
+    fi
+    
+    GPU_NODES=$(echo "$NODES" | jq -r '.items[] | select(.status.allocatable["nvidia.com/gpu"]? != null and (.status.allocatable["nvidia.com/gpu"] | tonumber) > 0) | .metadata.name')
+    
+    if [ -z "$GPU_NODES" ]; then
+        echo "❌ No GPU nodes found!"
+        exit 1
+    fi
+    
+    GPU_NODE_COUNT=$(echo "$GPU_NODES" | wc -l | tr -d ' ')
+    SAMPLE_NODE=$(echo "$GPU_NODES" | head -1)
+    
+    echo "   Found $GPU_NODE_COUNT GPU node(s)"
+    echo "   Sample node: $SAMPLE_NODE"
+    
+    # Get allocatable resources
+    ALLOCATABLE=$(kubectl get node "$SAMPLE_NODE" -o json | jq '.status.allocatable')
+    GPU_COUNT=$(echo "$ALLOCATABLE" | jq -r '."nvidia.com/gpu" // "0"' | sed 's/[^0-9]//g')
+    echo "   🎮 GPUs per node: $GPU_COUNT"
+    
+    # Get CPU and Memory
+    CPU_ALLOCATABLE=$(echo "$ALLOCATABLE" | jq -r '.cpu // "0"')
+    CPU_CORES=$(echo "$CPU_ALLOCATABLE" | sed 's/m$//' | awk '{print int($1/1000)}')
+    MEMORY_ALLOCATABLE=$(echo "$ALLOCATABLE" | jq -r '.memory // "0"')
+    MEMORY_GI=$(echo "$MEMORY_ALLOCATABLE" | sed 's/Ki$//' | awk '{print int($1/1024/1024)}')
+    
+    echo "   💻 CPU cores: $CPU_CORES"
+    echo "   🧠 Memory: ${MEMORY_GI}Gi"
+    
+    # --- STEP 3: DISCOVER NETWORK RESOURCES (CLOUD-SPECIFIC) ---
+    echo ""
+    echo "🌐 Discovering network resources for $CLOUD_PROVIDER..."
+    
+    declare -a NETWORK_RESOURCES=()
+    declare -a NETWORK_DEVICE_NAMES=()
+    RDMA_COUNT=0
+    
+    if [ "$CLOUD_PROVIDER" = "ibm-cloud" ]; then
+        # IBM Cloud: Use network-attachment-definitions
+        echo "   Using network-attachment-definitions (IBM Cloud virtio NICs)"
+    
+        # Get all NADs in the namespace
+        NADS=$(kubectl get network-attachment-definitions -n "$NAMESPACE" -o json 2>/dev/null || echo '{"items":[]}')
+        NAD_COUNT=$(echo "$NADS" | jq '.items | length')
+        if [ "$NAD_COUNT" -gt 0 ]; then
+            echo "   Found $NAD_COUNT network-attachment-definition(s)"
+            
+            # Collect NADs separately by type
+            declare -a IPVLAN_NADS=()
+            declare -a IPVLAN_DEVICES=()
+            declare -a HOSTDEV_NADS=()
+            declare -a HOSTDEV_DEVICES=()
+            
+            # Extract NAD names and check for RDMA support
+            while IFS= read -r nad_name; do
+                # Get NAD config
+                NAD_CONFIG=$(echo "$NADS" | jq -r --arg name "$nad_name" '.items[] | select(.metadata.name == $name) | .spec.config')
+    
+                # Check if NAD is RDMA-capable
+                IS_RDMA=$(echo "$NAD_CONFIG" | jq -r 'try (.plugins[0].isRdma // false)' 2>/dev/null || echo "false")
+                CNI_TYPE=$(echo "$NAD_CONFIG" | jq -r 'try (.plugins[0].type // "")' 2>/dev/null || echo "")
+                
+                # IBM Cloud: Also detect ipvlan/macvlan NADs as RDMA-capable
+                IS_IBM_RDMA="false"
+                if [ "$CNI_TYPE" = "ipvlan" ] || [ "$CNI_TYPE" = "macvlan" ]; then
+                    MASTER=$(echo "$NAD_CONFIG" | jq -r 'try (.plugins[0].master // "")' 2>/dev/null || echo "")
+                    # Check if master is an IBM Cloud virtio NIC (enp*s0 pattern)
+                    if echo "$MASTER" | grep -qE "^enp[0-9]+s0$"; then
+                        IS_IBM_RDMA="true"
+                    fi
+                fi
+    
+                if [ "$IS_RDMA" = "true" ] || echo "$NAD_CONFIG" | grep -qi "rdma" || [ "$IS_IBM_RDMA" = "true" ]; then
+                    # Extract device name
+                    DEVICE=$(echo "$NAD_CONFIG" | jq -r 'try (.plugins[0].device // .plugins[0].master // "")' 2>/dev/null || echo "")
+                    
+                    # Sort into ipvlan vs host-device
+                    if [ "$CNI_TYPE" = "ipvlan" ] || [ "$CNI_TYPE" = "macvlan" ]; then
+                        IPVLAN_NADS+=("k8s.v1.cni.cncf.io/$nad_name")
+                        IPVLAN_DEVICES+=("$DEVICE")
+                        echo "      ✓ $nad_name -> $DEVICE ($CNI_TYPE)"
+                    elif [ "$CNI_TYPE" = "host-device" ]; then
+                        HOSTDEV_NADS+=("k8s.v1.cni.cncf.io/$nad_name")
+                        HOSTDEV_DEVICES+=("$DEVICE")
+                        echo "      ✓ $nad_name -> $DEVICE ($CNI_TYPE)"
+                    fi
+                fi
+            done < <(echo "$NADS" | jq -r '.items[].metadata.name')
+            
+            # Choose which NADs to use based on availability
+            # Prefer ipvlan for single-node, host-device for multi-node
+            if [ ${#IPVLAN_NADS[@]} -gt 0 ]; then
+                echo "   📍 Found ${#IPVLAN_NADS[@]} ipvlan NADs - will use for single-node"
+                NETWORK_RESOURCES=("${IPVLAN_NADS[@]}")
+                NETWORK_DEVICE_NAMES=("${IPVLAN_DEVICES[@]}")
+            elif [ ${#HOSTDEV_NADS[@]} -gt 0 ]; then
+                echo "   📍 Found ${#HOSTDEV_NADS[@]} host-device NADs - will use for multi-node"
+                NETWORK_RESOURCES=("${HOSTDEV_NADS[@]}")
+                NETWORK_DEVICE_NAMES=("${HOSTDEV_DEVICES[@]}")
+            fi
+    
+            RDMA_COUNT=${#NETWORK_RESOURCES[@]}
+        else
+            echo "   ⚠️  No network-attachment-definitions found in namespace $NAMESPACE"
+        fi
+    
+    else
+        # Traditional: Use rdma/* resources from node allocatable
+        echo "   Using rdma/* resources from node allocatable"
+    
+        RDMA_RESOURCES=$(kubectl get node "$SAMPLE_NODE" -o json | jq -r '
+          .status.allocatable |
+          to_entries |
+          map(select(
+            (.key | startswith("rdma/")) and
+            ((.value | tostring | gsub("k$";"") | tonumber) > 0)
+          )) |
+          map("\(.key):\(.value)") |
+          .[]
+        ')
+    
+        if [ -n "$RDMA_RESOURCES" ]; then
+            RDMA_COUNT=$(echo "$RDMA_RESOURCES" | wc -l | tr -d ' ')
+            echo "   Found $RDMA_COUNT RDMA resource(s)"
+    
+            while IFS=: read -r resource count; do
+                NETWORK_RESOURCES+=("$resource:$count")
+                # Extract device name (e.g., rdma/rdma_shared_nic4 -> nic4)
+                DEVICE_NAME=$(echo "$resource" | sed 's|^rdma/rdma_shared_||')
+                NETWORK_DEVICE_NAMES+=("$DEVICE_NAME")
+                echo "      - $resource: $count"
+            done <<< "$RDMA_RESOURCES"
+        else
+            echo "   ⚠️  No RDMA resources found"
+        fi
+    fi
+    
+    # --- STEP 4: GENERATE CONFIGURATION ---
+    echo ""
+    echo "📦 Generating resource configuration..."
+    
+    cat > "$OUTPUT_FILE" << EOFYAML
+    # Auto-generated resource discovery
+    # Cloud Provider: $CLOUD_PROVIDER
+    # Node Count: $GPU_NODE_COUNT
+    # Discovery time: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+    
+    discovered:
+      cloudProvider: $CLOUD_PROVIDER
+      gpuCount: $GPU_COUNT
+      networkResourceCount: $RDMA_COUNT
+      tensorParallelSize: $GPU_COUNT
+      nodeCount: $GPU_NODE_COUNT
+      sampleNode: $SAMPLE_NODE
+    
+    # Resource limits and requests for Kubernetes pods
+    resources:
+      limits:
+        cpu: "32"
+        memory: "256Gi"
+        nvidia.com/gpu: "$GPU_COUNT"
+    EOFYAML
+    
+    # Add network resources to limits
+    if [ "$CLOUD_PROVIDER" = "ibm-cloud" ]; then
+        # For IBM Cloud NADs, add comments (resources managed via annotations)
+        echo "    # IBM Cloud NADs managed via k8s.v1.cni.cncf.io/networks annotation" >> "$OUTPUT_FILE"
+    else
+        # For traditional RDMA, add to resource limits
+        for resource in "${NETWORK_RESOURCES[@]}"; do
+            resource_name=$(echo "$resource" | cut -d: -f1)
+            echo "    $resource_name: \"1\"" >> "$OUTPUT_FILE"
+        done
+    fi
+    
+    cat >> "$OUTPUT_FILE" << EOFYAML
+      requests:
+        cpu: "32"
+        memory: "256Gi"
+        nvidia.com/gpu: "$GPU_COUNT"
+    EOFYAML
+    
+    # Add network resources to requests
+    if [ "$CLOUD_PROVIDER" != "ibm-cloud" ]; then
+        for resource in "${NETWORK_RESOURCES[@]}"; do
+            resource_name=$(echo "$resource" | cut -d: -f1)
+            echo "    $resource_name: \"1\"" >> "$OUTPUT_FILE"
+        done
+    fi
+    
+    # Calculate P/D split for single-node
+    calculate_pd_split() {
+        local total=$1
+        local half=$((total / 2))
+        local split=1
+        while [ $((split * 2)) -le $half ]; do
+            split=$((split * 2))
+        done
+        echo $split
+    }
+    
+    PD_SPLIT=$(calculate_pd_split $GPU_COUNT)
+    TOTAL_USED_GPUS=$((PD_SPLIT * 2))
+    
+    USABLE_CPU_CORES=$((CPU_CORES * 50 / 100))
+    USABLE_MEMORY_GI=$((MEMORY_GI * 80 / 100))
+    CPU_PER_POD=$((USABLE_CPU_CORES / 2))
+    MEMORY_PER_POD=$((USABLE_MEMORY_GI / 2))
+    
+    [ $CPU_PER_POD -lt 8 ] && CPU_PER_POD=8
+    [ $MEMORY_PER_POD -lt 32 ] && MEMORY_PER_POD=32
+    
+    cat >> "$OUTPUT_FILE" << EOFYAML
+    
+    # vLLM configuration
+    vllm:
+      multinode:
+        tensorParallelSize: $GPU_COUNT
+      singlenode:
+        prefillTensorParallelSize: $PD_SPLIT
+        decodeTensorParallelSize: $PD_SPLIT
+        totalUsedGpus: $TOTAL_USED_GPUS
+        unusedGpus: $((GPU_COUNT - TOTAL_USED_GPUS))
+    
+    # Resource allocation per pod (single-node)
+    singleNodeResources:
+      cpuPerPod: $CPU_PER_POD
+      memoryPerPodGi: $MEMORY_PER_POD
+      totalCpuCores: $CPU_CORES
+      totalMemoryGi: $MEMORY_GI
+      usableCpuCores: $USABLE_CPU_CORES
+      usableMemoryGi: $USABLE_MEMORY_GI
+    
+    # Network configuration
+    network:
+      mode: $CLOUD_PROVIDER
+    EOFYAML
+    
+    # IBM Cloud specific: Different strategy for single-node vs multi-node
+    if [ "$CLOUD_PROVIDER" = "ibm-cloud" ]; then
+        echo ""
+    
+        # Detect single-node vs multi-node deployment
+        if [ "$GPU_NODE_COUNT" -eq 1 ] || [ "${DEPLOYMENT_TYPE:-}" = "single-node" ]; then
+            # SINGLE-NODE: NOT SUPPORTED for PD disaggregation on IBM Cloud
+            # ipvlan/macvlan breaks RDMA needed for KV-cache transfer
+            echo "⚠️  IBM Cloud Single-Node: PD disaggregation NOT SUPPORTED"
+            echo "   Reason: ipvlan/macvlan breaks RDMA for KV-cache transfer"
+            echo "   Recommendation: Use aggregated deployment (all GPUs in one pod)"
+    
+            cat >> "$OUTPUT_FILE" << EOFYAML
+    
+      # IBM Cloud Single-Node: PD disaggregation NOT SUPPORTED
+      deploymentType: single-node
+      strategy: not-supported
+      recommendation: aggregated-deployment
+      reason: "ipvlan/macvlan breaks RDMA needed for KV-cache transfer"
+    
+      # For single-node on IBM Cloud, use aggregated deployment instead
+      # All GPUs in one pod with host-device NADs for RDMA
+      nadNames:
+    EOFYAML
+    
+            for nad in "${NETWORK_RESOURCES[@]}"; do
+                nad_name=$(echo "$nad" | sed 's|k8s.v1.cni.cncf.io/||')
+                echo "        - $nad_name" >> "$OUTPUT_FILE"
+            done
+    
+            # Build annotation string (all NADs for single aggregated pod)
+            ALL_NADS_ANNOTATION=$(IFS=,; for nad in "${NETWORK_RESOURCES[@]}"; do echo -n "$(echo "$nad" | sed 's|k8s.v1.cni.cncf.io/||'),"; done | sed 's/,$//')
+    
+            # Build device string (all devices)
+            ALL_DEVICES_STR=$(IFS=,; echo "${NETWORK_DEVICE_NAMES[*]}")
+    
+            cat >> "$OUTPUT_FILE" << EOFYAML
+    
+      # Aggregated deployment configuration (single pod uses all NICs)
+      aggregated:
+        nadAnnotation: '$ALL_NADS_ANNOTATION'
+        devices:
+    EOFYAML
+    
+            for device in "${NETWORK_DEVICE_NAMES[@]}"; do
+                echo "          - $device" >> "$OUTPUT_FILE"
+            done
+    
+            cat >> "$OUTPUT_FILE" << EOFYAML
+        devicesString: '$ALL_DEVICES_STR'
+        tensorParallelSize: $GPU_COUNT
+    EOFYAML
+    
+            echo ""
+            echo "   ❌ Single-Node PD: NOT SUPPORTED on IBM Cloud"
+            echo "   ✅ Alternative: Aggregated deployment with TP=$GPU_COUNT"
+            echo "   📝 NAD Annotation: $ALL_NADS_ANNOTATION"
+    
+        else
+            # MULTI-NODE: Each pod gets ALL NICs (same as traditional)
+            # Anti-affinity ensures pods on different nodes, so same NAD names = different physical NICs
+            echo "🔧 IBM Cloud Multi-Node: All NICs per pod (anti-affinity ensures different nodes)"
+    
+            echo "   Strategy: Each pod uses ALL $RDMA_COUNT NICs"
+            echo "   Scheduling: Anti-affinity ensures pods land on different nodes"
+            echo "   Result: Same NAD names, different physical NICs per node"
+    
+            # Build annotation string (all NADs for each pod)
+            ALL_NADS_ANNOTATION=$(IFS=,; for nad in "${NETWORK_RESOURCES[@]}"; do echo -n "$(echo "$nad" | sed 's|k8s.v1.cni.cncf.io/||'),"; done | sed 's/,$//')
+    
+            # Build device string (all devices)
+            ALL_DEVICES_STR=$(IFS=,; echo "${NETWORK_DEVICE_NAMES[*]}")
+    
+            cat >> "$OUTPUT_FILE" << EOFYAML
+    
+      # IBM Cloud Multi-Node: Same as traditional - all NICs per pod
+      # Anti-affinity scheduling ensures different nodes get different physical NICs
+      deploymentType: multi-node
+      strategy: all-nics-per-pod
+    
+      nadNames:
+    EOFYAML
+    
+            for nad in "${NETWORK_RESOURCES[@]}"; do
+                nad_name=$(echo "$nad" | sed 's|k8s.v1.cni.cncf.io/||')
+                echo "        - $nad_name" >> "$OUTPUT_FILE"
+            done
+    
+            cat >> "$OUTPUT_FILE" << EOFYAML
+    
+      # All pods use same NAD configuration (different physical nodes)
+      sharedNadAnnotation: '$ALL_NADS_ANNOTATION'
+      sharedDevices:
+    EOFYAML
+    
+            for device in "${NETWORK_DEVICE_NAMES[@]}"; do
+                echo "        - $device" >> "$OUTPUT_FILE"
+            done
+    
+            cat >> "$OUTPUT_FILE" << EOFYAML
+      sharedDevicesString: '$ALL_DEVICES_STR'
+    EOFYAML
+    
+            echo ""
+            echo "   ✅ Each pod: $RDMA_COUNT NICs ($ALL_NADS_ANNOTATION)"
+            echo "   ✅ NCCL devices: $ALL_DEVICES_STR"
+        fi
+    
+    else
+        # Traditional RDMA: All pods use all devices
+        cat >> "$OUTPUT_FILE" << EOFYAML
+    
+      # Traditional RDMA: All pods share all devices (SR-IOV VFs)
+      devices:
+    EOFYAML
+    
+        for device in "${NETWORK_DEVICE_NAMES[@]}"; do
+            echo "        - $device" >> "$OUTPUT_FILE"
+        done
+    fi
+    
+    # --- SUMMARY ---
+    echo ""
+    echo "✅ Discovery complete!"
+    echo "   Output: $OUTPUT_FILE"
+    echo ""
+    echo "Summary:"
+    echo "  - Cloud Provider: $CLOUD_PROVIDER"
+    echo "  - Deployment Type: $([ "$GPU_NODE_COUNT" -eq 1 ] && echo "Single-Node" || echo "Multi-Node ($GPU_NODE_COUNT nodes)")"
+    echo "  - GPUs: $GPU_COUNT per node"
+    echo "  - Network resources: $RDMA_COUNT"
+    if [ ${#NETWORK_DEVICE_NAMES[@]} -gt 0 ]; then
+        echo "  - Devices: ${NETWORK_DEVICE_NAMES[*]}"
+    fi
+    
+    if [ "$CLOUD_PROVIDER" = "ibm-cloud" ]; then
+        if [ "$GPU_NODE_COUNT" -eq 1 ] || [ "${DEPLOYMENT_TYPE:-}" = "single-node" ]; then
+            echo ""
+            echo "📝 IBM Cloud Single-Node:"
+            echo "   ❌ PD/EP Disaggregation: NOT SUPPORTED (requires 2+ nodes)"
+            echo "   ❌ Reason: host-device CNI requires exclusive NIC access"
+            echo "   ❌ Cannot share NICs between pods with RDMA on same node"
+            echo "   ✅ Recommended: Aggregated deployment (TP=$GPU_COUNT)"
+            echo "   ✅ Or: Deploy on 2+ nodes for PD/EP disaggregation"
+        else
+            echo ""
+            echo "📝 IBM Cloud Multi-Node Strategy:"
+            echo "   ✅ PD/EP/Wide-EP: FULLY SUPPORTED (same as traditional)"
+            echo "   ✅ Each pod gets ALL $RDMA_COUNT NICs via host-device NADs"
+            echo "   ✅ Anti-affinity scheduling ensures different nodes"
+            echo "   ✅ Full RDMA connectivity between all pods"
+        fi
+    fi

@@ -12,7 +12,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteMany  # Required for NFS to allow multiple pods to mount
-  storageClassName: nfs-disk-1-sc
+  storageClassName: ocs-storagecluster-cephfs-llm
   resources:
     requests:
       storage: 100Gi  # Llama-3.1-8B-FP8 is smaller than Qwen3-235B

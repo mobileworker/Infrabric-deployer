@@ -11,8 +11,9 @@ metadata:
     argocd.argoproj.io/hook: Sync
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
 spec:
-  backoffLimit: 3
-  ttlSecondsAfterFinished: 600
+  backoffLimit: 5
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 7200  # Keep job for 2 hours for debugging
   template:
     metadata:
       labels:
@@ -23,14 +24,58 @@ spec:
 
       # Init containers
       initContainers:
-        # 1. Discover GPU and RDMA resources
+        # 1. Wait for model download
+        - name: wait-for-model-download
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "Waiting for model download job to complete..."
+
+              # Install kubectl to local directory
+              mkdir -p /tmp/bin
+              export PATH="/tmp/bin:$PATH"
+              KUBE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
+              chmod +x /tmp/bin/kubectl
+
+              # Wait for job to exist first (handles race condition during simultaneous apply)
+              echo "Checking if model download job exists..."
+              RETRY=0
+              MAX_RETRIES=60
+              while [ $RETRY -lt $MAX_RETRIES ]; do
+                if kubectl get job/pd-model-download -n llm-d &>/dev/null; then
+                  echo "Job found, waiting for completion..."
+                  break
+                fi
+                echo "Job not found yet, waiting... (${RETRY}/${MAX_RETRIES})"
+                sleep 5
+                RETRY=$((RETRY + 1))
+              done
+
+              if [ $RETRY -eq $MAX_RETRIES ]; then
+                echo "ERROR: Model download job not found after ${MAX_RETRIES} retries"
+                exit 1
+              fi
+
+              # Wait for model download job to complete
+              kubectl wait --for=condition=complete job/pd-model-download -n llm-d --timeout=1800s
+
+              echo "✅ Model download job complete"
+          volumeMounts:
+            - name: model-cache
+              mountPath: /model-cache
+              readOnly: true
+
+        # 2. Discover GPU and RDMA resources
         - name: discover-resources
           image: registry.access.redhat.com/ubi9/ubi:latest
           command: ["/bin/bash", "-c"]
           args:
             - |
               set -euo pipefail
-              echo "🔍 Discovering GPU and RDMA resources for single-node deployment..."
+              echo "🔍 Discovering GPU and RDMA resources for multi-node deployment..."
 
               # Install dependencies
               mkdir -p /tmp/bin
@@ -57,14 +102,14 @@ spec:
             - name: shared-data
               mountPath: /data
 
-        # 2. Wait for gateway ready
+        # 3. Wait for Istio gateway ready
         - name: wait-for-gateway
           image: registry.access.redhat.com/ubi9/ubi:latest
           command: ["/bin/bash", "-c"]
           args:
             - |
               set -euo pipefail
-              echo "Waiting for gateway-ready job to complete..."
+              echo "Waiting for Istio gateway to be ready..."
 
               # Install kubectl to local directory
               mkdir -p /tmp/bin
@@ -73,10 +118,10 @@ spec:
               curl -sSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/bin/kubectl
               chmod +x /tmp/bin/kubectl
 
-              # Wait for gateway ready job
-              kubectl wait --for=condition=complete job/wait-for-gateway-ready -n llm-d --timeout=600s
+              # Wait for Istio gateway deployment to be ready
+              kubectl wait --for=condition=available --timeout=600s deployment/istio-ingressgateway -n istio-system || echo "Warning: Istio gateway timeout, continuing..."
 
-              echo "✅ Gateway is ready"
+              echo "✅ Gateway check complete"
 
       containers:
         - name: deploy-pd
@@ -87,7 +132,7 @@ spec:
               set -euo pipefail
 
               echo "========================================="
-              echo "P/D Disaggregation Single-Node Deployment"
+              echo "P/D Disaggregation Multi-Node Deployment"
               echo "========================================="
 
               # Install dependencies to local directory
@@ -118,13 +163,13 @@ spec:
 
               echo "✅ Gateway created"
 
-              # Step 2: Deploy Model Server with P/D Split
+              # Step 2: Deploy Model Server with P/D Multi-Node
               echo ""
               echo "========================================="
-              echo "Step 2: Deploying Model Server (Single-Node P/D)"
+              echo "Step 2: Deploying Model Server (Multi-Node P/D)"
               echo "========================================="
 
-              echo "📦 Preparing dynamic configuration with P/D GPU split..."
+              echo "📦 Preparing dynamic configuration for multi-node P/D..."
 
               # Load discovered resources
               if [ ! -f /data/discovered-resources.yaml ]; then
@@ -135,67 +180,160 @@ spec:
               echo "📊 Discovered resources:"
               cat /data/discovered-resources.yaml
 
-              # Extract discovered values for single-node P/D split
-              PREFILL_GPU_COUNT=$(yq '.vllm.singlenode.prefillTensorParallelSize' /data/discovered-resources.yaml)
-              DECODE_GPU_COUNT=$(yq '.vllm.singlenode.decodeTensorParallelSize' /data/discovered-resources.yaml)
-              TOTAL_USED_GPUS=$(yq '.vllm.singlenode.totalUsedGpus' /data/discovered-resources.yaml)
-              UNUSED_GPUS=$(yq '.vllm.singlenode.unusedGpus' /data/discovered-resources.yaml)
+              # Extract discovered values for multi-node deployment
+              GPU_COUNT=$(yq '.discovered.gpuCount' /data/discovered-resources.yaml)
+              RDMA_COUNT=$(yq '.discovered.rdmaCount' /data/discovered-resources.yaml)
+              NODE_COUNT=$(yq '.discovered.nodeCount' /data/discovered-resources.yaml)
 
-              # Extract CPU and Memory allocation
-              CPU_PER_POD=$(yq '.singleNodeResources.cpuPerPod' /data/discovered-resources.yaml)
-              MEMORY_PER_POD=$(yq '.singleNodeResources.memoryPerPodGi' /data/discovered-resources.yaml)
+              # Extract resource limits from discovery
+              CPU_LIMIT=$(yq '.resources.limits.cpu' /data/discovered-resources.yaml)
+              MEMORY_LIMIT=$(yq '.resources.limits.memory' /data/discovered-resources.yaml)
+              CPU_REQUEST=$(yq '.resources.requests.cpu' /data/discovered-resources.yaml)
+              MEMORY_REQUEST=$(yq '.resources.requests.memory' /data/discovered-resources.yaml)
+
+              # For multi-node: Use ALL GPUs per node for tensor parallelism
+              # Must be power of 2 (1, 2, 4, 8, 16, etc)
+              # Find largest power of 2 <= GPU_COUNT
+              TENSOR_PARALLEL_SIZE=1
+              while [ $((TENSOR_PARALLEL_SIZE * 2)) -le $GPU_COUNT ]; do
+                TENSOR_PARALLEL_SIZE=$((TENSOR_PARALLEL_SIZE * 2))
+              done
+
+              UNUSED_GPUS=$((GPU_COUNT - TENSOR_PARALLEL_SIZE))
+
+              # Calculate replicas for 2-node P/D disaggregation
+              # Strategy: 1 prefill pod + 1 decode pod (2 nodes minimum)
+              PREFILL_REPLICAS=1
+              DECODE_REPLICAS=1
 
               echo ""
-              echo "Single-Node P/D Configuration:"
-              echo "  - Prefill GPUs: $PREFILL_GPU_COUNT"
-              echo "  - Decode GPUs: $DECODE_GPU_COUNT"
-              echo "  - Total GPUs used: $TOTAL_USED_GPUS"
-              echo "  - Unused GPUs: $UNUSED_GPUS"
-              echo "  - CPU per pod: $CPU_PER_POD cores"
-              echo "  - Memory per pod: ${MEMORY_PER_POD}Gi"
+              echo "Multi-Node P/D Configuration:"
+              echo "  - Total GPU nodes: $NODE_COUNT"
+              echo "  - GPUs per node: $GPU_COUNT"
+              echo "  - Tensor Parallel Size: $TENSOR_PARALLEL_SIZE"
+              echo "  - Unused GPUs per node: $UNUSED_GPUS"
+              echo "  - RDMA resources: $RDMA_COUNT"
+              echo "  - Prefill replicas: $PREFILL_REPLICAS (uses 1 node)"
+              echo "  - Decode replicas: $DECODE_REPLICAS (uses $DECODE_REPLICAS nodes)"
               echo ""
 
               if [ "$UNUSED_GPUS" -gt 0 ]; then
-                echo "⚠️  WARNING: $UNUSED_GPUS GPU(s) will remain unused due to power-of-2 constraint"
+                echo "⚠️  WARNING: $UNUSED_GPUS GPU(s) per node will remain unused due to power-of-2 constraint"
               fi
 
-              # Patch Kubernetes manifests with discovered resources
+              # Detect network mode early for conditional logic
+              NETWORK_MODE=$(yq '.network.mode' /data/discovered-resources.yaml)
+              echo "📡 Network mode detected: $NETWORK_MODE"
+
+              # Copy manifests to tmp for patching
               echo "📦 Patching manifests with dynamic resources..."
 
-              # Copy consolidated manifest to tmp for patching
-              cp /config/ms/pd-lws.yaml /tmp/pd-lws.yaml
+              # Select ConfigMap based on network mode
+              if [ "$NETWORK_MODE" = "ibm-cloud" ]; then
+                echo "   Using IBM Cloud manifests (podAntiAffinity for different nodes)"
+                cp /config/ms-ibmcloud/pd-lws.yaml /tmp/pd-lws.yaml
+              else
+                echo "   Using traditional manifests (podAffinity for same node)"
+                cp /config/ms/pd-lws.yaml /tmp/pd-lws.yaml
+              fi
 
               # Patch PREFILL LeaderWorkerSet (first document in the YAML)
-              # Update GPU count
-              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$PREFILL_GPU_COUNT\"" /tmp/pd-lws.yaml
-              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$PREFILL_GPU_COUNT\"" /tmp/pd-lws.yaml
+              # Set replicas (always 1 for prefill in multi-node)
+              yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.replicas) = $PREFILL_REPLICAS" /tmp/pd-lws.yaml
 
-              # Update CPU
-              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.cpu) = \"$CPU_PER_POD\"" /tmp/pd-lws.yaml
-              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.cpu) = \"$CPU_PER_POD\"" /tmp/pd-lws.yaml
-
-              # Update Memory
-              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.memory) = \"${MEMORY_PER_POD}Gi\"" /tmp/pd-lws.yaml
-              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.memory) = \"${MEMORY_PER_POD}Gi\"" /tmp/pd-lws.yaml
+              # Update resource limits and requests for PREFILL
+              yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.cpu) = \"$CPU_LIMIT\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.cpu) = \"$CPU_REQUEST\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.memory) = \"$MEMORY_LIMIT\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.memory) = \"$MEMORY_REQUEST\"" /tmp/pd-lws.yaml
 
               # Update TP_SIZE environment variable
-              yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$PREFILL_GPU_COUNT\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
+
+              # Add RDMA resources from discovery (multi-node uses RDMA resource requests)
+              if [ "$RDMA_COUNT" -gt 0 ]; then
+                echo "🌐 Injecting RDMA resource requests for multi-node deployment..."
+
+                # Extract RDMA resources from discovery
+                RDMA_RESOURCES=$(yq '.resources.limits | to_entries | .[] | select(.key | test("^rdma/")) | .key + "=\"" + .value + "\""' /data/discovered-resources.yaml)
+
+                if [ -n "$RDMA_RESOURCES" ]; then
+                  echo "$RDMA_RESOURCES" | while IFS='=' read -r key value; do
+                    value=$(echo "$value" | tr -d '"')
+                    # Inject into both prefill and decode
+                    yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"$key\") = \"$value\"" /tmp/pd-lws.yaml
+                    yq eval-all -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"$key\") = \"$value\"" /tmp/pd-lws.yaml
+                    yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"$key\") = \"$value\"" /tmp/pd-lws.yaml
+                    yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"$key\") = \"$value\"" /tmp/pd-lws.yaml
+                  done
+                  echo "   ✓ RDMA resources injected for cross-node communication"
+                fi
+              else
+                echo "   ⚠️  No RDMA resources found - may impact cross-node performance"
+              fi
+
+              # Apply IBM Cloud specific configuration if needed
+              echo ""
+              if [ "$NETWORK_MODE" = "ibm-cloud" ]; then
+                echo "🌐 Applying IBM Cloud NetworkAttachmentDefinition configuration..."
+
+                # Detect deployment strategy
+                DEPLOYMENT_STRATEGY=$(yq '.network.strategy' /data/discovered-resources.yaml)
+                echo "   Strategy: $DEPLOYMENT_STRATEGY"
+
+                if [ "$DEPLOYMENT_STRATEGY" = "all-nics-per-pod" ]; then
+                  # Multi-Node: All pods use same NAD annotations (different physical nodes)
+                  echo "   🔧 Multi-Node: All pods get ALL NICs (anti-affinity ensures different nodes)"
+
+                  SHARED_NAD_ANNOTATION=$(yq '.network.sharedNadAnnotation' /data/discovered-resources.yaml)
+                  SHARED_DEVICES=$(yq '.network.sharedDevicesString' /data/discovered-resources.yaml)
+
+                  echo "   Shared NADs: $SHARED_NAD_ANNOTATION"
+                  echo "   Shared Devices: $SHARED_DEVICES"
+
+                  # Both prefill and decode use same NAD annotation
+                  yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.metadata.annotations.\"k8s.v1.cni.cncf.io/networks\") = \"$SHARED_NAD_ANNOTATION\"" /tmp/pd-lws.yaml
+                  yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.metadata.annotations.\"k8s.v1.cni.cncf.io/networks\") = \"$SHARED_NAD_ANNOTATION\"" /tmp/pd-lws.yaml
+
+                  # Both use same NCCL devices
+                  yq -i "(select(.metadata.name == \"pd-prefill\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].env[] | select(.name == \"NCCL_IB_HCA\") | .value) = \"$SHARED_DEVICES\"" /tmp/pd-lws.yaml
+                  yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].env[] | select(.name == \"NCCL_IB_HCA\") | .value) = \"$SHARED_DEVICES\"" /tmp/pd-lws.yaml
+
+                  echo "   ✅ Multi-Node all-nics-per-pod configuration applied"
+
+                else
+                  echo "   ⚠️  Unknown strategy: $DEPLOYMENT_STRATEGY"
+                fi
+
+                # Remove /dev/infiniband hostPath volume for IBM Cloud (virtio doesn't use it)
+                yq -i '(select(.metadata.name == "pd-prefill") | .spec.leaderWorkerTemplate.leaderTemplate.spec.volumes) |= map(select(.name != "dev-infiniband"))' /tmp/pd-lws.yaml
+                yq -i '(select(.metadata.name == "pd-decode") | .spec.leaderWorkerTemplate.leaderTemplate.spec.volumes) |= map(select(.name != "dev-infiniband"))' /tmp/pd-lws.yaml
+
+                # Remove /dev/infiniband volumeMount for IBM Cloud
+                yq -i '(select(.metadata.name == "pd-prefill") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].volumeMounts) |= map(select(.name != "dev-infiniband"))' /tmp/pd-lws.yaml
+                yq -i '(select(.metadata.name == "pd-decode") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].volumeMounts) |= map(select(.name != "dev-infiniband"))' /tmp/pd-lws.yaml
+
+                echo "   ✅ IBM Cloud NAD configuration applied"
+              else
+                echo "   ℹ️  Using traditional RDMA configuration (rdma/* resources)"
+              fi
 
               # Patch DECODE LeaderWorkerSet (second document in the YAML)
-              # Update GPU count
-              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$DECODE_GPU_COUNT\"" /tmp/pd-lws.yaml
-              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$DECODE_GPU_COUNT\"" /tmp/pd-lws.yaml
+              # Set replicas (NODE_COUNT - 1 for multi-node)
+              yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.replicas) = $DECODE_REPLICAS" /tmp/pd-lws.yaml
 
-              # Update CPU
-              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.cpu) = \"$CPU_PER_POD\"" /tmp/pd-lws.yaml
-              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.cpu) = \"$CPU_PER_POD\"" /tmp/pd-lws.yaml
-
-              # Update Memory
-              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.memory) = \"${MEMORY_PER_POD}Gi\"" /tmp/pd-lws.yaml
-              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.memory) = \"${MEMORY_PER_POD}Gi\"" /tmp/pd-lws.yaml
+              # Update resource limits and requests for DECODE
+              yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.\"nvidia.com/gpu\") = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.cpu) = \"$CPU_LIMIT\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.cpu) = \"$CPU_REQUEST\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.limits.memory) = \"$MEMORY_LIMIT\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].resources.requests.memory) = \"$MEMORY_REQUEST\"" /tmp/pd-lws.yaml
 
               # Update TP_SIZE environment variable
-              yq -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$DECODE_GPU_COUNT\"" /tmp/pd-lws.yaml
+              yq eval-all -i "(select(.metadata.name == \"pd-decode\") | .spec.leaderWorkerTemplate.leaderTemplate.spec.containers[0].env[] | select(.name == \"TP_SIZE\") | .value) = \"$TENSOR_PARALLEL_SIZE\"" /tmp/pd-lws.yaml
 
               echo "✅ Dynamic configuration prepared"
               echo ""
@@ -218,7 +356,7 @@ spec:
               echo "========================================="
 
               echo "Pods:"
-              kubectl get pods -n llm-d -l llm-d.ai/guide=pd-disaggregation
+              kubectl get pods -n llm-d -l llm-d.ai/guide=pd-disaggregation -o wide
 
               echo ""
               echo "InferencePool:"
@@ -230,7 +368,7 @@ spec:
 
               echo ""
               echo "========================================="
-              echo "✅ Single-Node P/D Disaggregation deployment complete!"
+              echo "✅ Multi-Node P/D Disaggregation deployment complete!"
               echo "========================================="
 
               # Remove llm-d-client pod (deployment role complete)
@@ -247,21 +385,26 @@ spec:
               echo "Deployment Summary"
               echo "========================================="
               echo "Configuration Summary:"
-              echo "  - Prefill: $PREFILL_GPU_COUNT GPUs (tensor-parallel-size: $PREFILL_GPU_COUNT)"
-              echo "  - Decode: $DECODE_GPU_COUNT GPUs (tensor-parallel-size: $DECODE_GPU_COUNT)"
-              echo "  - Total GPUs used: $TOTAL_USED_GPUS"
+              echo "  - Total GPU nodes: $NODE_COUNT"
+              echo "  - Prefill pods: $PREFILL_REPLICAS x $TENSOR_PARALLEL_SIZE GPUs (uses $PREFILL_REPLICAS node)"
+              echo "  - Decode pods: $DECODE_REPLICAS x $TENSOR_PARALLEL_SIZE GPUs (uses $DECODE_REPLICAS nodes)"
+              echo "  - Total GPUs used: $((PREFILL_REPLICAS * TENSOR_PARALLEL_SIZE + DECODE_REPLICAS * TENSOR_PARALLEL_SIZE)) of $((NODE_COUNT * GPU_COUNT))"
               if [ "$UNUSED_GPUS" -gt 0 ]; then
-                echo "  - Unused GPUs: $UNUSED_GPUS (power-of-2 constraint)"
+                echo "  - Unused GPUs per node: $UNUSED_GPUS (power-of-2 constraint)"
               fi
+              echo "  - RDMA resources: $RDMA_COUNT per node"
               echo ""
               echo "Next steps:"
-              echo "  1. Verify pods are running:"
-              echo "     kubectl get pods -n llm-d"
+              echo "  1. Verify pods are running on DIFFERENT nodes:"
+              echo "     kubectl get pods -n llm-d -o wide"
               echo ""
-              echo "  2. Check InferencePool status:"
+              echo "  2. Check that $PREFILL_REPLICAS prefill + $DECODE_REPLICAS decode pods are running:"
+              echo "     kubectl get deployments -n llm-d"
+              echo ""
+              echo "  3. Check InferencePool status:"
               echo "     kubectl describe inferencepool -n llm-d"
               echo ""
-              echo "  3. Test inference:"
+              echo "  4. Test inference:"
               echo "     kubectl get httproute -n llm-d"
               echo ""
 
@@ -270,6 +413,8 @@ spec:
               mountPath: /config/gaie
             - name: ms-manifests
               mountPath: /config/ms
+            - name: ms-manifests-ibmcloud
+              mountPath: /config/ms-ibmcloud
             - name: shared-data
               mountPath: /data
 
@@ -288,9 +433,15 @@ spec:
         - name: ms-manifests
           configMap:
             name: ms-pd-manifests
+        - name: ms-manifests-ibmcloud
+          configMap:
+            name: ms-pd-manifests-ibmcloud
         - name: discovery-script
           configMap:
-            name: gpu-rdma-discovery-script
+            name: gpu-rdma-discovery-script-ibm
             defaultMode: 0755
         - name: shared-data
           emptyDir: {}
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: pd-model-cache
