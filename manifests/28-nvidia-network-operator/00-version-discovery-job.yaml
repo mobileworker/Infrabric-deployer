@@ -55,6 +55,10 @@ spec:
         env:
         - name: OFED_VERSION_OVERRIDE
           value: ""
+        - name: OFED_IMAGE_OVERRIDE
+          value: ""
+        - name: OFED_REPO_OVERRIDE
+          value: ""
         command:
         - /bin/bash
         - -c
@@ -97,6 +101,10 @@ spec:
             echo "Discovered OFED version: $VERSION"
           fi
 
+          OFED_IMAGE="${OFED_IMAGE_OVERRIDE:-doca-driver}"
+          OFED_REPO="${OFED_REPO_OVERRIDE:-nvcr.io/nvidia/mellanox}"
+          echo "Using image: $OFED_REPO/$OFED_IMAGE:$VERSION"
+
           # Check if NicClusterPolicy already exists with this version
           EXISTING_VERSION=$(oc get nicclusterpolicy nic-cluster-policy -n nvidia-network-operator \
             -o jsonpath='{.spec.ofedDriver.version}' 2>/dev/null || echo "")
@@ -129,8 +137,8 @@ spec:
                   - key: node-role.kubernetes.io/master
                     operator: DoesNotExist
             ofedDriver:
-              image: doca-driver
-              repository: nvcr.io/nvidia/mellanox
+              image: $OFED_IMAGE
+              repository: $OFED_REPO
               version: $VERSION
               env:
                 - name: UNLOAD_STORAGE_MODULES
